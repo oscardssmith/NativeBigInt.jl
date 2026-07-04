@@ -2,12 +2,18 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "e65c6ae1fd53578b8a32b36b22dbe3857b6aedd0"
+project_hash = "58ca94d510522372beb7d39061beb1b8f151fcc5"
 
 [[deps.Dates]]
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
 version = "1.11.0"
+
+[[deps.NativeBigInt]]
+deps = ["SIMD"]
+path = "."
+uuid = "a431c85e-c5f3-4b57-94c0-2f8d9b9f469c"
+version = "0.1.0"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]

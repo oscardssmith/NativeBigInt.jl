@@ -1,5 +1,7 @@
 module NativeBigInt
 
+import SIMD
+
 export NBig
 
 const Limb = UInt64

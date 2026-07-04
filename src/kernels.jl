@@ -12,22 +12,29 @@ end
     return d2, Limb(o1 | o2)
 end
 
-# LLVM emits adc/sbb chains within a straight-line block but re-materializes
-# the carry at every loop back-edge; wide manual unrolls amortize that fixup.
+const V8 = SIMD.Vec{8,Limb}
+
+# SIMD fast path: within an 8-limb block, unless some limb sum equals typemax
+# (probability ~2^-64 per limb), an incoming carry bit cannot chain, so the
+# carry-into vector is just the generate vector (s < a) shifted one lane with
+# the block carry-in inserted at lane 0. Blocks where a carry could chain take
+# the cold scalar branch. r must alias a/b exactly or not at all.
 @inline function add_n!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, b::Memory{Limb}, bo::Int, n::Int)
     c = zero(Limb)
     i = 1
-    @inbounds while i + 15 <= n
-        Base.Cartesian.@nexprs 16 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
-        i += 16
-    end
     @inbounds while i + 7 <= n
-        Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
+        va = SIMD.vload(V8, a, ao + i)
+        vb = SIMD.vload(V8, b, bo + i)
+        vs = va + vb
+        if any(vs == V8(typemax(Limb)))
+            Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
+        else
+            g = SIMD.vifelse(vs < va, V8(one(Limb)), V8(zero(Limb)))
+            cv = SIMD.shufflevector(g, V8(c), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+            SIMD.vstore(vs + cv, r, ro + i)
+            c = g[8]
+        end
         i += 8
-    end
-    @inbounds while i + 3 <= n
-        Base.Cartesian.@nexprs 4 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
-        i += 4
     end
     @inbounds while i <= n
         (r[ro+i], c) = add_limb_c(a[ao+i], b[bo+i], c)
@@ -36,6 +43,10 @@ end
     return c
 end
 
+# LLVM emits sbb chains within a straight-line block but re-materializes the
+# borrow at every loop back-edge; wide manual unrolls amortize that fixup.
+# (No SIMD cold-path analog here: for subtraction "propagate" is d == 0, i.e.
+# equal limbs, which is common in real inputs, not 2^-64-rare.)
 @inline function sub_n!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, b::Memory{Limb}, bo::Int, n::Int)
     brw = zero(Limb)
     i = 1
