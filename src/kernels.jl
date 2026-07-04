@@ -105,16 +105,21 @@ end
     return brw
 end
 
-@inline function add_into!(r::Memory{Limb}, ro::Int, rlen::Int, b::Memory{Limb}, bo::Int, lb::Int)
-    c = add_n!(r, ro, r, ro, b, bo, lb)
-    i = lb + 1
+# ripple-add the carry c into r starting at index i
+@inline function add_carry!(r::Memory{Limb}, ro::Int, rlen::Int, i::Int, c::Limb)
     @inbounds while c != 0
-        @assert i <= rlen "add_into! carry out of range"
+        @assert i <= rlen "add_carry! carry out of range"
         s, o = Base.add_with_overflow(r[ro+i], c)
         r[ro+i] = s
         c = Limb(o)
         i += 1
     end
+    return nothing
+end
+
+@inline function add_into!(r::Memory{Limb}, ro::Int, rlen::Int, b::Memory{Limb}, bo::Int, lb::Int)
+    c = add_n!(r, ro, r, ro, b, bo, lb)
+    add_carry!(r, ro, rlen, lb + 1, c)
     return nothing
 end
 
