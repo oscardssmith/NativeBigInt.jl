@@ -62,3 +62,43 @@ end
     end
     return 0
 end
+
+@inline function mul_1!(r, ro, a, ao, n, b::Limb)
+    c = zero(Limb)
+    @inbounds for i in 1:n
+        p = widemul(a[ao+i], b) + c
+        r[ro+i] = p % Limb
+        c = (p >> 64) % Limb
+    end
+    return c
+end
+
+@inline function addmul_1!(r, ro, a, ao, n, b::Limb)
+    c = zero(Limb)
+    @inbounds for i in 1:n
+        p = widemul(a[ao+i], b) + r[ro+i] + c
+        r[ro+i] = p % Limb
+        c = (p >> 64) % Limb
+    end
+    return c
+end
+
+@inline function submul_1!(r, ro, a, ao, n, b::Limb)
+    c = zero(Limb)
+    @inbounds for i in 1:n
+        p = widemul(a[ao+i], b) + c
+        lo = p % Limb
+        d, o = Base.sub_with_overflow(r[ro+i], lo)
+        r[ro+i] = d
+        c = ((p >> 64) % Limb) + Limb(o)
+    end
+    return c
+end
+
+function mul_basecase!(r, ro, a, ao, m, b, bo, n)
+    @inbounds r[ro+m+1] = mul_1!(r, ro, a, ao, m, b[bo+1])
+    @inbounds for j in 2:n
+        r[ro+m+j] = addmul_1!(r, ro+j-1, a, ao, m, b[bo+j])
+    end
+    return nothing
+end
