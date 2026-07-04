@@ -1,0 +1,13 @@
+name = "NativeBigInt"
+uuid = "a431c85e-c5f3-4b57-94c0-2f8d9b9f469c"
+version = "0.1.0"
+
+[deps]
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[targets]
+test = ["Test", "Random"]
