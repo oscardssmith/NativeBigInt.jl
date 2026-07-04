@@ -1,23 +1,59 @@
 # Kernel functions for arbitrary-precision arithmetic
 
+@inline function add_limb_c(a::Limb, b::Limb, c::Limb)
+    s1, o1 = Base.add_with_overflow(a, b)
+    s2, o2 = Base.add_with_overflow(s1, c)
+    return s2, Limb(o1 | o2)
+end
+
+@inline function sub_limb_b(a::Limb, b::Limb, brw::Limb)
+    d1, o1 = Base.sub_with_overflow(a, b)
+    d2, o2 = Base.sub_with_overflow(d1, brw)
+    return d2, Limb(o1 | o2)
+end
+
+# LLVM emits adc/sbb chains within a straight-line block but re-materializes
+# the carry at every loop back-edge; wide manual unrolls amortize that fixup.
 @inline function add_n!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, b::Memory{Limb}, bo::Int, n::Int)
     c = zero(Limb)
-    @inbounds for i in 1:n
-        s1, o1 = Base.add_with_overflow(a[ao+i], b[bo+i])
-        s2, o2 = Base.add_with_overflow(s1, c)
-        r[ro+i] = s2
-        c = Limb(o1 | o2)
+    i = 1
+    @inbounds while i + 15 <= n
+        Base.Cartesian.@nexprs 16 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
+        i += 16
+    end
+    @inbounds while i + 7 <= n
+        Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
+        i += 8
+    end
+    @inbounds while i + 3 <= n
+        Base.Cartesian.@nexprs 4 k -> ((r[ro+i+k-1], c) = add_limb_c(a[ao+i+k-1], b[bo+i+k-1], c))
+        i += 4
+    end
+    @inbounds while i <= n
+        (r[ro+i], c) = add_limb_c(a[ao+i], b[bo+i], c)
+        i += 1
     end
     return c
 end
 
 @inline function sub_n!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, b::Memory{Limb}, bo::Int, n::Int)
     brw = zero(Limb)
-    @inbounds for i in 1:n
-        d1, o1 = Base.sub_with_overflow(a[ao+i], b[bo+i])
-        d2, o2 = Base.sub_with_overflow(d1, brw)
-        r[ro+i] = d2
-        brw = Limb(o1 | o2)
+    i = 1
+    @inbounds while i + 15 <= n
+        Base.Cartesian.@nexprs 16 k -> ((r[ro+i+k-1], brw) = sub_limb_b(a[ao+i+k-1], b[bo+i+k-1], brw))
+        i += 16
+    end
+    @inbounds while i + 7 <= n
+        Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], brw) = sub_limb_b(a[ao+i+k-1], b[bo+i+k-1], brw))
+        i += 8
+    end
+    @inbounds while i + 3 <= n
+        Base.Cartesian.@nexprs 4 k -> ((r[ro+i+k-1], brw) = sub_limb_b(a[ao+i+k-1], b[bo+i+k-1], brw))
+        i += 4
+    end
+    @inbounds while i <= n
+        (r[ro+i], brw) = sub_limb_b(a[ao+i], b[bo+i], brw)
+        i += 1
     end
     return brw
 end
