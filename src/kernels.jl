@@ -315,10 +315,64 @@ end
     return nothing
 end
 
-# addmul_2! beats two addmul_1! rows at every width, so always pair rows.
+# Non-adding addmul_2!: r[1..m+2] = a[1..m] * (b0 + b1*B), r is not read.
+# Same stream layout minus the r addend, so carry-in is 0..2 and the cold
+# guard is typemax-1; scalar lanes reuse addmul_2_lane with rj = 0.
+@inline function mul_2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int, b0::Limb, b1::Limb)
+    b00 = b0 & LO32; b01 = b0 >> 32
+    b10 = b1 & LO32; b11 = b1 >> 32
+    c = zero(Limb); qin = zero(Limb); hin2 = zero(Limb); hin1 = zero(Limb)
+    z = zero(Limb)
+    i = 1
+    @inbounds while i + 7 <= m
+        va = SIMD.vload(V8, a, ao + i)
+        lo0, hi0 = mul128_v8(va, b00, b01)
+        lo1, hi1 = mul128_v8(va, b10, b11)
+        q = hi0 + lo1
+        h = hi1 + SIMD.vifelse(q < hi0, V8(one(Limb)), V8(zero(Limb)))
+        pq = SIMD.shufflevector(q, V8(qin), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+        ph = SIMD.shufflevector(h, V8((hin2, hin1, z, z, z, z, z, z)),
+                                Val((8, 9, 0, 1, 2, 3, 4, 5)))
+        s1 = lo0 + pq
+        g1 = SIMD.vifelse(s1 < lo0, V8(one(Limb)), V8(zero(Limb)))
+        s2 = s1 + ph
+        g2 = SIMD.vifelse(s2 < s1, V8(one(Limb)), V8(zero(Limb)))
+        if any(s2 >= V8(typemax(Limb) - Limb(1)))
+            Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], c, qin, hin2, hin1) =
+                addmul_2_lane(zero(Limb), a[ao+i+k-1], b0, b1, c, qin, hin2, hin1))
+        else
+            g = g1 + g2
+            cv = SIMD.shufflevector(g, V8(c), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+            SIMD.vstore(s2 + cv, r, ro + i)
+            c = g[8]
+            qin = q[8]
+            hin2 = h[7]
+            hin1 = h[8]
+        end
+        i += 8
+    end
+    @inbounds while i <= m
+        (r[ro+i], c, qin, hin2, hin1) =
+            addmul_2_lane(zero(Limb), a[ao+i], b0, b1, c, qin, hin2, hin1)
+        i += 1
+    end
+    @inbounds begin
+        t = UInt128(qin) + hin2 + c
+        r[ro+m+1] = t % Limb
+        r[ro+m+2] = hin1 + (t >> 64) % Limb
+    end
+    return nothing
+end
+
+# addmul_2! beats two addmul_1! rows at every width, so always pair rows;
+# mul_2! covers the first pair without a separate mul_1! pass.
 function mul_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int, b::Memory{Limb}, bo::Int, n::Int)
-    @inbounds r[ro+m+1] = mul_1!(r, ro, a, ao, m, b[bo+1])
-    j = 2
+    if n == 1
+        @inbounds r[ro+m+1] = mul_1!(r, ro, a, ao, m, b[bo+1])
+        return nothing
+    end
+    @inbounds mul_2!(r, ro, a, ao, m, b[bo+1], b[bo+2])
+    j = 3
     @inbounds while j + 1 <= n
         addmul_2!(r, ro+j-1, a, ao, m, b[bo+j], b[bo+j+1])
         j += 2

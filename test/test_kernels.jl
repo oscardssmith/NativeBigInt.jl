@@ -128,6 +128,26 @@ end
     end
 end
 
+@testset "mul_2! direct" begin
+    rng = MersenneTwister(101)
+    mul_2! = NativeBigInt.mul_2!
+    checkm2(m, av, b0, b1) = begin
+        a = mem(av)
+        r = mem(rand(rng, UInt64, m + 2))  # garbage: mul_2! must not read r
+        mul_2!(r, 0, a, 0, m, b0, b1)
+        @test toref(r, 0, m + 2) == toref(a, 0, m) * (big(b0) + (big(b1) << 64))
+    end
+    for m in (1, 2, 7, 8, 9, 16, 23, 24, 31), trial in 1:20
+        checkm2(m, rand(rng, UInt64, m), rand(rng, UInt64), rand(rng, UInt64))
+    end
+    # cold path / carry saturation
+    for m in (8, 16, 24, 31)
+        checkm2(m, fill(typemax(UInt64), m), typemax(UInt64), typemax(UInt64))
+        av = fill(UInt64(1), m); av[3] = typemax(UInt64); av[min(10, m)] = typemax(UInt64) - 1
+        checkm2(m, av, typemax(UInt64), UInt64(2))
+    end
+end
+
 @testset "addmul_2! carry saturation" begin
     # typemax-dense operands drive the addmul_2! column carry to exactly 2^64
     # (hi0 = 2^64-2 plus two overflow bits), which a limb-sized carry drops
