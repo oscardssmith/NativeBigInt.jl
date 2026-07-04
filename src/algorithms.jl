@@ -38,3 +38,34 @@ function kar_scratch_len(n::Int)
     end
     return len
 end
+
+# Balanced n x n subtractive Karatsuba: r[1..2n] = a[1..n] * b[1..n].
+# a*b = hi*B^(2h2) + (lo + hi - s*mid)*B^h2 + lo where mid = |a_lo-a_hi|*|b_lo-b_hi|.
+# The middle term equals a_lo*b_hi + a_hi*b_lo >= 0, so carries never underflow.
+# scratch must have kar_scratch_len(n) limbs free at so; r must not alias a/b.
+function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
+                  b::Memory{Limb}, bo::Int, n::Int, scratch::Memory{Limb}, so::Int)
+    if n < KARATSUBA_THRESHOLD
+        return mul_basecase!(r, ro, a, ao, n, b, bo, n)
+    end
+    h2 = (n + 1) >> 1   # low-half length
+    h = n - h2          # high-half length (h2 or h2-1)
+    L = 2h2
+    mid = so            # L limbs: |a_lo-a_hi| * |b_lo-b_hi|
+    tmp = so + L        # L limbs: the two differences, then lo+hi±mid
+    rec = so + 2L       # recursion scratch
+    nega = abs_diff!(scratch, tmp, a, ao, h2, h)
+    negb = abs_diff!(scratch, tmp + h2, b, bo, h2, h)
+    kar_mul!(scratch, mid, scratch, tmp, scratch, tmp + h2, h2, scratch, rec)
+    kar_mul!(r, ro, a, ao, b, bo, h2, scratch, rec)                 # lo
+    kar_mul!(r, ro + L, a, ao + h2, b, bo + h2, h, scratch, rec)    # hi
+    c = add!(scratch, tmp, r, ro, L, r, ro + L, 2h)                 # tmp = lo + hi
+    if nega == negb
+        c -= sub_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
+    else
+        c += add_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
+    end
+    add_into!(r, ro + h2, 2n - h2, scratch, tmp, L)
+    add_carry!(r, ro + h2, 2n - h2, L + 1, c)
+    return nothing
+end

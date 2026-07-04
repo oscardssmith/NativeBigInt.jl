@@ -40,3 +40,35 @@ afrombig(x::BigInt, n) = (v = zeros(UInt64, n); for i in 1:n; v[i] = UInt64(x & 
     @test kar_scratch_len(KARATSUBA_THRESHOLD) == 4h2 + kar_scratch_len(h2)
     @test kar_scratch_len(4 * KARATSUBA_THRESHOLD) > kar_scratch_len(2 * KARATSUBA_THRESHOLD)
 end
+
+using NativeBigInt: kar_mul!
+
+@testset "kar_mul! balanced" begin
+    rng = MersenneTwister(123)
+    T = KARATSUBA_THRESHOLD
+    check(n, a, b) = begin
+        r = Memory{UInt64}(undef, 2n)
+        scratch = Memory{UInt64}(undef, kar_scratch_len(n))
+        kar_mul!(r, 0, a, 0, b, 0, n, scratch, 0)
+        @test atoref(r, 0, 2n) == atoref(a, 0, n) * atoref(b, 0, n)
+    end
+    # sizes spanning the threshold, odd/even splits, two+ recursion levels
+    for n in (T - 1, T, T + 1, 2T, 2T + 1, 4T + 3), trial in 1:10
+        check(n, amem(rand(rng, UInt64, n)), amem(rand(rng, UInt64, n)))
+    end
+    # adversarial: all-ones limbs (maximum carry chaining)
+    for n in (T + 1, 2T + 1)
+        a = amem(fill(typemax(UInt64), n))
+        check(n, a, a)
+    end
+    # 2^k patterns: single high bit times single high bit minus one
+    for n in (T + 1, 2T)
+        a = afrombig(big(1) << (64n - 1), n)
+        b = afrombig((big(1) << (64n - 1)) - 1, n)
+        check(n, a, b)
+    end
+    # zero middle difference: a_lo == a_hi exactly
+    n = 2 * (T + 1)
+    half = rand(rng, UInt64, T + 1)
+    check(n, amem([half; half]), amem(rand(rng, UInt64, n)))
+end
