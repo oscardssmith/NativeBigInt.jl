@@ -1,7 +1,7 @@
 # Multi-limb algorithms built on the kernels: Karatsuba multiplication.
 
 # Below this operand length (limbs) mul_basecase! wins; benchmark-tuned.
-const KARATSUBA_THRESHOLD = 33
+const KARATSUBA_THRESHOLD = 29
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -30,9 +30,9 @@ function abs_diff!(d::Memory{Limb}, dof::Int, x::Memory{Limb}, xo::Int, lo_len::
 end
 
 # Scratch limbs kar_mul! needs for an n x n product: 4*ceil(n/2) per level.
-function kar_scratch_len(n::Int)
+function kar_scratch_len(n::Int, thr::Int=KARATSUBA_THRESHOLD)
     len = 0
-    while n >= KARATSUBA_THRESHOLD
+    while n >= thr
         n = (n + 1) >> 1
         len += 4n
     end
@@ -44,8 +44,9 @@ end
 # The middle term equals a_lo*b_hi + a_hi*b_lo >= 0, so carries never underflow.
 # scratch must have kar_scratch_len(n) limbs free at so; r must not alias a/b.
 function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
-                  b::Memory{Limb}, bo::Int, n::Int, scratch::Memory{Limb}, so::Int)
-    if n < KARATSUBA_THRESHOLD
+                  b::Memory{Limb}, bo::Int, n::Int, scratch::Memory{Limb}, so::Int,
+                  thr::Int=KARATSUBA_THRESHOLD)
+    if n < thr
         return mul_basecase!(r, ro, a, ao, n, b, bo, n)
     end
     h2 = (n + 1) >> 1   # low-half length
@@ -56,9 +57,9 @@ function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
     rec = so + 2L       # recursion scratch
     nega = abs_diff!(scratch, tmp, a, ao, h2, h)
     negb = abs_diff!(scratch, tmp + h2, b, bo, h2, h)
-    kar_mul!(scratch, mid, scratch, tmp, scratch, tmp + h2, h2, scratch, rec)
-    kar_mul!(r, ro, a, ao, b, bo, h2, scratch, rec)                 # lo
-    kar_mul!(r, ro + L, a, ao + h2, b, bo + h2, h, scratch, rec)    # hi
+    kar_mul!(scratch, mid, scratch, tmp, scratch, tmp + h2, h2, scratch, rec, thr)
+    kar_mul!(r, ro, a, ao, b, bo, h2, scratch, rec, thr)                 # lo
+    kar_mul!(r, ro + L, a, ao + h2, b, bo + h2, h, scratch, rec, thr)    # hi
     c = add!(scratch, tmp, r, ro, L, r, ro + L, 2h)                 # tmp = lo + hi
     if nega == negb
         c -= sub_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
@@ -74,19 +75,19 @@ end
 # alias a or b. Karatsuba on n-limb chunks of a; each block's low n limbs
 # accumulate into r, its high limbs land in fresh territory (plus carry).
 function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
-              b::Memory{Limb}, bo::Int, n::Int)
-    if n < KARATSUBA_THRESHOLD
+              b::Memory{Limb}, bo::Int, n::Int, thr::Int=KARATSUBA_THRESHOLD)
+    if n < thr
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
-    scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n))
-    kar_mul!(r, ro, a, ao, b, bo, n, scratch, 2n)
+    scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n, thr))
+    kar_mul!(r, ro, a, ao, b, bo, n, scratch, 2n, thr)
     i = n
     while i < m
         chunk = min(n, m - i)
         if chunk == n
-            kar_mul!(scratch, 0, a, ao + i, b, bo, n, scratch, 2n)
+            kar_mul!(scratch, 0, a, ao + i, b, bo, n, scratch, 2n, thr)
         else
-            mul!(scratch, 0, b, bo, n, a, ao + i, chunk)  # ragged tail, n x chunk
+            mul!(scratch, 0, b, bo, n, a, ao + i, chunk, thr)  # ragged tail, n x chunk
         end
         c = add_n!(r, ro + i, r, ro + i, scratch, 0, n)
         copy_tail!(r, ro + i, scratch, 0, n + 1, n + chunk)
