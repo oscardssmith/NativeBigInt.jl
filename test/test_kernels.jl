@@ -104,6 +104,22 @@ end
     @test toref(r, 0, 7) == toref(a, 0, 4) * toref(b, 0, 3)
 end
 
+@testset "addmul_2! carry saturation" begin
+    # typemax-dense operands drive the addmul_2! column carry to exactly 2^64
+    # (hi0 = 2^64-2 plus two overflow bits), which a limb-sized carry drops
+    rng = MersenneTwister(1234)
+    for trial in 1:300
+        m = rand(rng, 8:23); n = rand(rng, 2:40)  # m < MUL_BC_SIMD_THRESHOLD path
+        av = rand(rng, UInt64, m); bv = rand(rng, UInt64, n)
+        for i in 1:m; rand(rng) < 0.5 && (av[i] = typemax(UInt64) - rand(rng, 0:1)); end
+        for i in 1:n; rand(rng) < 0.5 && (bv[i] = typemax(UInt64) - rand(rng, 0:1)); end
+        a = mem(av); b = mem(bv)
+        r = Memory{UInt64}(undef, m + n)
+        mul_basecase!(r, 0, a, 0, m, b, 0, n)
+        @test toref(r, 0, m + n) == toref(a, 0, m) * toref(b, 0, n)
+    end
+end
+
 @testset "shift/div1 kernels" begin
     rng = MersenneTwister(7)
     for n in (1, 3, 9), cnt in (1, 13, 63), trial in 1:20
