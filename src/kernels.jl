@@ -102,3 +102,31 @@ function mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
     return nothing
 end
+
+@inline function lshift!(r, ro, a, ao, n, cnt)
+    ret = @inbounds a[ao+n] >> (64 - cnt)
+    @inbounds for i in n:-1:2
+        r[ro+i] = (a[ao+i] << cnt) | (a[ao+i-1] >> (64 - cnt))
+    end
+    @inbounds r[ro+1] = a[ao+1] << cnt
+    return ret
+end
+
+@inline function rshift!(r, ro, a, ao, n, cnt)
+    ret = @inbounds a[ao+1] << (64 - cnt)
+    @inbounds for i in 1:n-1
+        r[ro+i] = (a[ao+i] >> cnt) | (a[ao+i+1] << (64 - cnt))
+    end
+    @inbounds r[ro+n] = a[ao+n] >> cnt
+    return ret
+end
+
+@inline function divrem_1!(q, qo, a, ao, n, d::Limb)
+    rem = zero(Limb)
+    @inbounds for i in n:-1:1
+        num = (DLimb(rem) << 64) | a[ao+i]
+        q[qo+i] = (num ÷ d) % Limb
+        rem = (num % d) % Limb
+    end
+    return rem
+end

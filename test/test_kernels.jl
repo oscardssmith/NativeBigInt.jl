@@ -1,5 +1,5 @@
 # Kernel tests
-using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!
+using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!, lshift!, rshift!, divrem_1!
 using Random: MersenneTwister
 
 mem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -68,4 +68,24 @@ end
     r = Memory{UInt64}(undef, 7)
     mul_basecase!(r, 0, a, 0, 4, b, 0, 3)
     @test toref(r, 0, 7) == toref(a, 0, 4) * toref(b, 0, 3)
+end
+
+@testset "shift/div1 kernels" begin
+    rng = MersenneTwister(7)
+    for n in (1, 3, 9), cnt in (1, 13, 63), trial in 1:20
+        a = mem(rand(rng, UInt64, n)); aref = toref(a, 0, n)
+        r = Memory{UInt64}(undef, n)
+        hi = lshift!(r, 0, a, 0, n, cnt)
+        @test (big(hi) << (64n)) | toref(r, 0, n) == aref << cnt
+        lo = rshift!(r, 0, a, 0, n, cnt)
+        @test toref(r, 0, n) == aref >> cnt
+        @test big(lo) >> (64 - cnt) == aref & ((big(1) << cnt) - 1)
+        # in-place
+        b = mem(collect(a)); lshift!(b, 0, b, 0, n, cnt)
+        @test toref(b, 0, n) == (aref << cnt) & ((big(1) << (64n)) - 1)
+        d = rand(rng, UInt64) | 1
+        q = Memory{UInt64}(undef, n)
+        rem = divrem_1!(q, 0, a, 0, n, d)
+        @test toref(q, 0, n) == aref ÷ d && rem == aref % d
+    end
 end
