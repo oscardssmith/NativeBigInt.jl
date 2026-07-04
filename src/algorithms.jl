@@ -96,3 +96,39 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     end
     return nothing
 end
+
+# Quotient/remainder: a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1.
+# Writes n-m+1 quotient limbs (top may be zero) and m remainder limbs
+# (unnormalized). One scratch Memory holds the shifted numerator copy (n+1
+# limbs) and, for unnormalized d, the shifted divisor; a is not modified.
+function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
+                 a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int)
+    if m == 1
+        @inbounds r[ro+1] = divrem_1!(q, qo, a, ao, n, d[do_+1])
+        return nothing
+    end
+    l = leading_zeros(@inbounds d[do_+m])
+    nn = n + 1
+    scratch = Memory{Limb}(undef, nn + (l > 0 ? m : 0))
+    if l == 0
+        @inbounds for i in 1:n
+            scratch[i] = a[ao+i]
+        end
+        @inbounds scratch[nn] = zero(Limb)
+        dv, dvo = d, do_
+    else
+        @inbounds scratch[nn] = lshift!(scratch, 0, a, ao, n, l)
+        lshift!(scratch, nn, d, do_, m, l)
+        dv, dvo = scratch, nn
+    end
+    v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
+    divrem_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)   # qh == 0: Q < β^(nn-m)
+    if l == 0
+        @inbounds for i in 1:m
+            r[ro+i] = scratch[i]
+        end
+    else
+        rshift!(r, ro, scratch, 0, m, l)
+    end
+    return nothing
+end

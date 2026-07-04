@@ -425,6 +425,101 @@ end
     return q1, r
 end
 
+# 3/2 reciprocal (Möller–Granlund Alg. 6): v = ⌊(β³-1)/(d1·β+d0)⌋ - β,
+# for normalized d1; refines invert_limb(d1) by two conditional corrections.
+@inline function invert_pi1(d1::Limb, d0::Limb)
+    v = invert_limb(d1)
+    p = d1 * v
+    p += d0
+    if p < d0
+        v -= one(Limb)
+        if p >= d1
+            v -= one(Limb)
+            p -= d1
+        end
+        p -= d1
+    end
+    t = DLimb(v) * d0
+    t1 = (t >> 64) % Limb
+    t0 = t % Limb
+    p += t1
+    if p < t1
+        v -= one(Limb)
+        if (p > d1) | ((p == d1) & (t0 >= d0))
+            v -= one(Limb)
+        end
+    end
+    return v
+end
+
+# Divide ⟨u2,u1,u0⟩ by normalized ⟨d1,d0⟩ given v = invert_pi1(d1, d0);
+# requires ⟨u2,u1⟩ < ⟨d1,d0⟩. Returns (q, r1, r0) with ⟨r1,r0⟩ the remainder.
+# Möller–Granlund Alg. 2: candidate off by at most 1 either way, same fixup
+# structure as div_2by1 (first masked, second rare and branchy).
+@inline function div_3by2(u2::Limb, u1::Limb, u0::Limb, d1::Limb, d0::Limb, v::Limb)
+    dd = (DLimb(d1) << 64) | d0
+    q = DLimb(v) * u2 + ((DLimb(u2) << 64) | u1)
+    q1 = (q >> 64) % Limb
+    q0 = q % Limb
+    r1 = u1 - q1 * d1
+    r = ((DLimb(r1) << 64) | u0) - DLimb(q1) * d0 - dd
+    q1 += one(Limb)
+    if (r >> 64) % Limb >= q0
+        q1 -= one(Limb)
+        r += dd
+    end
+    if r >= dd
+        q1 += one(Limb)
+        r -= dd
+    end
+    return q1, (r >> 64) % Limb, r % Limb
+end
+
+# Schoolbook (Knuth Algorithm D) quotient/remainder with 3/2 qhat estimation.
+# u (nn limbs) is destroyed: the m-limb remainder is left in u[1..m].
+# d must be normalized (top bit of d[m] set), m ≥ 2, v = invert_pi1 of its top
+# two limbs. Writes q[1..nn-m]; returns the extra top quotient bit qh ∈ {0,1}.
+function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
+                    d::Memory{Limb}, do_::Int, m::Int, v::Limb)
+    qn = nn - m
+    qh = zero(Limb)
+    if cmp_limbs(u, uo+qn, m, d, do_, m) >= 0
+        qh = one(Limb)
+        sub_n!(u, uo+qn, u, uo+qn, d, do_, m)
+    end
+    d1 = @inbounds d[do_+m]
+    d0 = @inbounds d[do_+m-1]
+    n1 = @inbounds u[uo+nn]   # top window limb lives in a register; its memory slot is stale
+    @inbounds for j in qn:-1:1
+        if n1 == d1 && u[uo+j+m-1] == d0
+            # ⟨n1, u1⟩ == ⟨d1, d0⟩: qhat = β-1 exactly, and the window bound
+            # W < β·d guarantees no borrow past the top limb.
+            qhat = typemax(Limb)
+            submul_1!(u, uo+j-1, d, do_, m, qhat)
+            n1 = u[uo+j+m-1]
+        else
+            qhat, r1, r0 = div_3by2(n1, u[uo+j+m-1], u[uo+j+m-2], d1, d0, v)
+            cy = m > 2 ? submul_1!(u, uo+j-1, d, do_, m-2, qhat) : zero(Limb)
+            cy1 = Limb(r0 < cy)
+            r0 -= cy
+            cy2 = r1 < cy1
+            r1 -= cy1
+            if cy2   # rare: qhat one too large, add the divisor back
+                qhat -= one(Limb)
+                c = m > 2 ? add_n!(u, uo+j-1, u, uo+j-1, d, do_, m-2) : zero(Limb)
+                s = ((DLimb(r1) << 64) | r0) + ((DLimb(d1) << 64) | d0) + c
+                r1 = (s >> 64) % Limb   # 128-bit overflow cancels the borrow
+                r0 = s % Limb
+            end
+            u[uo+j+m-2] = r0
+            n1 = r1
+        end
+        q[qo+j] = qhat
+    end
+    @inbounds u[uo+m] = n1
+    return qh
+end
+
 function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb)
     l = leading_zeros(d)
     dn = d << l

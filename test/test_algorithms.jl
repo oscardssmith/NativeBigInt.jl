@@ -1,5 +1,5 @@
 # Algorithm tests
-using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, KARATSUBA_THRESHOLD
+using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, KARATSUBA_THRESHOLD, divrem!
 using Random: MersenneTwister
 
 amem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -100,5 +100,72 @@ using NativeBigInt: mul!
     for trial in 1:60
         m = rand(rng, 1:3T); n = rand(rng, 1:m)
         checkmul(m, n, amem(rand(rng, UInt64, m)), amem(rand(rng, UInt64, n)))
+    end
+end
+
+@testset "divrem! multi-limb" begin
+    rng = MersenneTwister(23)
+
+    function checkdiv(a::Memory{UInt64}, n, d::Memory{UInt64}, m)
+        aref = atoref(a, 0, n); dref = atoref(d, 0, m)
+        q = Memory{UInt64}(undef, n - m + 1)
+        r = Memory{UInt64}(undef, m)
+        divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+        @test atoref(q, 0, n - m + 1) == aref ÷ dref
+        @test atoref(r, 0, m) == aref % dref
+    end
+
+    # random sweep over sizes, normalized and unnormalized divisors
+    for trial in 1:200
+        n = rand(rng, 1:40); m = rand(rng, 1:n)
+        a = amem(rand(rng, UInt64, n))
+        d = amem(rand(rng, UInt64, m))
+        d[m] == 0 && (d[m] = UInt64(1))
+        rand(rng) < 0.5 && (d[m] |= UInt64(1) << 63)   # normalized divisor path
+        checkdiv(a, n, d, m)
+    end
+
+    # adversarial: all-ones numerator, minimal/maximal normalized divisors
+    for (n, m) in ((5, 2), (8, 3), (12, 7), (3, 3), (9, 2))
+        ones_a = amem(fill(typemax(UInt64), n))
+        for dv in (vcat(zeros(UInt64, m - 1), UInt64(1) << 63),       # d = B^m / 2
+                   fill(typemax(UInt64), m),                          # d = B^m - 1
+                   vcat(fill(typemax(UInt64), m - 1), UInt64(1) << 63))
+            checkdiv(ones_a, n, amem(copy(dv)), m)
+        end
+    end
+
+    # qhat == B-1 special case: numerator top limbs replicate the divisor's
+    for trial in 1:50
+        m = rand(rng, 2:6); n = m + rand(rng, 1:4)
+        dref = atoref(amem(rand(rng, UInt64, m)), 0, m) | (big(1) << (64m - 1))
+        # a = d * (B^k - 1) + small ⟹ quotient limbs of typemax
+        k = n - m
+        aref = dref * ((big(1) << (64k)) - 1) + rand(rng, big(0):dref-1)
+        checkdiv(afrombig(aref, n), n, afrombig(dref, m), m)
+    end
+
+    # add-back stress: fat low divisor limbs make qhat overshoot as likely as possible
+    for trial in 1:300
+        m = rand(rng, 3:8); n = m + rand(rng, 1:6)
+        dv = fill(typemax(UInt64), m); dv[m] = UInt64(1) << 63
+        av = fill(typemax(UInt64), n)
+        for i in 1:n
+            rand(rng) < 0.3 && (av[i] = rand(rng, UInt64))
+        end
+        checkdiv(amem(av), n, amem(dv), m)
+    end
+
+    # exact multiples and quotient == 0
+    for trial in 1:50
+        m = rand(rng, 2:8); n = m + rand(rng, 0:6)
+        dref = atoref(amem(rand(rng, UInt64, m)), 0, m)
+        dref == 0 && continue
+        dref |= big(1) << (64 * (m - 1))          # keep m limbs
+        qref = rand(rng, big(0):(big(1) << (64 * (n - m))) - 1)
+        aref = qref * dref
+        aref < big(1) << (64n) || continue
+        checkdiv(afrombig(aref, n), n, afrombig(dref, m), m)
+        checkdiv(afrombig(dref - 1, m), m, afrombig(dref, m), m)   # a < d ⟹ q = 0
     end
 end

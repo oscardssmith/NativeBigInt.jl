@@ -1,5 +1,5 @@
 # Kernel tests
-using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!, lshift!, rshift!, divrem_1!, invert_limb, div_2by1
+using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!, lshift!, rshift!, divrem_1!, invert_limb, div_2by1, invert_pi1, div_3by2, divrem_bc!
 using Random: MersenneTwister
 
 mem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -206,6 +206,99 @@ end
             num = (big(u1) << 64) | u0
             @test big(qq) == num ÷ d && big(rr) == num % d
         end
+    end
+end
+
+@testset "invert_pi1 / div_3by2" begin
+    rng = MersenneTwister(17)
+    β = big(1) << 64
+    hi = UInt64(1) << 63
+    dpairs = Tuple{UInt64,UInt64}[
+        (hi, UInt64(0)), (hi, UInt64(1)), (hi, typemax(UInt64)),
+        (typemax(UInt64), typemax(UInt64)), (typemax(UInt64), UInt64(0)),
+        (hi | UInt64(1), typemax(UInt64) - 1),
+    ]
+    for _ in 1:30
+        push!(dpairs, (rand(rng, UInt64) | hi, rand(rng, UInt64)))
+    end
+    for (d1, d0) in dpairs
+        D = (big(d1) << 64) | d0
+        v = invert_pi1(d1, d0)
+        @test big(v) == (β^3 - 1) ÷ D - β
+        for trial in 1:40
+            # numerator top two limbs strictly below ⟨d1,d0⟩
+            num = rand(rng, big(0):(D << 64) - 1)
+            u2 = UInt64((num >> 128) & typemax(UInt64))
+            u1 = UInt64((num >> 64) & typemax(UInt64))
+            u0 = UInt64(num & typemax(UInt64))
+            (big(u2) << 64) | u1 < D || continue
+            q, r1, r0 = div_3by2(u2, u1, u0, d1, d0, v)
+            @test big(q) == num ÷ D
+            @test (big(r1) << 64) | r0 == num % D
+        end
+        # boundary numerators: just below D*B, exact multiples, tiny
+        for num in ((D << 64) - 1, D * 7, D, big(0), D - 1, (D << 64) - D)
+            u2 = UInt64((num >> 128) & typemax(UInt64))
+            u1 = UInt64((num >> 64) & typemax(UInt64))
+            u0 = UInt64(num & typemax(UInt64))
+            (big(u2) << 64) | u1 < D || continue
+            q, r1, r0 = div_3by2(u2, u1, u0, d1, d0, v)
+            @test big(q) == num ÷ D
+            @test (big(r1) << 64) | r0 == num % D
+        end
+    end
+end
+
+@testset "divrem_bc! rare branches" begin
+    # These paths fire with probability ~2^-64 on random inputs, so construct
+    # them explicitly and run the basecase directly on normalized divisors.
+    rng = MersenneTwister(29)
+    hib = UInt64(1) << 63
+
+    function checkbc(uref::BigInt, nn, dref::BigInt, m)
+        u = Memory{UInt64}(undef, nn)
+        for i in 1:nn
+            u[i] = UInt64((uref >> (64 * (i - 1))) & typemax(UInt64))
+        end
+        d = Memory{UInt64}(undef, m)
+        for i in 1:m
+            d[i] = UInt64((dref >> (64 * (i - 1))) & typemax(UInt64))
+        end
+        q = Memory{UInt64}(undef, nn - m)
+        v = invert_pi1(d[m], d[m-1])
+        qh = divrem_bc!(q, 0, u, 0, nn, d, 0, m, v)
+        got_q = (big(qh) << (64 * (nn - m))) | toref(q, 0, nn - m)
+        @test got_q == uref ÷ dref
+        @test toref(u, 0, m) == uref % dref
+    end
+
+    β = big(1) << 64
+    for trial in 1:100
+        # add-back: window = qe·⟨d1,d0⟩·B + w with w < qe·dl0 forces the 3/2
+        # estimate one too high once the low-limb borrow lands
+        d1 = rand(rng, UInt64) | hib
+        d0 = rand(rng, UInt64)
+        dl0 = rand(rng, UInt64) | 1
+        qe = rand(rng, UInt64(2):typemax(UInt64))
+        w = rand(rng, big(0):min(big(qe) * dl0, β) - 1)
+        dref = ((big(d1) << 64 | d0) << 64) | dl0
+        uref = (big(qe) * (big(d1) << 64 | d0)) << 64 | w
+        @assert uref < dref * β && uref ÷ dref == qe - 1
+        checkbc(uref, 4, dref, 3)
+
+        # qhat == β-1 special case: top two window limbs equal ⟨d1,d0⟩
+        x = rand(rng, UInt64(0):(dl0 - 1))
+        uref2 = (((big(d1) << 64 | d0) << 64) | x) << 64 | rand(rng, UInt64)
+        @assert uref2 < dref * β
+        checkbc(uref2, 4, dref, 3)
+
+        # same two shapes with extra low divisor limbs (m = 5)
+        low = rand(rng, big(0):(big(1) << 128) - 1)
+        dref5 = (((big(d1) << 64 | d0) << 64) | dl0) << 128 | low
+        uref5 = uref * (β^2) + rand(rng, big(0):β^2 - 1)
+        uref5 ÷ dref5 < β && checkbc(uref5, 6, dref5, 5)
+        uref6 = uref2 * (β^2) + rand(rng, big(0):β^2 - 1)
+        uref6 < dref5 * β && checkbc(uref6, 6, dref5, 5)
     end
 end
 
