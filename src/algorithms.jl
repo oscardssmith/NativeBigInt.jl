@@ -1,7 +1,7 @@
 # Multi-limb algorithms built on the kernels: Karatsuba multiplication.
 
 # Below this operand length (limbs) mul_basecase! wins; benchmark-tuned.
-const KARATSUBA_THRESHOLD = 25
+const KARATSUBA_THRESHOLD = 33
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
