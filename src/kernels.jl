@@ -244,54 +244,87 @@ end
     return hin + brw
 end
 
-# Two rows of b per pass over a: the two mulx chains are independent and
-# interleave in the OOO window, and r is traversed half as often. The column
-# carry hi0 + o1 + o2 + o3 can be exactly 2^64 (doesn't fit a limb), so o1/o2
-# ride into the next iteration's 128-bit p0 accumulation (cb, weight-correct
-# and headroom-safe) and c0 = hi0 + o3 <= typemax stays representable.
+# One scalar lane of addmul_2!: r[j] += lo(a*b0) + carry-in state, returning
+# the updated (c, qin, hin2, hin1). q merges hi(a*b0) + lo(a*b1) (both weight
+# +1); its overflow bit has weight +2 and folds into the hi(a*b1) stream,
+# which is <= typemax-1 so the fold cannot overflow.
+@inline function addmul_2_lane(rj::Limb, aj::Limb, b0::Limb, b1::Limb, c::Limb, qin::Limb, hin2::Limb, hin1::Limb)
+    p0 = widemul(aj, b0)
+    p1 = widemul(aj, b1)
+    t = UInt128(rj) + (p0 % Limb) + qin + hin2 + c
+    q, o = Base.add_with_overflow((p0 >> 64) % Limb, p1 % Limb)
+    return t % Limb, (t >> 64) % Limb, q, hin1, ((p1 >> 64) % Limb) + Limb(o)
+end
+
+# Two rows of b per pass over a, SIMD (same cold-propagate idea as addmul_1!):
+# per lane r += lo0 + q<<64 + h<<128 with q = hi0+lo1, h = hi1+overflow(q), so
+# the resolved carry-in is 0..3 and can only chain when some lane sum
+# >= typemax-2 (~2^-62-rare), which falls back to a scalar block. Versus two
+# addmul_1! passes this halves the r loads/stores and loop overhead.
+# Writes (not adds) the two overflow limbs r[m+1], r[m+2].
 @inline function addmul_2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int, b0::Limb, b1::Limb)
-    c0 = zero(Limb); c1 = zero(Limb); prev_lo1 = zero(Limb); cb = zero(Limb)
-    @inbounds for i in 1:m
-        p0 = widemul(a[ao+i], b0) + cb
-        lo0 = p0 % Limb; hi0 = (p0 >> 64) % Limb
-        p1 = widemul(a[ao+i], b1) + c1
-        lo1 = p1 % Limb; c1 = (p1 >> 64) % Limb
-        t, o1 = Base.add_with_overflow(r[ro+i], lo0)
-        t, o2 = Base.add_with_overflow(t, prev_lo1)
-        t, o3 = Base.add_with_overflow(t, c0)
-        r[ro+i] = t
-        cb = Limb(o1) + Limb(o2)
-        c0 = hi0 + Limb(o3)
-        prev_lo1 = lo1
+    b00 = b0 & LO32; b01 = b0 >> 32
+    b10 = b1 & LO32; b11 = b1 >> 32
+    c = zero(Limb)     # resolved carry into the next lane (0..3)
+    qin = zero(Limb)   # q = hi0+lo1 pending from the previous lane
+    hin2 = zero(Limb)  # h = hi1+carry(q) pending from two lanes back
+    hin1 = zero(Limb)  # h pending from the previous lane
+    z = zero(Limb)
+    i = 1
+    @inbounds while i + 7 <= m
+        va = SIMD.vload(V8, a, ao + i)
+        vr = SIMD.vload(V8, r, ro + i)
+        lo0, hi0 = mul128_v8(va, b00, b01)
+        lo1, hi1 = mul128_v8(va, b10, b11)
+        q = hi0 + lo1
+        h = hi1 + SIMD.vifelse(q < hi0, V8(one(Limb)), V8(zero(Limb)))
+        pq = SIMD.shufflevector(q, V8(qin), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+        ph = SIMD.shufflevector(h, V8((hin2, hin1, z, z, z, z, z, z)),
+                                Val((8, 9, 0, 1, 2, 3, 4, 5)))
+        s1 = vr + lo0
+        g1 = SIMD.vifelse(s1 < vr, V8(one(Limb)), V8(zero(Limb)))
+        s2 = s1 + pq
+        g2 = SIMD.vifelse(s2 < s1, V8(one(Limb)), V8(zero(Limb)))
+        s3 = s2 + ph
+        g3 = SIMD.vifelse(s3 < s2, V8(one(Limb)), V8(zero(Limb)))
+        if any(s3 >= V8(typemax(Limb) - Limb(2)))
+            Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], c, qin, hin2, hin1) =
+                addmul_2_lane(r[ro+i+k-1], a[ao+i+k-1], b0, b1, c, qin, hin2, hin1))
+        else
+            g = g1 + g2 + g3
+            cv = SIMD.shufflevector(g, V8(c), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+            SIMD.vstore(s3 + cv, r, ro + i)
+            c = g[8]
+            qin = q[8]
+            hin2 = h[7]
+            hin1 = h[8]
+        end
+        i += 8
+    end
+    @inbounds while i <= m
+        (r[ro+i], c, qin, hin2, hin1) =
+            addmul_2_lane(r[ro+i], a[ao+i], b0, b1, c, qin, hin2, hin1)
+        i += 1
     end
     @inbounds begin
-        t, oa = Base.add_with_overflow(prev_lo1, c0)
-        t, ob = Base.add_with_overflow(t, cb)
-        r[ro+m+1] = t
-        r[ro+m+2] = c1 + Limb(oa) + Limb(ob)
+        t = UInt128(qin) + hin2 + c
+        r[ro+m+1] = t % Limb
+        # the full product fits m+2 limbs, so this top add cannot overflow
+        r[ro+m+2] = hin1 + (t >> 64) % Limb
     end
     return nothing
 end
 
-# Row-width crossover between addmul_2! rows and SIMD addmul_1! rows.
-# 0 = SIMD addmul_1! everywhere: two SIMD rows now beat one scalar addmul_2!.
-const MUL_BC_SIMD_THRESHOLD = 0
-
+# addmul_2! beats two addmul_1! rows at every width, so always pair rows.
 function mul_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int, b::Memory{Limb}, bo::Int, n::Int)
     @inbounds r[ro+m+1] = mul_1!(r, ro, a, ao, m, b[bo+1])
-    if m < MUL_BC_SIMD_THRESHOLD
-        j = 2
-        @inbounds while j + 1 <= n
-            addmul_2!(r, ro+j-1, a, ao, m, b[bo+j], b[bo+j+1])
-            j += 2
-        end
-        @inbounds if j <= n
-            r[ro+m+j] = addmul_1!(r, ro+j-1, a, ao, m, b[bo+j])
-        end
-    else
-        @inbounds for j in 2:n
-            r[ro+m+j] = addmul_1!(r, ro+j-1, a, ao, m, b[bo+j])
-        end
+    j = 2
+    @inbounds while j + 1 <= n
+        addmul_2!(r, ro+j-1, a, ao, m, b[bo+j], b[bo+j+1])
+        j += 2
+    end
+    @inbounds if j <= n
+        r[ro+m+j] = addmul_1!(r, ro+j-1, a, ao, m, b[bo+j])
     end
     return nothing
 end
