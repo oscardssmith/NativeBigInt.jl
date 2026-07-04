@@ -69,3 +69,29 @@ function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
     add_carry!(r, ro + h2, 2n - h2, L + 1, c)
     return nothing
 end
+
+# General product r[1..m+n] = a[1..m] * b[1..n], m >= n >= 1; r must not
+# alias a or b. Karatsuba on n-limb chunks of a; each block's low n limbs
+# accumulate into r, its high limbs land in fresh territory (plus carry).
+function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
+              b::Memory{Limb}, bo::Int, n::Int)
+    if n < KARATSUBA_THRESHOLD
+        return mul_basecase!(r, ro, a, ao, m, b, bo, n)
+    end
+    scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n))
+    kar_mul!(r, ro, a, ao, b, bo, n, scratch, 2n)
+    i = n
+    while i < m
+        chunk = min(n, m - i)
+        if chunk == n
+            kar_mul!(scratch, 0, a, ao + i, b, bo, n, scratch, 2n)
+        else
+            mul!(scratch, 0, b, bo, n, a, ao + i, chunk)  # ragged tail, n x chunk
+        end
+        c = add_n!(r, ro + i, r, ro + i, scratch, 0, n)
+        copy_tail!(r, ro + i, scratch, 0, n + 1, n + chunk)
+        add_carry!(r, ro + i, m + n - i, n + 1, c)
+        i += chunk
+    end
+    return nothing
+end

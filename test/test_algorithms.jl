@@ -72,3 +72,33 @@ using NativeBigInt: kar_mul!
     half = rand(rng, UInt64, T + 1)
     check(n, amem([half; half]), amem(rand(rng, UInt64, n)))
 end
+
+using NativeBigInt: mul!
+
+@testset "mul! general" begin
+    rng = MersenneTwister(7)
+    T = KARATSUBA_THRESHOLD
+    checkmul(m, n, a, b) = begin
+        r = Memory{UInt64}(undef, m + n)
+        mul!(r, 0, a, 0, m, b, 0, n)
+        @test atoref(r, 0, m + n) == atoref(a, 0, m) * atoref(b, 0, n)
+    end
+    # unbalanced shapes: basecase small-n, exact multiples, ragged tails,
+    # tail chunk itself above/below threshold
+    for (m, n) in ((100, 3), (64, 33), (2T, T), (2T + 5, T), (3T + 2, T + 1),
+                   (200, T), (2T + T ÷ 2, T)), trial in 1:5
+        checkmul(m, n, amem(rand(rng, UInt64, m)), amem(rand(rng, UInt64, n)))
+    end
+    # all-ones stress across the chunk boundaries
+    m, n = 3T + 2, T + 1
+    checkmul(m, n, amem(fill(typemax(UInt64), m)), amem(fill(typemax(UInt64), n)))
+    # m == n delegates to balanced path
+    for nn in (T, 2T + 1)
+        checkmul(nn, nn, amem(rand(rng, UInt64, nn)), amem(rand(rng, UInt64, nn)))
+    end
+    # differential sweep vs BigInt over random sizes
+    for trial in 1:60
+        m = rand(rng, 1:3T); n = rand(rng, 1:m)
+        checkmul(m, n, amem(rand(rng, UInt64, m)), amem(rand(rng, UInt64, n)))
+    end
+end
