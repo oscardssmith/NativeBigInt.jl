@@ -43,6 +43,40 @@ toref(m, off, n) = (x = big(0); for i in n:-1:1; x = (x << 64) | m[off+i]; end; 
     @test cmp_limbs(mem([UInt64(9), UInt64(1)]), 0, 2, mem([UInt64(0), UInt64(2)]), 0, 2) == -1
 end
 
+@testset "add_n! SIMD cold path" begin
+    # deterministic cases hitting the s == typemax guard inside 8-limb SIMD blocks
+    for n in (8, 16, 24, 30)
+        # full ripple: (B^n - 1) + 1 chains a carry through every lane
+        a = mem(fill(typemax(UInt64), n)); b = mem([one(UInt64); zeros(UInt64, n - 1)])
+        r = Memory{UInt64}(undef, n)
+        @test add_n!(r, 0, a, 0, b, 0, n) == 1 && all(iszero, r)
+        # typemax-sum lane with no incoming carry: cold path fires, result unchanged
+        a2 = mem(fill(UInt64(1), n))
+        b2v = fill(UInt64(2), n); b2v[3] = typemax(UInt64) - 1; b2v[min(10, n)] = typemax(UInt64) - 1
+        b2 = mem(b2v)
+        r2 = Memory{UInt64}(undef, n)
+        c2 = add_n!(r2, 0, a2, 0, b2, 0, n)
+        @test toref(r2, 0, n) + (big(c2) << (64n)) == toref(a2, 0, n) + toref(b2, 0, n)
+        # carry generated in lane 1 chains through typemax lanes mid-block
+        av = fill(typemax(UInt64), n)
+        bv = zeros(UInt64, n); bv[1] = 1; bv[n] = 5
+        a3 = mem(av); b3 = mem(bv)
+        r3 = Memory{UInt64}(undef, n)
+        c3 = add_n!(r3, 0, a3, 0, b3, 0, n)
+        @test toref(r3, 0, n) + (big(c3) << (64n)) == toref(a3, 0, n) + toref(b3, 0, n)
+        # carry entering a block whose lane 0 sums to typemax (block-boundary chain)
+        a4v = fill(UInt64(7), n); a4v[8] = typemax(UInt64)
+        b4v = fill(UInt64(9), n); b4v[8] = 1
+        if n > 8
+            a4v[9] = typemax(UInt64); b4v[9] = 0
+        end
+        a4 = mem(a4v); b4 = mem(b4v)
+        r4 = Memory{UInt64}(undef, n)
+        c4 = add_n!(r4, 0, a4, 0, b4, 0, n)
+        @test toref(r4, 0, n) + (big(c4) << (64n)) == toref(a4, 0, n) + toref(b4, 0, n)
+    end
+end
+
 @testset "mul kernels" begin
     rng = MersenneTwister(1)
     for n in (1, 2, 5, 20), trial in 1:50
