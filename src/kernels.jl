@@ -69,23 +69,39 @@ end
     return brw
 end
 
+# Once the carry/borrow dies (expected after ~1 limb), the rest of the tail is
+# a plain copy; keeping it out of the carry loop lets LLVM vectorize it.
+@inline function copy_tail!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, from::Int, to::Int)
+    (r === a && ro == ao) && return nothing
+    @inbounds for i in from:to
+        r[ro+i] = a[ao+i]
+    end
+    return nothing
+end
+
 @inline function add!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, la::Int, b::Memory{Limb}, bo::Int, lb::Int)
     c = add_n!(r, ro, a, ao, b, bo, lb)
-    @inbounds for i in lb+1:la
+    i = lb + 1
+    @inbounds while c != 0 && i <= la
         s, o = Base.add_with_overflow(a[ao+i], c)
         r[ro+i] = s
         c = Limb(o)
+        i += 1
     end
+    copy_tail!(r, ro, a, ao, i, la)
     return c
 end
 
 @inline function sub!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, la::Int, b::Memory{Limb}, bo::Int, lb::Int)
     brw = sub_n!(r, ro, a, ao, b, bo, lb)
-    @inbounds for i in lb+1:la
+    i = lb + 1
+    @inbounds while brw != 0 && i <= la
         d, o = Base.sub_with_overflow(a[ao+i], brw)
         r[ro+i] = d
         brw = Limb(o)
+        i += 1
     end
+    copy_tail!(r, ro, a, ao, i, la)
     return brw
 end
 
