@@ -1,5 +1,5 @@
 # Kernel tests
-using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!, lshift!, rshift!, divrem_1!
+using NativeBigInt: Limb, DLimb, add_n!, sub_n!, add!, sub!, add_into!, cmp_limbs, mul_1!, addmul_1!, submul_1!, mul_basecase!, lshift!, rshift!, divrem_1!, invert_limb, div_2by1
 using Random: MersenneTwister
 
 mem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -181,5 +181,57 @@ end
         q = Memory{UInt64}(undef, n)
         rem = divrem_1!(q, 0, a, 0, n, d)
         @test toref(q, 0, n) == aref ÷ d && rem == aref % d
+    end
+end
+
+@testset "invert_limb / div_2by1" begin
+    rng = MersenneTwister(11)
+    β = big(1) << 64
+    for d in UInt64[UInt64(1) << 63, typemax(UInt64), 0x8000000000000001,
+                    rand(rng, UInt64, 20) .| (UInt64(1) << 63)...]
+        v = invert_limb(d)
+        @test big(v) == (β^2 - 1) ÷ d - β
+        for trial in 1:50
+            u1 = rand(rng, UInt64) % d      # remainder invariant: u1 < d
+            u0 = rand(rng, UInt64)
+            qq, rr = div_2by1(u1, u0, d, v)
+            num = (big(u1) << 64) | u0
+            @test big(qq) == num ÷ d && big(rr) == num % d
+        end
+        # adversarial: numerator just below (d:0) and near quotient boundary
+        for (u1, u0) in ((d - 1, typemax(UInt64)), (d - 1, UInt64(0)),
+                         (UInt64(0), d - 1), (UInt64(0), d), (d >> 1, d - 1))
+            u1 < d || continue
+            qq, rr = div_2by1(u1, u0, d, v)
+            num = (big(u1) << 64) | u0
+            @test big(qq) == num ÷ d && big(rr) == num % d
+        end
+    end
+end
+
+@testset "divrem_1! adversarial divisors" begin
+    rng = MersenneTwister(13)
+    for n in (1, 2, 5, 17), trial in 1:30
+        av = rand(rng, UInt64, n)
+        rand(rng) < 0.3 && (av .= typemax(UInt64))
+        rand(rng) < 0.3 && (av[n] = UInt64(1))
+        a = mem(av); aref = toref(a, 0, n)
+        for d in UInt64[1, 2, 3, 10, UInt64(1) << 32, UInt64(1) << 63,
+                        typemax(UInt64), typemax(UInt64) - 1, rand(rng, UInt64) | 1]
+            q = Memory{UInt64}(undef, n)
+            rem = divrem_1!(q, 0, a, 0, n, d)
+            @test toref(q, 0, n) == aref ÷ d
+            @test rem == aref % d
+        end
+        # exact division and quotient == 0 cases
+        d = rand(rng, UInt64) >> rand(rng, 0:60) + UInt64(1)
+        q = Memory{UInt64}(undef, n)
+        prod = (aref ÷ d) * d
+        if prod > 0
+            pv = [UInt64((prod >> (64 * (i - 1))) & typemax(UInt64)) for i in 1:n]
+            p = mem(pv)
+            rem = divrem_1!(q, 0, p, 0, n, d)
+            @test rem == 0 && toref(q, 0, n) == prod ÷ d
+        end
     end
 end

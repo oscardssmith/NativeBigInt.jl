@@ -401,12 +401,49 @@ end
     return ret
 end
 
-@inline function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb)
-    rem = zero(Limb)
-    @inbounds for i in n:-1:1
-        num = (DLimb(rem) << 64) | a[ao+i]
-        q[qo+i] = (num ÷ d) % Limb
-        rem = (num % d) % Limb
+# Möller–Granlund reciprocal: v = ⌊(β²-1)/d⌋ - β for normalized d (top bit set).
+# One hardware 128/64 divide at setup; every per-limb divide becomes 2 muls.
+@inline function invert_limb(d::Limb)
+    return ((typemax(DLimb) - (DLimb(d) << 64)) ÷ d) % Limb
+end
+
+# Divide (u1:u0) by normalized d given v = invert_limb(d); requires u1 < d.
+# The first fixup fires ~50% of the time, so it is masked (branch-free) to keep
+# the loop-carried remainder chain free of mispredicts; the second is rare and branchy.
+@inline function div_2by1(u1::Limb, u0::Limb, d::Limb, v::Limb)
+    p = DLimb(v) * u1 + ((DLimb(u1) << 64) | u0)
+    q1 = (p >> 64) % Limb + one(Limb)
+    q0 = p % Limb
+    r = u0 - q1 * d
+    mask = -Limb(r > q0)
+    q1 += mask
+    r += d & mask
+    if r >= d
+        q1 += one(Limb)
+        r -= d
     end
-    return rem
+    return q1, r
+end
+
+function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb)
+    l = leading_zeros(d)
+    dn = d << l
+    v = invert_limb(dn)
+    if l == 0
+        rem = zero(Limb)
+        @inbounds for i in n:-1:1
+            q[qo+i], rem = div_2by1(rem, a[ao+i], d, v)
+        end
+        return rem
+    end
+    # Divide the left-shifted numerator by dn; quotient limbs are unchanged
+    # and the true remainder is rem >> l. The spill a[n] >> (64-l) < 2^l ≤ dn
+    # seeds the running remainder, so no extra quotient limb is needed.
+    rem = @inbounds a[ao+n] >> (64 - l)
+    @inbounds for i in n:-1:2
+        u = (a[ao+i] << l) | (a[ao+i-1] >> (64 - l))
+        q[qo+i], rem = div_2by1(rem, u, dn, v)
+    end
+    @inbounds q[qo+1], rem = div_2by1(rem, a[ao+1] << l, dn, v)
+    return rem >> l
 end
