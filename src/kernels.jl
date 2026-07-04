@@ -273,8 +273,9 @@ end
     return nothing
 end
 
-# Below this row width addmul_2! rows beat the SIMD addmul_1! rows.
-const MUL_BC_SIMD_THRESHOLD = 24
+# Row-width crossover between addmul_2! rows and SIMD addmul_1! rows.
+# 0 = SIMD addmul_1! everywhere: two SIMD rows now beat one scalar addmul_2!.
+const MUL_BC_SIMD_THRESHOLD = 0
 
 function mul_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int, b::Memory{Limb}, bo::Int, n::Int)
     @inbounds r[ro+m+1] = mul_1!(r, ro, a, ao, m, b[bo+1])

@@ -104,12 +104,36 @@ end
     @test toref(r, 0, 7) == toref(a, 0, 4) * toref(b, 0, 3)
 end
 
+@testset "addmul_2! direct" begin
+    rng = MersenneTwister(99)
+    addmul_2! = NativeBigInt.addmul_2!
+    check2(m, av, b0, b1) = begin
+        a = mem(av)
+        rv = rand(rng, UInt64, m + 2)
+        r = mem(copy(rv))
+        addmul_2!(r, 0, a, 0, m, b0, b1)
+        want = toref(mem(rv), 0, m) + toref(a, 0, m) * (big(b0) + (big(b1) << 64))
+        @test toref(r, 0, m + 2) == want
+    end
+    # widths covering scalar-only, one vector block, blocks + tail
+    for m in (1, 2, 7, 8, 9, 16, 23, 24, 31), trial in 1:20
+        check2(m, rand(rng, UInt64, m), rand(rng, UInt64), rand(rng, UInt64))
+    end
+    # cold path: all-ones a with all-ones b limbs maximizes lane sums/carries
+    for m in (8, 16, 24, 31)
+        check2(m, fill(typemax(UInt64), m), typemax(UInt64), typemax(UInt64))
+        # sparse typemax lanes mid-block
+        av = fill(UInt64(1), m); av[3] = typemax(UInt64); av[min(10, m)] = typemax(UInt64) - 1
+        check2(m, av, typemax(UInt64), UInt64(2))
+    end
+end
+
 @testset "addmul_2! carry saturation" begin
     # typemax-dense operands drive the addmul_2! column carry to exactly 2^64
     # (hi0 = 2^64-2 plus two overflow bits), which a limb-sized carry drops
     rng = MersenneTwister(1234)
     for trial in 1:300
-        m = rand(rng, 8:23); n = rand(rng, 2:40)  # m < MUL_BC_SIMD_THRESHOLD path
+        m = rand(rng, 8:23); n = rand(rng, 2:40)
         av = rand(rng, UInt64, m); bv = rand(rng, UInt64, n)
         for i in 1:m; rand(rng) < 0.5 && (av[i] = typemax(UInt64) - rand(rng, 0:1)); end
         for i in 1:n; rand(rng) < 0.5 && (bv[i] = typemax(UInt64) - rand(rng, 0:1)); end
