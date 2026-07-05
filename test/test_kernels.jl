@@ -472,3 +472,23 @@ end
         end
     end
 end
+
+@testset "divrem! small-quotient subtraction path" begin
+    rng = MersenneTwister(77)
+    for m in (3, 4, 8, 31), k in (0, 1, 2, 3, 7, 8, 9), trial in 1:10
+        d = mem(rand(rng, UInt64, m))
+        d[m] |= trial % 2 == 0 ? UInt64(1) << 63 : UInt64(1) << 40  # norm + unnorm
+        dref = toref(d, 0, m)
+        rref = trial % 3 == 0 ? dref - 1 : (trial % 3 == 1 ? big(0) : rand(rng, big(0):dref-1))
+        aref = k * dref + rref
+        nbits = ndigits(aref, base = 2)
+        n = max(cld(nbits, 64), m)   # a needs >= m limbs for the contract
+        n * 64 < nbits && (n += 1)
+        a = mem(UInt64[UInt64((aref >> (64j)) & typemax(UInt64)) for j in 0:n-1])
+        q = Memory{UInt64}(undef, n - m + 1)
+        r = Memory{UInt64}(undef, m)
+        NativeBigInt.divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+        @test toref(q, 0, n - m + 1) == k
+        @test toref(r, 0, m) == rref
+    end
+end

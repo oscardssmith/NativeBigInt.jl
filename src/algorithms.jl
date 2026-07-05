@@ -138,6 +138,26 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
         @inbounds r[ro+2] = r1
         return nothing
     end
+    # Small-quotient fast path: bitlength(a) - bitlength(d) ≤ 2 bounds the
+    # quotient below 8 (a/d < 2^(Δ+1)), so at most 7 subtraction sweeps beat
+    # the scratch-alloc + normalize + invert + basecase machinery. Δ ≤ 2 also
+    # forces n ≤ m+1 with a[n] < 4, so the value fits r plus one register.
+    dbits = 64n - leading_zeros(@inbounds a[ao+n]) -
+            (64m - leading_zeros(@inbounds d[do_+m]))
+    if dbits <= 2
+        @inbounds for i in 1:m
+            r[ro+i] = a[ao+i]
+        end
+        t = n > m ? (@inbounds a[ao+n]) : zero(Limb)
+        c = zero(Limb)
+        while t != zero(Limb) || cmp_limbs(r, ro, m, d, do_, m) >= 0
+            t -= sub_n!(r, ro, r, ro, d, do_, m)
+            c += one(Limb)
+        end
+        @inbounds q[qo+1] = c
+        n > m && (@inbounds q[qo+2] = zero(Limb))
+        return nothing
+    end
     l = leading_zeros(@inbounds d[do_+m])
     nn = n + 1
     scratch = Memory{Limb}(undef, nn + (l > 0 ? m : 0))
