@@ -32,6 +32,10 @@ end
         @test BigInt(na + nb) == a + b
         @test BigInt(na - nb) == a - b
         @test BigInt(na * nb) == a * b
+        if la <= 4
+            e = rand(rng, 0:12)
+            @test BigInt(na^e) == a^e
+        end
         k = rand(rng, 0:200)
         @test BigInt(na << k) == a << k
         @test BigInt(na >> k) == a >> k

@@ -52,3 +52,23 @@ end
     @test trailing_zeros(NBig(big(2)^100)) == 100
     @test count_ones(NBig(big(2)^100 - 1)) == 100
 end
+
+@testset "NBig pow" begin
+    @test NBig(0)^0 == NBig(1)
+    @test NBig(0)^5 == NBig(0)
+    @test NBig(-2)^3 == NBig(-8) && NBig(-2)^4 == NBig(16)
+    @test NBig(2)^100 == NBig(big(2)^100)
+    # negative exponents must match BigInt behavior exactly (value or exception)
+    function outcome(f)
+        try
+            return (:val, f())
+        catch err
+            return (:err, typeof(err))
+        end
+    end
+    for (x, e) in ((1, -5), (-1, -3), (-1, -4), (2, -1), (-2, -1), (0, -1))
+        want = outcome(() -> big(x)^e)
+        got = outcome(() -> BigInt(NBig(x)^e))
+        @test got == want
+    end
+end
