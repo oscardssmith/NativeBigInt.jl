@@ -244,6 +244,73 @@ end
     return hin + brw
 end
 
+# One scalar lane of submul_2!: r[j] -= lo(a*b0) + pending state, returning
+# the updated (brw, qin, hin2, hin1). Product stream identical to
+# addmul_2_lane; the subtraction's two's-complement hi limb gives the 0..3
+# borrow directly.
+@inline function submul_2_lane(rj::Limb, aj::Limb, b0::Limb, b1::Limb, brw::Limb, qin::Limb, hin2::Limb, hin1::Limb)
+    p0 = widemul(aj, b0)
+    p1 = widemul(aj, b1)
+    t = DLimb(p0 % Limb) + qin + hin2 + brw
+    dif = DLimb(rj) - t
+    q, o = Base.add_with_overflow((p0 >> 64) % Limb, p1 % Limb)
+    return dif % Limb, -((dif >> 64) % Limb), q, hin1, ((p1 >> 64) % Limb) + Limb(o)
+end
+
+# r[1..n] -= a[1..n] * (b0 + b1·β) (mod β^n); returns (co1, co0): the two-limb
+# value of weight β^n still to subtract (co ≤ β²-1 since ⌊a·b/β^n⌋ ≤ β²-2 and
+# the final borrow adds at most 1). Same product-stream layout and SIMD
+# cold-propagate scheme as addmul_2!, with a 0..3 borrow chain in place of the
+# carry chain: the resolved borrow-in can only chain when some lane difference
+# is <= 2, which falls back to a scalar block.
+@inline function submul_2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int, b0::Limb, b1::Limb)
+    b00 = b0 & LO32; b01 = b0 >> 32
+    b10 = b1 & LO32; b11 = b1 >> 32
+    brw = zero(Limb)   # resolved borrow into the next lane (0..3)
+    qin = zero(Limb)   # q = hi0+lo1 pending from the previous lane
+    hin2 = zero(Limb)  # h = hi1+overflow(q) pending from two lanes back
+    hin1 = zero(Limb)  # h pending from the previous lane
+    z = zero(Limb)
+    i = 1
+    @inbounds while i + 7 <= n
+        va = SIMD.vload(V8, a, ao + i)
+        vr = SIMD.vload(V8, r, ro + i)
+        lo0, hi0 = mul128_v8(va, b00, b01)
+        lo1, hi1 = mul128_v8(va, b10, b11)
+        q = hi0 + lo1
+        h = hi1 + SIMD.vifelse(q < hi0, V8(one(Limb)), V8(zero(Limb)))
+        pq = SIMD.shufflevector(q, V8(qin), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+        ph = SIMD.shufflevector(h, V8((hin2, hin1, z, z, z, z, z, z)),
+                                Val((8, 9, 0, 1, 2, 3, 4, 5)))
+        s1 = vr - lo0
+        g1 = SIMD.vifelse(vr < lo0, V8(one(Limb)), V8(zero(Limb)))
+        s2 = s1 - pq
+        g2 = SIMD.vifelse(s1 < pq, V8(one(Limb)), V8(zero(Limb)))
+        s3 = s2 - ph
+        g3 = SIMD.vifelse(s2 < ph, V8(one(Limb)), V8(zero(Limb)))
+        if any(s3 <= V8(Limb(2)))
+            Base.Cartesian.@nexprs 8 k -> ((r[ro+i+k-1], brw, qin, hin2, hin1) =
+                submul_2_lane(r[ro+i+k-1], a[ao+i+k-1], b0, b1, brw, qin, hin2, hin1))
+        else
+            g = g1 + g2 + g3
+            bv = SIMD.shufflevector(g, V8(brw), Val((8, 0, 1, 2, 3, 4, 5, 6)))
+            SIMD.vstore(s3 - bv, r, ro + i)
+            brw = g[8]
+            qin = q[8]
+            hin2 = h[7]
+            hin1 = h[8]
+        end
+        i += 8
+    end
+    @inbounds while i <= n
+        (r[ro+i], brw, qin, hin2, hin1) =
+            submul_2_lane(r[ro+i], a[ao+i], b0, b1, brw, qin, hin2, hin1)
+        i += 1
+    end
+    co = (DLimb(hin1) << 64) + qin + hin2 + brw
+    return (co >> 64) % Limb, co % Limb
+end
+
 # One scalar lane of addmul_2!: r[j] += lo(a*b0) + carry-in state, returning
 # the updated (c, qin, hin2, hin1). q merges hi(a*b0) + lo(a*b1) (both weight
 # +1); its overflow bit has weight +2 and folds into the hi(a*b1) stream,
@@ -481,10 +548,17 @@ end
     return q1, (r >> 64) % Limb, r % Limb
 end
 
-# Schoolbook (Knuth Algorithm D) quotient/remainder with 3/2 qhat estimation.
-# u (nn limbs) is destroyed: the m-limb remainder is left in u[1..m].
-# d must be normalized (top bit of d[m] set), m ≥ 2, v = invert_pi1 of its top
-# two limbs. Writes q[1..nn-m]; returns the extra top quotient bit qh ∈ {0,1}.
+# Schoolbook (Knuth Algorithm D) quotient/remainder, two quotient limbs per
+# pass (radix β²). u (nn limbs) is destroyed: the m-limb remainder is left in
+# u[1..m]. d must be normalized (top bit of d[m] set), m ≥ 2, v = invert_pi1 of
+# its top two limbs. Writes q[1..nn-m]; returns the extra top quotient bit qh.
+#
+# Each super-row: a 4/2 division of the top window (two chained div_3by2)
+# yields the exact quotient ⟨qhi,qlo⟩ of the top four limbs by ⟨d1,d0⟩ — a
+# single-super-digit Knuth estimate, at most 2 too large for normalized d
+# (TAOCP 4.3.1 Thm A/B) — then one submul_2! sweep subtracts both rows at
+# once, halving the passes over u versus limb-at-a-time. The top two window
+# limbs ⟨n1, n0⟩ live in registers across rows (their memory slots are stale).
 function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
                     d::Memory{Limb}, do_::Int, m::Int, v::Limb)
     qn = nn - m
@@ -495,38 +569,72 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     end
     d1 = @inbounds d[do_+m]
     d0 = @inbounds d[do_+m-1]
-    # The top two window limbs ⟨n1, n0⟩ live in registers across rows (their
-    # memory slots are stale): each row's remainder feeds the next row's
-    # div_3by2 directly, avoiding a store + store-forwarded reload per row.
+    dd = (DLimb(d1) << 64) | d0
     n1 = @inbounds u[uo+nn]
     n0 = @inbounds u[uo+nn-1]
-    @inbounds for j in qn:-1:1
+    j = qn
+    @inbounds while j >= 2
         if n1 == d1 && n0 == d0
-            # ⟨n1, n0⟩ == ⟨d1, d0⟩: qhat = β-1 exactly, and the window bound
-            # W < β·d guarantees no borrow past the top limb.
+            # ⟨n1, n0⟩ == ⟨d1, d0⟩ violates the div_3by2 precondition:
+            # qhat = β-1 exactly, and the window bound W < β·d guarantees no
+            # borrow past the top limb. One scalar row, then re-pair.
             qhat = typemax(Limb)
             u[uo+j+m-1] = n0   # submul needs the stale slot refreshed
             submul_1!(u, uo+j-1, d, do_, m, qhat)
             n1 = u[uo+j+m-1]
             n0 = u[uo+j+m-2]
+            q[qo+j] = qhat
+            j -= 1
+            continue
+        end
+        qhi, t1, t0 = div_3by2(n1, n0, u[uo+j+m-2], d1, d0, v)
+        qlo, r1, r0 = div_3by2(t1, t0, u[uo+j+m-3], d1, d0, v)
+        co1, co0 = m > 2 ? submul_2!(u, uo+j-2, d, do_, m-2, qlo, qhi) :
+                           (zero(Limb), zero(Limb))
+        rr = (DLimb(r1) << 64) | r0
+        co = (DLimb(co1) << 64) | co0
+        brw = rr < co
+        rr -= co
+        qq = (DLimb(qhi) << 64) | qlo
+        while brw   # rare: estimate 1 or 2 too large, add the divisor back
+            qq -= one(DLimb)
+            c = m > 2 ? add_n!(u, uo+j-2, u, uo+j-2, d, do_, m-2) : zero(Limb)
+            s, o1 = Base.add_with_overflow(rr, dd)
+            s, o2 = Base.add_with_overflow(s, DLimb(c))
+            brw = !(o1 | o2)   # 128-bit overflow cancels the borrow
+            rr = s
+        end
+        q[qo+j] = (qq >> 64) % Limb
+        q[qo+j-1] = qq % Limb
+        n1 = (rr >> 64) % Limb
+        n0 = rr % Limb
+        j -= 2
+    end
+    @inbounds if j == 1   # leftover scalar row (3/2 qhat, error ≤ 1)
+        if n1 == d1 && n0 == d0
+            qhat = typemax(Limb)
+            u[uo+m] = n0
+            submul_1!(u, uo, d, do_, m, qhat)
+            n1 = u[uo+m]
+            n0 = u[uo+m-1]
         else
-            qhat, r1, r0 = div_3by2(n1, n0, u[uo+j+m-2], d1, d0, v)
-            cy = m > 2 ? submul_1!(u, uo+j-1, d, do_, m-2, qhat) : zero(Limb)
+            qhat, r1, r0 = div_3by2(n1, n0, u[uo+m-1], d1, d0, v)
+            cy = m > 2 ? submul_1!(u, uo, d, do_, m-2, qhat) : zero(Limb)
             cy1 = Limb(r0 < cy)
             r0 -= cy
             cy2 = r1 < cy1
             r1 -= cy1
             if cy2   # rare: qhat one too large, add the divisor back
                 qhat -= one(Limb)
-                c = m > 2 ? add_n!(u, uo+j-1, u, uo+j-1, d, do_, m-2) : zero(Limb)
-                s = ((DLimb(r1) << 64) | r0) + ((DLimb(d1) << 64) | d0) + c
+                c = m > 2 ? add_n!(u, uo, u, uo, d, do_, m-2) : zero(Limb)
+                s = ((DLimb(r1) << 64) | r0) + dd + c
                 r1 = (s >> 64) % Limb   # 128-bit overflow cancels the borrow
                 r0 = s % Limb
             end
             n1 = r1
             n0 = r0
         end
-        q[qo+j] = qhat
+        q[qo+1] = qhat
     end
     @inbounds u[uo+m] = n1
     @inbounds u[uo+m-1] = n0

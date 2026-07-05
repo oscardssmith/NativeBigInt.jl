@@ -355,3 +355,90 @@ end
     r1, r0 = divrem_2!(a, 0, a, 0, 3, d1, d0)
     @test toref(a, 0, 2) == aref ÷ dref && (big(r1) << 64) | r0 == aref % dref
 end
+
+@testset "submul_2!" begin
+    using NativeBigInt: submul_2!
+    rng = MersenneTwister(33)
+    for n in (1, 2, 3, 7, 8, 9, 16, 31), trial in 1:20
+        a = mem(rand(rng, UInt64, n))
+        r = mem(rand(rng, UInt64, n))
+        trial % 4 == 0 && fill!(r, typemax(UInt64))
+        trial % 5 == 0 && fill!(a, typemax(UInt64))
+        trial % 7 == 0 && fill!(r, UInt64(0))
+        b0, b1 = rand(rng, UInt64), rand(rng, UInt64)
+        trial % 3 == 0 && (b0 = b1 = typemax(UInt64))
+        rref, aref = toref(r, 0, n), toref(a, 0, n)
+        bref = (big(b1) << 64) | b0
+        co1, co0 = submul_2!(r, 0, a, 0, n, b0, b1)
+        co = (big(co1) << 64) | co0
+        # exact identity: result - co·β^n == r - a*b
+        @test toref(r, 0, n) - (co << (64n)) == rref - aref * bref
+    end
+end
+
+@testset "divrem_bc! two-limb qhat add-back" begin
+    # d1 = 2^63 (minimal normalized) with saturated low limbs makes the
+    # 4/2 single-super-digit estimate exceed the true beta^2 quotient digit
+    # often (error up to 2), exercising the add-back correction.
+    rng = MersenneTwister(44)
+    err1 = 0; err2 = 0
+    for m in (3, 4, 5, 8), trial in 1:50
+        d = mem(fill(typemax(UInt64), m))
+        d[m] = UInt64(1) << 63
+        d[m-1] = trial % 2 == 0 ? UInt64(0) : rand(rng, UInt64)
+        n = m + rand(rng, 2:6)
+        a = mem(rand(rng, UInt64, n))
+        dref, aref = toref(d, 0, m), toref(a, 0, n)
+        # count super-digit estimate errors via BigInt simulation of the
+        # radix-beta^2 schoolbook loop (super-rows from j=qn, scalar at j==1)
+        dhat = (big(d[m]) << 64) | d[m-1]
+        qn = n + 1 - m
+        R = aref
+        R >> (64qn) >= dref && (R -= dref << (64qn))
+        j = qn
+        while j >= 2
+            W = R >> (64 * (j - 2))
+            top4 = W >> (64 * (m - 2))
+            if top4 >> 128 == dhat   # implementation takes a scalar special row
+                Ws = R >> (64 * (j - 1))
+                R -= (Ws ÷ dref) * dref << (64 * (j - 1))
+                j -= 1
+                continue
+            end
+            qhat = top4 ÷ dhat
+            qtrue = W ÷ dref
+            e = Int(qhat - qtrue)
+            e >= 1 && (err1 += 1)
+            e >= 2 && (err2 += 1)
+            R -= qtrue * dref << (64 * (j - 2))
+            j -= 2
+        end
+        q = Memory{UInt64}(undef, n - m + 1)
+        r = Memory{UInt64}(undef, m)
+        NativeBigInt.divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+        @test toref(q, 0, n - m + 1) == aref ÷ dref
+        @test toref(r, 0, m) == aref % dref
+    end
+    # the adversarial shape must actually hit the estimate-error path
+    @test err1 > 0
+end
+
+@testset "submul_2! SIMD cold path" begin
+    # r == a*b (mod beta^n) makes every difference limb 0..3, forcing the
+    # cold scalar-propagate block in each SIMD iteration.
+    using NativeBigInt: submul_2!
+    rng = MersenneTwister(55)
+    for n in (8, 16, 24, 31), off in 0:3
+        a = mem(rand(rng, UInt64, n))
+        b0, b1 = rand(rng, UInt64), rand(rng, UInt64)
+        aref = toref(a, 0, n)
+        bref = (big(b1) << 64) | b0
+        prod = (aref * bref) & ((big(1) << (64n)) - 1)
+        r = mem(UInt64[UInt64((prod >> (64k)) & typemax(UInt64)) for k in 0:n-1])
+        off > 0 && (r[1] = r[1] + UInt64(off))  # results 0..3 in low limb
+        rref = toref(r, 0, n)
+        co1, co0 = submul_2!(r, 0, a, 0, n, b0, b1)
+        co = (big(co1) << 64) | co0
+        @test toref(r, 0, n) - (co << (64n)) == rref - aref * bref
+    end
+end
