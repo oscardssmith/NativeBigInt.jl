@@ -680,11 +680,116 @@ function divrem_2!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d
     return r1 >> l, (r0 >> l) | (r1 << (64 - l))
 end
 
+# Two dividend limbs per iteration with a lazy (unreduced, two-limb) running
+# remainder R < β²: per pair, R ← r1·B3 + r0·B2 + ⟨u1,u0⟩ folded mod β²
+# (B2 = β² mod d, B3 = β³ mod d), so the loop-carried chain is two independent
+# muls plus adds — no 2/1 division inside the loop. Quotient mass accrues off
+# the chain via K2 = ⌊β²/d⌋ = β+v, K3 = ⌊β³/d⌋ = β·K2 + q3 into a sliding
+# two-limb pending window ⟨p1,p0⟩; the finalized limbs written each iteration
+# cannot receive later carries (all future pieces land strictly below), so no
+# ripple into written quotient limbs is needed. Requires d normalized,
+# d ≠ 2^63 (K2 = 2β wouldn't fit the k2lo limb), n ≥ 4.
+function divrem_1_pi2!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb, v::Limb)
+    # setup: no hardware divide — B2 = β² - K2·d via wrapping negation
+    b2 = (-(widemul(d, v) + (DLimb(d) << 64))) % Limb
+    q3, b3 = div_2by1(b2, zero(Limb), d, v)     # ⟨B2,0⟩ = q3·d + B3
+    k3l = q3                                    # K3 - β² = ⟨v, q3⟩
+    r1 = @inbounds a[ao+n]
+    r0 = @inbounds a[ao+n-1]
+    p1 = zero(Limb)
+    p0 = zero(Limb)
+    i = n - 3
+    @inbounds while i >= 1
+        u1 = a[ao+i+1]
+        u0 = a[ao+i]
+        # remainder chain: W = r1·B3 + r0·B2 + ⟨u1,u0⟩ (≤ 130 bits), then fold
+        # the c ∈ {0,1,2} overflows of weight β² back in as c·B2
+        m3 = widemul(r1, b3)
+        m2 = widemul(r0, b2)
+        w, o1 = Base.add_with_overflow(m3, m2)
+        w, o2 = Base.add_with_overflow(w, (DLimb(u1) << 64) | u0)
+        c = Limb(o1) + Limb(o2)
+        # c·B2 as two masked adds keeps a mul off the loop-carried chain
+        w, o3 = Base.add_with_overflow(w, DLimb(b2 & (-Limb(o1))) + (b2 & (-Limb(o2))))
+        if o3                                    # rare second fold; w < 3β now
+            w += b2
+            c += one(Limb)
+        end
+        # quotient piece Qp = r1·K3 + (r0+c)·K2 < 2β³ at weight β^(i-1) with
+        # K3 = β² + ⟨k3h,k3l⟩, K2 = β + v. f = r0+c may wrap: the missing β·K2
+        # contributes fc·v at weight β¹ and fc at weight β². By weight:
+        #   L0: lo(r1·k3l), lo(f·v)
+        #   L1: hi(r1·k3l), hi(f·v), lo(r1·k3h), f, fc·v
+        #   L2: hi(r1·k3h), r1, fc, p0   (+ carries)
+        #   L3: p1                        (+ carries; no carry-out: S is final)
+        f = r0 + c
+        fc = Limb(f < r0)
+        ml = widemul(r1, k3l)
+        mh = widemul(r1, v)                      # k3h == v
+        A, cA = Base.add_with_overflow(ml, widemul(f, v))
+        A, cA2 = Base.add_with_overflow(A, DLimb(v & (-fc)) << 64)
+        s0 = A % Limb
+        B = DLimb((A >> 64) % Limb) + (mh % Limb) + f
+        s1 = B % Limb
+        C = DLimb((mh >> 64) % Limb) + r1 + fc + p0 +
+            ((B >> 64) % Limb) + Limb(cA) + Limb(cA2)
+        s2 = C % Limb
+        s3 = p1 + ((C >> 64) % Limb)   # no wrap: finalized mass < β²
+        q[qo+i+3] = s3
+        q[qo+i+2] = s2
+        p1 = s1
+        p0 = s0
+        r1 = (w >> 64) % Limb
+        r0 = w % Limb
+        i -= 2
+    end
+    if i == 0   # one leftover limb: V = R·β + u[1], quotient at weight β⁰
+        ul = @inbounds a[ao+1]
+        m2 = widemul(r1, b2)
+        w, o1 = Base.add_with_overflow(m2, (DLimb(r0) << 64) | ul)
+        c = Limb(o1)
+        w, o2 = Base.add_with_overflow(w, DLimb(c) * b2)
+        if o2
+            w += b2
+            c += one(Limb)
+        end
+        x1 = (w >> 64) % Limb
+        x0 = w % Limb
+        b = x1 >= d
+        b && (x1 -= d)
+        q2, rem = div_2by1(x1, x0, d, v)
+        # Qt = (r1+c)·K2 + b·β + q2; pending sits at (q[3], q[2])
+        f = r1 + c
+        fc = Limb(f < r1)
+        A, cA = Base.add_with_overflow(widemul(f, v), DLimb(q2))
+        A, cA2 = Base.add_with_overflow(A, DLimb(v & (-fc)) << 64)
+        B = DLimb((A >> 64) % Limb) + f + Limb(b) + p0
+        C = DLimb((B >> 64) % Limb) + fc + p1 + Limb(cA) + Limb(cA2)
+        @inbounds q[qo+1] = A % Limb
+        @inbounds q[qo+2] = B % Limb
+        @inbounds q[qo+3] = C % Limb   # no wrap: finalized mass < β
+        return rem
+    end
+    # no leftover: reduce R = ⟨r1,r0⟩, quotient Qt = b·β + q2 into ⟨p1,p0⟩
+    b = r1 >= d
+    b && (r1 -= d)
+    q2, rem = div_2by1(r1, r0, d, v)
+    s = DLimb(p0) + q2
+    @inbounds q[qo+1] = s % Limb
+    @inbounds q[qo+2] = p1 + ((s >> 64) % Limb) + Limb(b)
+    return rem
+end
+
 function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb)
     l = leading_zeros(d)
     dn = d << l
     v = invert_limb(dn)
     if l == 0
+        # below ~10 limbs the pi2 setup (one div_2by1 + muls) outweighs the
+        # faster loop; benchmark-tuned crossover
+        if n >= 10 && d != (one(Limb) << 63)
+            return divrem_1_pi2!(q, qo, a, ao, n, d, v)
+        end
         rem = zero(Limb)
         @inbounds for i in n:-1:1
             q[qo+i], rem = div_2by1(rem, a[ao+i], d, v)

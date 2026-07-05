@@ -442,3 +442,33 @@ end
         @test toref(r, 0, n) - (co << (64n)) == rref - aref * bref
     end
 end
+
+@testset "divrem_1! normalized two-limb path" begin
+    # shapes that stress the lazy-remainder pi2 loop: saturated dividends
+    # (max unreduced remainder growth), quotient limbs near typemax
+    # (quotient-window carry saturation), boundary divisors, odd/even n
+    rng = MersenneTwister(66)
+    β = big(1) << 64
+    ds = UInt64[UInt64(1) << 63, (UInt64(1) << 63) + 1, typemax(UInt64),
+                typemax(UInt64) - 1, UInt64(10)^19, (UInt64(1) << 63) | 1]
+    for d in ds, n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33)
+        for trial in 1:8
+            av = rand(rng, UInt64, n)
+            trial == 1 && fill!(av, typemax(UInt64))
+            trial == 2 && (av = [fill(typemax(UInt64), n - 1); d - 1])   # top < d
+            if trial == 3   # engineered near-typemax quotient limbs
+                qv = fill(typemax(UInt64), n)
+                prod = toref(mem(qv), 0, n) * d + (d - 1)
+                prod >= β^n && (prod = (β^n - 1) ÷ d * d + (d - 1))
+                prod >= β^n && (prod = β^n - 1)
+                av = [UInt64((prod >> (64k)) & typemax(UInt64)) for k in 0:n-1]
+            end
+            a = mem(av)
+            q = Memory{UInt64}(undef, n)
+            rem = divrem_1!(q, 0, a, 0, n, d)
+            aref = toref(a, 0, n)
+            @test toref(q, 0, n) == aref ÷ d
+            @test rem == aref % d
+        end
+    end
+end
