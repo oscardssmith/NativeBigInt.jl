@@ -97,6 +97,31 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     return nothing
 end
 
+# Largest power of base that fits in a limb: (base^k, k).
+function big_base(base::Int)
+    bb = Limb(base)
+    k = 1
+    while true
+        nb, ovf = Base.mul_with_overflow(bb, Limb(base))
+        ovf && return bb, k
+        bb, k = nb, k + 1
+    end
+end
+
+# Little-endian base^k digit chunks of the n-limb magnitude in a (destroyed:
+# a is divided down in place). Repeated divrem_1! — O(n²), fine for v1;
+# divide-and-conquer is a post-v1 extension for very large n.
+function radix_chunks!(a::Memory{Limb}, n::Int, bb::Limb)
+    chunks = Limb[]
+    while n > 0
+        push!(chunks, divrem_1!(a, 0, a, 0, n, bb))
+        @inbounds while n > 0 && a[n] == 0
+            n -= 1
+        end
+    end
+    return chunks
+end
+
 # Quotient/remainder: a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1.
 # Writes n-m+1 quotient limbs (top may be zero) and m remainder limbs
 # (unnormalized). One scratch Memory holds the shifted numerator copy (n+1

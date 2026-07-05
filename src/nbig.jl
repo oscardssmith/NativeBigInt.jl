@@ -256,6 +256,94 @@ function Base.count_ones(x::NBig)
     return c
 end
 
+const DIGIT_CHARS = codeunits("0123456789abcdefghijklmnopqrstuvwxyz")
+
+function Base.string(x::NBig; base::Integer = 10, pad::Integer = 1)
+    2 <= base <= 36 || throw(ArgumentError("base must be in 2:36, got $base"))
+    n = nlimbs(x)
+    bb, k = big_base(Int(base))
+    scratch = Memory{Limb}(undef, n)
+    @inbounds for i in 1:n
+        scratch[i] = x.limbs[i]
+    end
+    chunks = radix_chunks!(scratch, n, bb)
+    # digit count of the top chunk (chunks may be empty for zero)
+    ndig = (length(chunks) - 1) * k
+    top = isempty(chunks) ? zero(Limb) : chunks[end]
+    while top > 0
+        ndig += 1
+        top = div(top, base % Limb)
+    end
+    width = max(ndig, Int(pad), 1)
+    neg = signbit(x)
+    buf = Base.StringMemory(width + neg)
+    j = width + neg
+    for (ci, c) in enumerate(chunks)
+        lim = ci == length(chunks) ? ndig - (length(chunks) - 1) * k : k
+        for _ in 1:lim
+            c, d = divrem(c, base % Limb)
+            @inbounds buf[j] = DIGIT_CHARS[d+1]
+            j -= 1
+        end
+    end
+    @inbounds while j > (neg ? 1 : 0)
+        buf[j] = UInt8('0')
+        j -= 1
+    end
+    neg && (@inbounds buf[1] = UInt8('-'))
+    return Base.unsafe_takestring(buf)
+end
+
+Base.show(io::IO, x::NBig) = print(io, string(x))
+
+function Base.tryparse(::Type{NBig}, s::AbstractString; base::Integer = 10)
+    2 <= base <= 36 || throw(ArgumentError("base must be in 2:36, got $base"))
+    cs = lstrip(isspace, rstrip(isspace, s))
+    isempty(cs) && return nothing
+    neg = false
+    c1 = cs[1]
+    if c1 == '-' || c1 == '+'
+        neg = c1 == '-'
+        cs = SubString(cs, nextind(cs, 1))
+        isempty(cs) && return nothing
+    end
+    bb, k = big_base(Int(base))
+    bigb = NBig(bb)
+    x = NBig(0, EMPTY_LIMBS)
+    chunk = zero(Limb)
+    nd = 0
+    for c in cs
+        d = '0' <= c <= '9' ? c - '0' :
+            'a' <= c <= 'z' ? c - 'a' + 10 :
+            'A' <= c <= 'Z' ? c - 'A' + 10 : 99
+        d < base || return nothing
+        chunk = chunk * (base % Limb) + (d % Limb)
+        nd += 1
+        if nd == k
+            x = x * bigb + NBig(chunk)
+            chunk = zero(Limb)
+            nd = 0
+        end
+    end
+    if nd > 0
+        x = x * NBig(Limb(base)^nd) + NBig(chunk)
+    end
+    return neg ? -x : x
+end
+
+function Base.parse(::Type{NBig}, s::AbstractString; base::Integer = 10)
+    r = tryparse(NBig, s; base)
+    r === nothing && throw(ArgumentError("invalid base-$base digit string: $(repr(s))"))
+    return r
+end
+
+# Delegating keeps isequal/hash consistent with Int and BigInt; a native
+# limb-walking hash is a post-v1 optimization.
+Base.hash(x::NBig, h::UInt) = hash(BigInt(x), h)
+
+Base.Float64(x::NBig) = Float64(BigInt(x))
+Base.AbstractFloat(x::NBig) = Float64(x)
+
 Base.zero(::Type{NBig}) = NBig(0, EMPTY_LIMBS)
 Base.one(::Type{NBig}) = NBig(1)
 

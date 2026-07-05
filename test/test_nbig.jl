@@ -72,3 +72,20 @@ end
         @test got == want
     end
 end
+
+@testset "NBig strings/hash/float" begin
+    @test string(NBig(0)) == "0"
+    @test string(NBig(-255), base = 16) == "-ff"
+    @test string(NBig(5), pad = 3) == "005"
+    @test repr(NBig(-12345)) == "-12345"
+    @test parse(NBig, "0") == NBig(0)
+    @test parse(NBig, "+42") == NBig(42)
+    @test parse(NBig, "-42") == NBig(-42)
+    @test parse(NBig, "ff"; base = 16) == NBig(255)
+    @test_throws ArgumentError parse(NBig, "12x3")
+    @test_throws ArgumentError parse(NBig, "")
+    @test hash(NBig(42)) == hash(42)
+    @test isequal(NBig(-7), NBig(-7)) && hash(NBig(-7)) == hash(-7)
+    @test Float64(NBig(0)) === 0.0
+    @test Float64(NBig(-3)) === -3.0
+end

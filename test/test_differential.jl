@@ -45,6 +45,12 @@ end
         @test BigInt(~na) == ~a
         iszero(a) || @test trailing_zeros(na) == trailing_zeros(a)
         a < 0 || @test count_ones(na) == count_ones(a)
+        @test string(na) == string(a)
+        @test string(na, base = 16) == string(a, base = 16)
+        @test string(na, base = 2, pad = 100) == string(a, base = 2, pad = 100)
+        @test parse(NBig, string(a)) == na
+        @test hash(na) == hash(a)
+        @test Float64(na) == Float64(a)
         if !iszero(b)
             q, r = divrem(na, nb)
             @test BigInt(q) == div(a, b)
