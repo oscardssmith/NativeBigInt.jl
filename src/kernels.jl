@@ -466,13 +466,15 @@ end
     q = DLimb(v) * u2 + ((DLimb(u2) << 64) | u1)
     q1 = (q >> 64) % Limb
     q0 = q % Limb
-    r1 = u1 - q1 * d1
-    r = ((DLimb(r1) << 64) | u0) - DLimb(q1) * d0 - dd
+    # r = ⟨u1,u0⟩ - q1*⟨d1,d0⟩ - dd (mod β²), regrouped so the dd subtraction
+    # runs off the q1 critical path and both q1 muls merge into low128(q1*dd)
+    w = ((DLimb(u1) << 64) | u0) - dd
+    r = w - (DLimb(q1) * d0 + (DLimb(q1 * d1) << 64))
     q1 += one(Limb)
-    if (r >> 64) % Limb >= q0
-        q1 -= one(Limb)
-        r += dd
-    end
+    # first fixup fires ~50%: masked to avoid mispredicts on the remainder chain
+    mask = -Limb((r >> 64) % Limb >= q0)
+    q1 += mask
+    r += dd & ((DLimb(mask) << 64) | mask)
     if r >= dd
         q1, r = div_fixup(q1, r, dd)
     end
