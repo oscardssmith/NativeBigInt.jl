@@ -495,16 +495,22 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     end
     d1 = @inbounds d[do_+m]
     d0 = @inbounds d[do_+m-1]
-    n1 = @inbounds u[uo+nn]   # top window limb lives in a register; its memory slot is stale
+    # The top two window limbs ⟨n1, n0⟩ live in registers across rows (their
+    # memory slots are stale): each row's remainder feeds the next row's
+    # div_3by2 directly, avoiding a store + store-forwarded reload per row.
+    n1 = @inbounds u[uo+nn]
+    n0 = @inbounds u[uo+nn-1]
     @inbounds for j in qn:-1:1
-        if n1 == d1 && u[uo+j+m-1] == d0
-            # ⟨n1, u1⟩ == ⟨d1, d0⟩: qhat = β-1 exactly, and the window bound
+        if n1 == d1 && n0 == d0
+            # ⟨n1, n0⟩ == ⟨d1, d0⟩: qhat = β-1 exactly, and the window bound
             # W < β·d guarantees no borrow past the top limb.
             qhat = typemax(Limb)
+            u[uo+j+m-1] = n0   # submul needs the stale slot refreshed
             submul_1!(u, uo+j-1, d, do_, m, qhat)
             n1 = u[uo+j+m-1]
+            n0 = u[uo+j+m-2]
         else
-            qhat, r1, r0 = div_3by2(n1, u[uo+j+m-1], u[uo+j+m-2], d1, d0, v)
+            qhat, r1, r0 = div_3by2(n1, n0, u[uo+j+m-2], d1, d0, v)
             cy = m > 2 ? submul_1!(u, uo+j-1, d, do_, m-2, qhat) : zero(Limb)
             cy1 = Limb(r0 < cy)
             r0 -= cy
@@ -517,12 +523,13 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
                 r1 = (s >> 64) % Limb   # 128-bit overflow cancels the borrow
                 r0 = s % Limb
             end
-            u[uo+j+m-2] = r0
             n1 = r1
+            n0 = r0
         end
         q[qo+j] = qhat
     end
     @inbounds u[uo+m] = n1
+    @inbounds u[uo+m-1] = n0
     return qh
 end
 
