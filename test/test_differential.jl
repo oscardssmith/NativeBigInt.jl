@@ -32,6 +32,15 @@ end
         @test BigInt(na + nb) == a + b
         @test BigInt(na - nb) == a - b
         @test BigInt(na * nb) == a * b
+        k = rand(rng, 0:200)
+        @test BigInt(na << k) == a << k
+        @test BigInt(na >> k) == a >> k
+        @test BigInt(na & nb) == a & b
+        @test BigInt(na | nb) == a | b
+        @test BigInt(xor(na, nb)) == xor(a, b)
+        @test BigInt(~na) == ~a
+        iszero(a) || @test trailing_zeros(na) == trailing_zeros(a)
+        a < 0 || @test count_ones(na) == count_ones(a)
         if !iszero(b)
             q, r = divrem(na, nb)
             @test BigInt(q) == div(a, b)

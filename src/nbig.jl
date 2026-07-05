@@ -161,6 +161,101 @@ function Base.cld(a::NBig, b::NBig)
     return (!iszero(r) && sign(r) == sign(b)) ? q + one(NBig) : q
 end
 
+function Base.:<<(x::NBig, c::UInt)
+    (iszero(x) || c == 0) && return x
+    lx = nlimbs(x)
+    lw, cnt = Int(c >> 6), Int(c & 63)
+    n = lx + lw + 1
+    r = Memory{Limb}(undef, n)
+    @inbounds for i in 1:lw
+        r[i] = 0
+    end
+    @inbounds r[n] = lshift!(r, lw, x.limbs, 0, lx, cnt)
+    return nbig_from_limbs(sign(x), r, n)
+end
+
+function Base.:>>(x::NBig, c::UInt)
+    (iszero(x) || c == 0) && return x
+    lx = nlimbs(x)
+    lw, cnt = Int(c >> 6), Int(c & 63)
+    if lw >= lx
+        # magnitude fully shifted out: 0, or -1 by flooring
+        return signbit(x) ? NBig(-1) : NBig(0, EMPTY_LIMBS)
+    end
+    n = lx - lw
+    r = Memory{Limb}(undef, n)
+    lost = rshift!(r, 0, x.limbs, lw, n, cnt) != 0
+    if signbit(x) && !lost
+        @inbounds for i in 1:lw
+            x.limbs[i] != 0 && (lost = true; break)
+        end
+    end
+    q = nbig_from_limbs(sign(x), r, n)
+    # arithmetic shift floors: negative with dropped bits rounds away from zero
+    return (signbit(x) && lost) ? q - one(NBig) : q
+end
+Base.:>>>(x::NBig, c::UInt) = x >> c
+
+Base.:~(x::NBig) = -(x + one(NBig))
+
+# Two's-complement image of x in t[1..n]; requires n > nlimbs(x) so the sign
+# extends into at least one full limb.
+function twos_complement!(t::Memory{Limb}, x::NBig, n::Int)
+    lx = nlimbs(x)
+    @inbounds for i in 1:n
+        t[i] = i <= lx ? x.limbs[i] : zero(Limb)
+    end
+    if signbit(x)
+        c = Limb(1)
+        @inbounds for i in 1:n
+            t[i], c = add_limb_c(~t[i], c, zero(Limb))
+        end
+    end
+    return t
+end
+
+# Interpret t[1..n] as two's complement (sign limb is all-0 or all-1).
+function from_twos_complement!(t::Memory{Limb}, n::Int)
+    if t[n] >> 63 == 0
+        return nbig_from_limbs(1, t, n)
+    end
+    c = Limb(1)
+    @inbounds for i in 1:n
+        t[i], c = add_limb_c(~t[i], c, zero(Limb))
+    end
+    return nbig_from_limbs(-1, t, n)
+end
+
+for (op, f) in ((:&, :&), (:|, :|), (:xor, :xor))
+    @eval function Base.$op(a::NBig, b::NBig)
+        n = max(nlimbs(a), nlimbs(b)) + 1
+        ta = twos_complement!(Memory{Limb}(undef, n), a, n)
+        tb = twos_complement!(Memory{Limb}(undef, n), b, n)
+        @inbounds for i in 1:n
+            ta[i] = $f(ta[i], tb[i])
+        end
+        return from_twos_complement!(ta, n)
+    end
+end
+
+function Base.trailing_zeros(x::NBig)
+    iszero(x) && throw(DomainError(x, "trailing_zeros of zero is undefined"))
+    i = 1
+    @inbounds while x.limbs[i] == 0
+        i += 1
+    end
+    return 64 * (i - 1) + trailing_zeros(@inbounds x.limbs[i])
+end
+
+function Base.count_ones(x::NBig)
+    signbit(x) && throw(DomainError(x, "count_ones of a negative NBig is undefined"))
+    c = 0
+    @inbounds for i in 1:nlimbs(x)
+        c += count_ones(x.limbs[i])
+    end
+    return c
+end
+
 Base.zero(::Type{NBig}) = NBig(0, EMPTY_LIMBS)
 Base.one(::Type{NBig}) = NBig(1)
 

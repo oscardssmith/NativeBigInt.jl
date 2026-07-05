@@ -36,3 +36,19 @@ end
     @test_throws DivideError div(NBig(0), NBig(0))
     @test NBig(2) + 3 == NBig(5) && 3 * NBig(2) == NBig(6)    # promotion
 end
+
+@testset "NBig shifts and bit ops" begin
+    @test NBig(1) << 64 == NBig(big(2)^64)
+    @test NBig(5) << 0 == NBig(5) && NBig(5) >> 0 == NBig(5)
+    @test NBig(-1) >> 100 == NBig(-1)          # arithmetic shift floors
+    @test NBig(-8) >> 2 == NBig(-2)
+    @test NBig(big(2)^200) >> 200 == NBig(1)
+    @test NBig(5) >> 700 == NBig(0)
+    @test NBig(3) << -1 == NBig(1)             # negative count flips direction
+    @test NBig(-1) & NBig(-1) == NBig(-1)
+    @test NBig(-1) & NBig(0) == NBig(0)
+    @test NBig(-2) | NBig(1) == NBig(-1)
+    @test ~NBig(0) == NBig(-1) && ~NBig(-1) == NBig(0)
+    @test trailing_zeros(NBig(big(2)^100)) == 100
+    @test count_ones(NBig(big(2)^100 - 1)) == 100
+end
