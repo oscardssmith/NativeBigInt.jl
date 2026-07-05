@@ -21,3 +21,18 @@ using NativeBigInt: nlimbs
     @test zero(NBig) == NBig(0) && one(NBig) == NBig(1)
     @test promote_type(NBig, Int) == NBig
 end
+
+@testset "NBig arithmetic edges" begin
+    @test NBig(2) + NBig(3) == NBig(5)
+    @test NBig(0) + NBig(-7) == NBig(-7)
+    @test NBig(5) - NBig(5) == NBig(0)
+    @test NBig(3) * NBig(0) == NBig(0)
+    @test NBig(-3) * NBig(4) == NBig(-12)
+    @test divrem(NBig(7), NBig(2)) == (NBig(3), NBig(1))
+    @test divrem(NBig(-7), NBig(2)) == (NBig(-3), NBig(-1))   # truncated, like Base
+    @test divrem(NBig(3), NBig(10)) == (NBig(0), NBig(3))     # |a| < |b|
+    @test mod(NBig(-7), NBig(2)) == NBig(1)
+    @test_throws DivideError divrem(NBig(1), NBig(0))
+    @test_throws DivideError div(NBig(0), NBig(0))
+    @test NBig(2) + 3 == NBig(5) && 3 * NBig(2) == NBig(6)    # promotion
+end

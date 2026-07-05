@@ -93,6 +93,74 @@ Base.abs(x::NBig) = iszero(x) || !signbit(x) ? x : NBig(-x.signlen, x.limbs)
 Base.isodd(x::NBig) = nlimbs(x) > 0 && isodd(x.limbs[1])
 Base.iseven(x::NBig) = !isodd(x)
 
+# Magnitude add/sub; the result sign is decided here from operand signs and
+# magnitude comparison, then magnitudes combine via the kernels.
+function Base.:+(a::NBig, b::NBig)
+    iszero(a) && return b
+    iszero(b) && return a
+    la, lb = nlimbs(a), nlimbs(b)
+    if sign(a) == sign(b)
+        if la < lb
+            a, b = b, a
+            la, lb = lb, la
+        end
+        r = Memory{Limb}(undef, la + 1)
+        c = add!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+        @inbounds r[la+1] = c
+        return nbig_from_limbs(sign(a), r, la + 1)
+    else
+        c = cmp_limbs(a.limbs, 0, la, b.limbs, 0, lb)
+        c == 0 && return NBig(0, EMPTY_LIMBS)
+        if c < 0
+            a, b = b, a
+            la, lb = lb, la
+        end
+        r = Memory{Limb}(undef, la)
+        sub!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+        return nbig_from_limbs(sign(a), r, la)
+    end
+end
+Base.:-(a::NBig, b::NBig) = a + (-b)
+
+function Base.:*(a::NBig, b::NBig)
+    (iszero(a) || iszero(b)) && return NBig(0, EMPTY_LIMBS)
+    la, lb = nlimbs(a), nlimbs(b)
+    if la < lb
+        a, b = b, a
+        la, lb = lb, la
+    end
+    r = Memory{Limb}(undef, la + lb)
+    mul!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
+end
+
+# Truncated division (Base semantics): rem takes the sign of a.
+function Base.divrem(a::NBig, b::NBig)
+    iszero(b) && throw(DivideError())
+    la, lb = nlimbs(a), nlimbs(b)
+    cmp_limbs(a.limbs, 0, la, b.limbs, 0, lb) < 0 && return (NBig(0, EMPTY_LIMBS), a)
+    q = Memory{Limb}(undef, la - lb + 1)
+    r = Memory{Limb}(undef, lb)
+    divrem!(q, 0, r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+    return (nbig_from_limbs(sign(a) * sign(b), q, la - lb + 1),
+            nbig_from_limbs(sign(a), r, lb))
+end
+Base.div(a::NBig, b::NBig) = divrem(a, b)[1]
+Base.rem(a::NBig, b::NBig) = divrem(a, b)[2]
+
+function Base.mod(a::NBig, b::NBig)
+    r = rem(a, b)
+    return (iszero(r) || sign(r) == sign(b)) ? r : r + b
+end
+function Base.fld(a::NBig, b::NBig)
+    q, r = divrem(a, b)
+    return (!iszero(r) && sign(r) != sign(b)) ? q - one(NBig) : q
+end
+function Base.cld(a::NBig, b::NBig)
+    q, r = divrem(a, b)
+    return (!iszero(r) && sign(r) == sign(b)) ? q + one(NBig) : q
+end
+
 Base.zero(::Type{NBig}) = NBig(0, EMPTY_LIMBS)
 Base.one(::Type{NBig}) = NBig(1)
 
