@@ -328,3 +328,30 @@ end
         end
     end
 end
+
+@testset "divrem_2!" begin
+    using NativeBigInt: divrem_2!
+    rng = MersenneTwister(22)
+    for n in (2, 3, 4, 7, 16, 33), trial in 1:30
+        a = mem(rand(rng, UInt64, n))
+        # mix of normalized and unnormalized 2-limb divisors, incl. adversarial
+        d1 = trial % 3 == 0 ? rand(rng, UInt64) | (UInt64(1) << 63) :
+             trial % 3 == 1 ? rand(rng, UInt64) >> rand(rng, 0:62) :
+             (UInt64(1) << rand(rng, 0:63))
+        d1 == 0 && (d1 = UInt64(1))
+        d0 = trial % 5 == 0 ? typemax(UInt64) : rand(rng, UInt64)
+        q = Memory{UInt64}(undef, n - 1)
+        r1, r0 = divrem_2!(q, 0, a, 0, n, d1, d0)
+        aref = toref(a, 0, n)
+        dref = (big(d1) << 64) | d0
+        @test toref(q, 0, n - 1) == aref ÷ dref
+        @test (big(r1) << 64) | r0 == aref % dref
+    end
+    # in-place: q aliasing a at the same offset
+    a = mem(UInt64[typemax(UInt64), typemax(UInt64), typemax(UInt64)])
+    aref = toref(a, 0, 3)
+    d1, d0 = UInt64(3), typemax(UInt64)
+    dref = (big(d1) << 64) | d0
+    r1, r0 = divrem_2!(a, 0, a, 0, 3, d1, d0)
+    @test toref(a, 0, 2) == aref ÷ dref && (big(r1) << 64) | r0 == aref % dref
+end

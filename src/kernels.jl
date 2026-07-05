@@ -407,6 +407,12 @@ end
     return ((typemax(DLimb) - (DLimb(d) << 64)) ÷ d) % Limb
 end
 
+# Rare second-fixup bodies. @noinline keeps them as real (predicted-not-taken)
+# branches: inlined, LLVM if-converts them to cmovs on the loop-carried
+# remainder chain, costing ~3 cycles per limb in the divrem_1!/divrem_2! loops.
+@noinline div_fixup(q1::Limb, r::Limb, d::Limb) = (q1 + one(Limb), r - d)
+@noinline div_fixup(q1::Limb, r::DLimb, dd::DLimb) = (q1 + one(Limb), r - dd)
+
 # Divide (u1:u0) by normalized d given v = invert_limb(d); requires u1 < d.
 # The first fixup fires ~50% of the time, so it is masked (branch-free) to keep
 # the loop-carried remainder chain free of mispredicts; the second is rare and branchy.
@@ -419,8 +425,7 @@ end
     q1 += mask
     r += d & mask
     if r >= d
-        q1 += one(Limb)
-        r -= d
+        q1, r = div_fixup(q1, r, d)
     end
     return q1, r
 end
@@ -469,8 +474,7 @@ end
         r += dd
     end
     if r >= dd
-        q1 += one(Limb)
-        r -= dd
+        q1, r = div_fixup(q1, r, dd)
     end
     return q1, (r >> 64) % Limb, r % Limb
 end
@@ -518,6 +522,45 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     end
     @inbounds u[uo+m] = n1
     return qh
+end
+
+# a[1..n] ÷ ⟨d1,d0⟩ (d1 ≠ 0, n ≥ 2): writes n-1 quotient limbs (top may be
+# zero), returns the remainder (r1, r0). The two-limb remainder window stays in
+# registers and unnormalized divisors are handled by shifting the numerator on
+# the fly, so no scratch or numerator copy is needed (cf. mpn_divrem_2).
+# q may alias a at the same offset.
+function divrem_2!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d1::Limb, d0::Limb)
+    l = leading_zeros(d1)
+    if l == 0
+        v = invert_pi1(d1, d0)
+        dd = (DLimb(d1) << 64) | d0
+        w = @inbounds (DLimb(a[ao+n]) << 64) | a[ao+n-1]
+        qh = w >= dd
+        qh && (w -= dd)
+        @inbounds q[qo+n-1] = qh
+        r1 = (w >> 64) % Limb
+        r0 = w % Limb
+        @inbounds for j in n-2:-1:1
+            qhat, r1, r0 = div_3by2(r1, r0, a[ao+j], d1, d0, v)
+            q[qo+j] = qhat
+        end
+        return r1, r0
+    end
+    # shifted numerator has n+1 limbs; its top spill a[n] >> (64-l) < 2^l ≤ dn1
+    # seeds the window, so exactly n-1 quotient limbs come out of the loop
+    dn1 = (d1 << l) | (d0 >> (64 - l))
+    dn0 = d0 << l
+    v = invert_pi1(dn1, dn0)
+    r1 = @inbounds a[ao+n] >> (64 - l)
+    r0 = @inbounds (a[ao+n] << l) | (a[ao+n-1] >> (64 - l))
+    @inbounds for j in n-1:-1:2
+        u = (a[ao+j] << l) | (a[ao+j-1] >> (64 - l))
+        qhat, r1, r0 = div_3by2(r1, r0, u, dn1, dn0, v)
+        q[qo+j] = qhat
+    end
+    qhat, r1, r0 = div_3by2(r1, r0, @inbounds(a[ao+1]) << l, dn1, dn0, v)
+    @inbounds q[qo+1] = qhat
+    return r1 >> l, (r0 >> l) | (r1 << (64 - l))
 end
 
 function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d::Limb)

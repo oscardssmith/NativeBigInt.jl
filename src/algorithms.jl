@@ -132,6 +132,12 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
         @inbounds r[ro+1] = divrem_1!(q, qo, a, ao, n, d[do_+1])
         return nothing
     end
+    if m == 2
+        r1, r0 = @inbounds divrem_2!(q, qo, a, ao, n, d[do_+2], d[do_+1])
+        @inbounds r[ro+1] = r0
+        @inbounds r[ro+2] = r1
+        return nothing
+    end
     l = leading_zeros(@inbounds d[do_+m])
     nn = n + 1
     scratch = Memory{Limb}(undef, nn + (l > 0 ? m : 0))
