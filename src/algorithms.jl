@@ -223,10 +223,7 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     dl > hh && (rhi = Int(@inbounds scratch[uu+dl]))
     # Q <= β^lq; if Q = β^lq exactly, clamp to β^lq - 1 and put 2S' back in U
     # (still >= the true root; the correction loop repairs the remainder).
-    toobig = false
-    @inbounds for i in lq+1:qlen
-        scratch[qq+i] != 0 && (toobig = true)
-    end
+    toobig = any(!iszero, view(scratch, qq+lq+1:qq+qlen))
     if toobig
         fill!(view(scratch, qq+1:qq+lq), typemax(Limb))
         c = add_n!(a, ao + lq, a, ao + lq, scratch, dd, hh)
@@ -423,10 +420,7 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
         if odd
             redc!(dst, dsto, prod, 0, m, 0, k, ninv)
         else
-            lt = 2k
-            @inbounds while lt > 0 && prod[lt] == 0
-                lt -= 1
-            end
+            lt = normlen(prod, 0, 2k)
             if lt < k || cmp_limbs(prod, 0, lt, m, 0, k) < 0
                 copyto!(dst, dsto + 1, prod, 1, lt)
                 fill!(view(dst, dsto+lt+1:dsto+k), zero(Limb))
@@ -536,9 +530,7 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     dbits = 64n - leading_zeros(@inbounds a[ao+n]) -
             (64m - leading_zeros(@inbounds d[do_+m]))
     if dbits <= 2
-        @inbounds for i in 1:m
-            r[ro+i] = a[ao+i]
-        end
+        copyto!(r, ro + 1, a, ao + 1, m)
         t = n > m ? (@inbounds a[ao+n]) : zero(Limb)
         c = zero(Limb)
         while t != zero(Limb) || cmp_limbs(r, ro, m, d, do_, m) >= 0
