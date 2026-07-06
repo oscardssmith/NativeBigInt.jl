@@ -204,8 +204,9 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
         @inbounds scratch[num+numlen] = c1 % Limb
     end
     dc = lshift!(scratch, dd, s, so + lq, hh, 1)
+    dhi = dc != 0            # doubling S' spilled a top limb into 2S' (dl = hh+1)
     dl = hh
-    if dc != 0
+    if dhi
         dl = hh + 1
         @inbounds scratch[dd+dl] = dc
     end
@@ -220,14 +221,14 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     qlen = numlen - dl + 1
     rhi = 0
     copyto!(a, ao + lq + 1, scratch, uu + 1, hh)
-    dl > hh && (rhi = Int(@inbounds scratch[uu+dl]))
+    dhi && (rhi = Int(@inbounds scratch[uu+dl]))
     # Q <= β^lq; if Q = β^lq exactly, clamp to β^lq - 1 and put 2S' back in U
     # (still >= the true root; the correction loop repairs the remainder).
     toobig = any(!iszero, view(scratch, qq+lq+1:qq+qlen))
     if toobig
         fill!(view(scratch, qq+1:qq+lq), typemax(Limb))
         c = add_n!(a, ao + lq, a, ao + lq, scratch, dd, hh)
-        rhi += Int(c) + (dl > hh ? Int(@inbounds scratch[dd+dl]) : 0)
+        rhi += Int(c) + (dhi ? Int(@inbounds scratch[dd+dl]) : 0)
     end
     copyto!(s, so + 1, scratch, qq + 1, lq)
     # R = U*β^lq + A0 - Q^2, tracked as (rhi, a[ao+1..ao+h]) with rhi signed
