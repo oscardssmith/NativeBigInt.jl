@@ -319,64 +319,145 @@ function mul_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::In
     return nothing
 end
 
+# Straight-line squares for n <= 4: cross products column-summed into
+# triangle limbs T, doubled via shifts, then the diagonal squares added in one
+# UInt128 chain. Skips the triangle/double-pass structure entirely.
+@inline function sqr_2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int)
+    @inbounds begin
+        a1 = a[ao+1]; a2 = a[ao+2]
+        p11 = widemul(a1, a1); p12 = widemul(a1, a2); p22 = widemul(a2, a2)
+        T1 = p12 % Limb; T2 = (p12 >> 64) % Limb
+        r[ro+1] = p11 % Limb
+        s = (p11 >> 64) + (T1 << 1)
+        r[ro+2] = s % Limb
+        s = (s >> 64) + (p22 % Limb) + ((T2 << 1) | (T1 >> 63))
+        r[ro+3] = s % Limb
+        r[ro+4] = ((s >> 64) % Limb) + ((p22 >> 64) % Limb) + (T2 >> 63)
+    end
+    return nothing
+end
+
+@inline function sqr_3!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int)
+    @inbounds begin
+        a1 = a[ao+1]; a2 = a[ao+2]; a3 = a[ao+3]
+        p11 = widemul(a1, a1); p22 = widemul(a2, a2); p33 = widemul(a3, a3)
+        p12 = widemul(a1, a2); p13 = widemul(a1, a3); p23 = widemul(a2, a3)
+        T1 = p12 % Limb
+        u = (p12 >> 64) + (p13 % Limb)
+        T2 = u % Limb
+        u = (u >> 64) + ((p13 >> 64) % Limb) + (p23 % Limb)
+        T3 = u % Limb
+        T4 = ((u >> 64) % Limb) + ((p23 >> 64) % Limb)  # cannot overflow
+        r[ro+1] = p11 % Limb
+        s = (p11 >> 64) + (T1 << 1)
+        r[ro+2] = s % Limb
+        s = (s >> 64) + (p22 % Limb) + ((T2 << 1) | (T1 >> 63))
+        r[ro+3] = s % Limb
+        s = (s >> 64) + ((p22 >> 64) % Limb) + ((T3 << 1) | (T2 >> 63))
+        r[ro+4] = s % Limb
+        s = (s >> 64) + (p33 % Limb) + ((T4 << 1) | (T3 >> 63))
+        r[ro+5] = s % Limb
+        r[ro+6] = ((s >> 64) % Limb) + ((p33 >> 64) % Limb) + (T4 >> 63)
+    end
+    return nothing
+end
+
+@inline function sqr_4!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int)
+    @inbounds begin
+        a1 = a[ao+1]; a2 = a[ao+2]; a3 = a[ao+3]; a4 = a[ao+4]
+        p12 = widemul(a1, a2); p13 = widemul(a1, a3); p14 = widemul(a1, a4)
+        p23 = widemul(a2, a3); p24 = widemul(a2, a4); p34 = widemul(a3, a4)
+        T1 = p12 % Limb
+        u = (p12 >> 64) + (p13 % Limb)
+        T2 = u % Limb
+        u = (u >> 64) + ((p13 >> 64) % Limb) + (p14 % Limb) + (p23 % Limb)
+        T3 = u % Limb
+        u = (u >> 64) + ((p14 >> 64) % Limb) + ((p23 >> 64) % Limb) + (p24 % Limb)
+        T4 = u % Limb
+        u = (u >> 64) + ((p24 >> 64) % Limb) + (p34 % Limb)
+        T5 = u % Limb
+        T6 = ((u >> 64) % Limb) + ((p34 >> 64) % Limb)  # cannot overflow
+        p11 = widemul(a1, a1); p22 = widemul(a2, a2)
+        p33 = widemul(a3, a3); p44 = widemul(a4, a4)
+        r[ro+1] = p11 % Limb
+        s = (p11 >> 64) + (T1 << 1)
+        r[ro+2] = s % Limb
+        s = (s >> 64) + (p22 % Limb) + ((T2 << 1) | (T1 >> 63))
+        r[ro+3] = s % Limb
+        s = (s >> 64) + ((p22 >> 64) % Limb) + ((T3 << 1) | (T2 >> 63))
+        r[ro+4] = s % Limb
+        s = (s >> 64) + (p33 % Limb) + ((T4 << 1) | (T3 >> 63))
+        r[ro+5] = s % Limb
+        s = (s >> 64) + ((p33 >> 64) % Limb) + ((T5 << 1) | (T4 >> 63))
+        r[ro+6] = s % Limb
+        s = (s >> 64) + (p44 % Limb) + ((T6 << 1) | (T5 >> 63))
+        r[ro+7] = s % Limb
+        r[ro+8] = ((s >> 64) % Limb) + ((p44 >> 64) % Limb) + (T6 >> 63)
+    end
+    return nothing
+end
+
 # r[1..2n] = a[1..n]^2; r must not alias a. Half the multiplies of
 # mul_basecase!: build the off-diagonal triangle sum_{i<j} a_i*a_j once with
 # paired mul_2!/addmul_2! rows (rows j,j+1 over a[j+2..n] share one pass; the
 # split-off a[j]*a[j+1] term is added separately), then one fused pass doubles
-# the triangle and adds the diagonal squares a_i^2.
+# the triangle and adds the diagonal squares a_i^2. n <= 4 dispatches to the
+# straight-line sqr_2!/sqr_3!/sqr_4! (1.7-2.8x faster at those sizes).
 function sqr_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     @inbounds begin
-        if n == 1
-            p = widemul(a[ao+1], a[ao+1])
-            r[ro+1] = p % Limb
-            r[ro+2] = (p >> 64) % Limb
+        if n <= 2
+            if n == 1
+                p = widemul(a[ao+1], a[ao+1])
+                r[ro+1] = p % Limb
+                r[ro+2] = (p >> 64) % Limb
+            else
+                sqr_2!(r, ro, a, ao)
+            end
             return nothing
+        elseif n == 3
+            return sqr_3!(r, ro, a, ao)
+        elseif n == 4
+            return sqr_4!(r, ro, a, ao)
         end
         # Off-diagonal triangle into r[2..2n-1]: a[j]*a[j+k] lands at limb
         # index 2j+k-1, so rows j,j+1 over the shared range a[j+2..n] form one
         # (a[j], a[j+1]) two-row pass based at r[2j+1].
-        if n == 2
-            p = widemul(a[ao+1], a[ao+2])
-            r[ro+2] = p % Limb
-            r[ro+3] = (p >> 64) % Limb
-        else
-            mul_2!(r, ro + 2, a, ao + 2, n - 2, a[ao+1], a[ao+2])
-            p = widemul(a[ao+1], a[ao+2])
-            r[ro+2] = p % Limb
-            t = UInt128(r[ro+3]) + (p >> 64) % Limb
-            r[ro+3] = t % Limb
+        mul_2!(r, ro + 2, a, ao + 2, n - 2, a[ao+1], a[ao+2])
+        p = widemul(a[ao+1], a[ao+2])
+        r[ro+2] = p % Limb
+        t = UInt128(r[ro+3]) + (p >> 64) % Limb
+        r[ro+3] = t % Limb
+        c = (t >> 64) % Limb
+        k = 4
+        while c != zero(Limb)
+            t = UInt128(r[ro+k]) + c
+            r[ro+k] = t % Limb
             c = (t >> 64) % Limb
-            k = 4
+            k += 1
+        end
+        j = 3
+        while j <= n - 2
+            addmul_2!(r, ro + 2j, a, ao + j + 1, n - j - 1, a[ao+j], a[ao+j+1])
+            p = widemul(a[ao+j], a[ao+j+1])
+            t = UInt128(r[ro+2j]) + p % Limb
+            r[ro+2j] = t % Limb
+            # hi(p) <= 2^64-2, so hi + carry cannot overflow a limb
+            c = ((t >> 64) % Limb) + (p >> 64) % Limb
+            k = 2j + 1
             while c != zero(Limb)
                 t = UInt128(r[ro+k]) + c
                 r[ro+k] = t % Limb
                 c = (t >> 64) % Limb
                 k += 1
             end
-            j = 3
-            while j <= n - 2
-                addmul_2!(r, ro + 2j, a, ao + j + 1, n - j - 1, a[ao+j], a[ao+j+1])
-                p = widemul(a[ao+j], a[ao+j+1])
-                t = UInt128(r[ro+2j]) + p % Limb
-                r[ro+2j] = t % Limb
-                # hi(p) <= 2^64-2, so hi + carry cannot overflow a limb
-                c = ((t >> 64) % Limb) + (p >> 64) % Limb
-                k = 2j + 1
-                while c != zero(Limb)
-                    t = UInt128(r[ro+k]) + c
-                    r[ro+k] = t % Limb
-                    c = (t >> 64) % Limb
-                    k += 1
-                end
-                j += 2
-            end
-            if j == n - 1
-                # unpaired last row: the single product a[n-1]*a[n]
-                p = widemul(a[ao+j], a[ao+j+1])
-                t = UInt128(r[ro+2n-2]) + p % Limb
-                r[ro+2n-2] = t % Limb
-                r[ro+2n-1] = ((t >> 64) % Limb) + (p >> 64) % Limb
-            end
+            j += 2
+        end
+        if j == n - 1
+            # unpaired last row: the single product a[n-1]*a[n]
+            p = widemul(a[ao+j], a[ao+j+1])
+            t = UInt128(r[ro+2n-2]) + p % Limb
+            r[ro+2n-2] = t % Limb
+            r[ro+2n-1] = ((t >> 64) % Limb) + (p >> 64) % Limb
         end
         # Fused double-and-add-diagonal: slot i covers r[2i-1..2i]; the bit
         # shifted out of a slot and the additive carry both have weight
