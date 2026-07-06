@@ -405,15 +405,13 @@ end
 # straight-line sqr_2!/sqr_3!/sqr_4! (1.7-2.8x faster at those sizes).
 function sqr_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     @inbounds begin
-        if n <= 2
-            if n == 1
-                p = widemul(a[ao+1], a[ao+1])
-                r[ro+1] = p % Limb
-                r[ro+2] = (p >> 64) % Limb
-            else
-                sqr_2!(r, ro, a, ao)
-            end
+        if n == 1
+            p = widemul(a[ao+1], a[ao+1])
+            r[ro+1] = p % Limb
+            r[ro+2] = (p >> 64) % Limb
             return nothing
+        elseif n == 2
+            return sqr_2!(r, ro, a, ao)
         elseif n == 3
             return sqr_3!(r, ro, a, ao)
         elseif n == 4
