@@ -273,6 +273,51 @@ function lehmer_apply!(r1::Memory{Limb}, r1o::Int, r2::Memory{Limb}, r2o::Int,
     return n + 1
 end
 
+# One single-word Lehmer pass on 63-bit window tops: Euclid with nonnegative
+# magnitude cofactors (implicit alternating signs, Knuth's formulation) capped
+# at 2^30. A quotient is accepted only when both truncation extremes
+# (x - s1)/(y + s2) and (x + s3)/(y - s4) agree; `slack` widens the brackets
+# to absorb inherited window error (0 for exact tops, 2 after a prior matrix
+# application). q <= 3 (~85%, Gauss–Kuzmin) comes from a subtract chain, the
+# rest from one hardware 64-bit divide; only the verify widens to 128 bits.
+# Returns (A, B, C, D, even, steps); at even parity the signed rows are
+# (+A, -B) / (-C, +D), flipped at odd.
+@inline function lehmer63(x::UInt64, y::UInt64, slack::UInt64)
+    A, B, C, D = UInt64(1), UInt64(0), UInt64(0), UInt64(1)
+    even = true
+    steps = 0
+    while true
+        s1, s2, s3, s4 = even ? (B, D, A, C) : (A, C, B, D)
+        s1, s2, s3, s4 = s1 + slack, s2 + slack, s3 + slack, s4 + slack
+        (s1 > x || s4 >= y) && break
+        xl, dh = x - s1, y + s2
+        xh, dl = x + s3, y - s4
+        xl < dh && break
+        r1 = xl - dh
+        if r1 < dh
+            q = UInt64(1)
+        elseif r1 - dh < dh
+            q = UInt64(2)
+        elseif r1 - 2dh < dh   # reached only when r1 >= 2dh, so 2dh < 2^63
+            q = UInt64(3)
+        else
+            q = div(xl, dh)
+        end
+        # verify against the other extreme (q*dl can exceed 64 bits)
+        w = widemul(q, dl)
+        (w <= xh && UInt128(xh) < w + dl) || break
+        q > UInt64(2)^30 && break   # would blow the cap; q*C could wrap
+        nC = A + q * C
+        nD = B + q * D
+        (nC > UInt64(2)^30 || nD > UInt64(2)^30) && break
+        x, y = y, xl + s1 - q * y   # wrap-exact: true remainder < y
+        A, B, C, D = C, D, nC, nD
+        even = !even
+        steps += 1
+    end
+    return A, B, C, D, even, steps
+end
+
 # gcd of the magnitudes u[1..lu] and v[1..lv]; both buffers are destroyed and
 # must have capacity >= max(lu, lv) + 1. Returns (mem, len) with the result in
 # one of the two buffers. Lehmer's method (Knuth TAOCP §4.5.2, Algorithm L):
@@ -312,46 +357,31 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         vb = 64lv - leading_zeros(@inbounds v[lv])
         steps = 0
         if ub - vb < 64
-            # Euclid on the 126-bit windows; cofactors bracket the truncation
-            # error, so a quotient is accepted only when both extremes agree.
-            # Cofactors are kept as nonnegative magnitudes with implicit
-            # alternating signs (Knuth's formulation): at even step counts the
-            # rows are (+A, -B) / (-C, +D), at odd counts the signs flip. The
-            # update (A,B,C,D) <- (C, D, A+qC, B+qD) is then sign-free.
+            # Two single-word phases per 126-bit window (hgcd2-flavoured):
+            # phase 1 on the exact 63-bit tops, then the phase-1 matrix is
+            # applied to the window (wrap-exact), fresh tops are extracted and
+            # phase 2 runs with brackets widened by 2 to absorb the inherited
+            # truncation error (< 2^30 window-ulps, < 1 ulp after a >= 31-bit
+            # shift). Composed magnitudes stay <= 2^61.
             pos = ub - 126
             x = extract_window(u, lu, pos)
             y = extract_window(v, lv, pos)
-            A, B, C, D = UInt128(1), UInt128(0), UInt128(0), UInt128(1)
-            even = true
-            while true
-                # error brackets by parity: true quotient lies between
-                # (x - s1)/(y + s2) and (x + s3)/(y - s4)
-                s1, s2, s3, s4 = even ? (B, D, A, C) : (A, C, B, D)
-                (s1 > x || s4 >= y) && break
-                xl, dh = x - s1, y + s2
-                xh, dl = x + s3, y - s4
-                # q <= 3 covers ~70% of quotients (Gauss–Kuzmin) and needs no
-                # 128-bit divide (__udivti3), just a compare ladder; otherwise
-                # one division plus a multiply/range check. All products stay
-                # below 2^128: dl <= dh < 2^126 + 2^62.
-                xl < dh && break
-                if (xl >> 2) < dh
-                    d2 = dh + dh
-                    q = xl < d2 ? UInt128(1) : xl < d2 + dh ? UInt128(2) : UInt128(3)
-                    xl - q * dh < dh || break   # gate admits xl up to 4dh+3
-                    (q * dl <= xh && xh < (q + 1) * dl) || break
-                else
-                    q = div(xl, dh)
-                    r = xh - q * dl   # xh >= xl >= q*dh >= q*dl
-                    r < dl || break
+            A, B, C, D, even, steps = lehmer63(UInt64(x >> 63), UInt64(y >> 63), UInt64(0))
+            if steps > 0
+                xn, yn = even ? (A * x - B * y, D * y - C * x) :
+                                (B * y - A * x, C * x - D * y)
+                nb = 128 - leading_zeros(xn)
+                if nb >= 94 && yn != 0
+                    sh = nb - 63
+                    A2, B2, C2, D2, even2, steps2 =
+                        lehmer63(UInt64(xn >> sh), UInt64(yn >> sh), UInt64(2))
+                    if steps2 > 0   # compose: M <- M2 * M1, parities add
+                        A, B, C, D = A2 * A + B2 * C, A2 * B + B2 * D,
+                                     C2 * A + D2 * C, C2 * B + D2 * D
+                        even = even == even2
+                        steps += steps2
+                    end
                 end
-                nC = A + q * C
-                nD = B + q * D
-                (nC > UInt128(2)^62 || nD > UInt128(2)^62) && break
-                x, y = y, x - q * y
-                A, B, C, D = C, D, nC, nD
-                even = !even
-                steps += 1
             end
         end
         if steps == 0
