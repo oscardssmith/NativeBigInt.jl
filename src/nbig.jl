@@ -194,12 +194,8 @@ function Base.gcd(a::NBig, b::NBig)
     cap = max(la, lb) + 1
     u = Memory{Limb}(undef, cap)
     v = Memory{Limb}(undef, cap)
-    @inbounds for i in 1:la
-        u[i] = a.limbs[i]
-    end
-    @inbounds for i in 1:lb
-        v[i] = b.limbs[i]
-    end
+    copyto!(u, 1, a.limbs, 1, la)
+    copyto!(v, 1, b.limbs, 1, lb)
     mem, n = gcd!(u, la, v, lb)
     return nbig_from_limbs(1, mem, n)
 end
@@ -211,9 +207,7 @@ function Base.isqrt(x::NBig)
     iszero(x) && return x
     n = nlimbs(x)
     if n <= 2
-        v = n == 1 ? UInt128(@inbounds x.limbs[1]) :
-            (UInt128(@inbounds x.limbs[2]) << 64) | (@inbounds x.limbs[1])
-        return NBig(isqrt(v) % Limb)
+        return NBig(isqrt(extract_window(x.limbs, n, 0)) % Limb)
     end
     bits = 64n - leading_zeros(@inbounds x.limbs[n])
     e = (64n - bits) & ~1

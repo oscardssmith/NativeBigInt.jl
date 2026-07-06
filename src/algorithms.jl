@@ -244,35 +244,6 @@ end
     return (UInt128(hi) << 64) | lo
 end
 
-@inline sterm(c::Int64, x::Limb) =
-    c >= 0 ? Int128(widemul(Limb(c), x)) : -Int128(widemul(Limb(-c), x))
-
-# Fused Lehmer matrix apply: r1 = A*U + B*V, r2 = C*U + D*V in one pass over
-# the operands via exact two's-complement limb accumulation (signed Int128
-# carries; |carry| stays < 2^63 for |cofactor| < 2^62). Valid cofactor
-# matrices give nonnegative results, so the final carries are the top limbs.
-# Writes n+1 limbs each, n = max(lu, lv); returns n+1.
-function lehmer_apply!(r1::Memory{Limb}, r1o::Int, r2::Memory{Limb}, r2o::Int,
-                       u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
-                       A::Int64, B::Int64, C::Int64, D::Int64)
-    n = max(lu, lv)
-    c1 = Int128(0)
-    c2 = Int128(0)
-    @inbounds for i in 1:n
-        ui = i <= lu ? u[i] : zero(Limb)
-        vi = i <= lv ? v[i] : zero(Limb)
-        a1 = c1 + sterm(A, ui) + sterm(B, vi)
-        r1[r1o+i] = a1 % Limb
-        c1 = a1 >> 64
-        a2 = c2 + sterm(C, ui) + sterm(D, vi)
-        r2[r2o+i] = a2 % Limb
-        c2 = a2 >> 64
-    end
-    @inbounds r1[r1o+n+1] = c1 % Limb
-    @inbounds r2[r2o+n+1] = c2 % Limb
-    return n + 1
-end
-
 # One single-word Lehmer pass on 63-bit window tops: Euclid with nonnegative
 # magnitude cofactors (implicit alternating signs, Knuth's formulation) capped
 # at 2^30. A quotient is accepted only when both truncation extremes
@@ -321,15 +292,14 @@ end
 # gcd of the magnitudes u[1..lu] and v[1..lv]; both buffers are destroyed and
 # must have capacity >= max(lu, lv) + 1. Returns (mem, len) with the result in
 # one of the two buffers. Lehmer's method (Knuth TAOCP §4.5.2, Algorithm L):
-# Euclid on 126-bit leading windows with signed single-limb cofactors, applied
-# to the full operands in one fused lehmer_apply! pass with buffer rotation;
-# a full divrem! step when the window test makes no progress; UInt128 binary
-# gcd once v fits two limbs.
+# per 126-bit leading window, two lehmer63 passes build a cofactor matrix that
+# one fused lehmer_apply! pass applies to the full operands (buffer rotation,
+# no copies); a full divrem! step when the window makes no progress; UInt128
+# binary gcd once v fits two limbs.
 function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
-    cap = max(lu, lv) + 2
+    cap = max(lu, lv) + 1
     w1 = Memory{Limb}(undef, cap)
-    w2 = Memory{Limb}(undef, cap)
-    qb = Memory{Limb}(undef, cap)
+    w2 = Memory{Limb}(undef, cap)   # also serves as divrem!'s quotient buffer
     while true
         # invariant maintenance: normalized lengths, u >= v
         if lu < lv || (lu == lv && cmp_limbs(u, 0, lu, v, 0, lv) < 0)
@@ -339,16 +309,12 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         lv == 0 && return u, lu
         if lv <= 2
             if lu > 2
-                divrem!(qb, 0, w1, 0, u, 0, lu, v, 0, lv)
-                x = lv == 1 ? UInt128(@inbounds w1[1]) :
-                    (UInt128(@inbounds w1[2]) << 64) | (@inbounds w1[1])
+                divrem!(w2, 0, w1, 0, u, 0, lu, v, 0, lv)
+                x = extract_window(w1, lv, 0)
             else
-                x = lu == 1 ? UInt128(@inbounds u[1]) :
-                    (UInt128(@inbounds u[2]) << 64) | (@inbounds u[1])
+                x = extract_window(u, lu, 0)
             end
-            y = lv == 1 ? UInt128(@inbounds v[1]) :
-                (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
-            g = gcd(x, y)
+            g = gcd(x, extract_window(v, lv, 0))
             @inbounds u[1] = g % Limb
             @inbounds u[2] = (g >> 64) % Limb
             return u, ((g >> 64) != 0 ? 2 : 1)
@@ -379,7 +345,6 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
                         A, B, C, D = A2 * A + B2 * C, A2 * B + B2 * D,
                                      C2 * A + D2 * C, C2 * B + D2 * D
                         even = even == even2
-                        steps += steps2
                     end
                 end
             end
@@ -387,12 +352,10 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         if steps == 0
             # window made no progress: one full division step, rotating the
             # remainder buffer in rather than copying
-            divrem!(qb, 0, w1, 0, u, 0, lu, v, 0, lv)
+            divrem!(w2, 0, w1, 0, u, 0, lu, v, 0, lv)
             u, v, w1 = v, w1, u
-            lu, lv = lv, lv
-            while lv > 0 && (@inbounds v[lv]) == 0
-                lv -= 1
-            end
+            lu = lv
+            lv = normlen(v, 0, lv)
         else
             # (U, V) <- (A*U + B*V, C*U + D*V), one fused pass, then rotate
             sA, sB, sC, sD = Int64(A), Int64(B), Int64(C), Int64(D)
@@ -404,13 +367,8 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
             n = lehmer_apply!(w1, 0, w2, 0, u, lu, v, lv, sA, sB, sC, sD)
             u, w1 = w1, u
             v, w2 = w2, v
-            lu = lv = n
-            while lu > 0 && (@inbounds u[lu]) == 0
-                lu -= 1
-            end
-            while lv > 0 && (@inbounds v[lv]) == 0
-                lv -= 1
-            end
+            lu = normlen(u, 0, n)
+            lv = normlen(v, 0, n)
         end
     end
 end
