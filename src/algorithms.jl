@@ -138,6 +138,347 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     return nothing
 end
 
+# Karatsuba square root (Zimmermann, INRIA RR-3805): s[1..h] = isqrt(a[1..n]),
+# h = (n+1)>>1. Requires n even (or n <= 2) and a[ao+n] >= 2^62 (caller
+# normalizes by an even bit shift plus a zero low limb for odd lengths); an
+# odd-length high part would leave S' half-normalized, 2S' < β^hh, and the
+# quotient step unbounded.
+# On return a[ao+1..ao+h] holds the low limbs of the remainder a - s^2; the
+# return value is its top limb (0 or 1). scratch needs 5h+8 limbs at sco;
+# recursion levels share it (a level touches it only after its child returns).
+function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
+                  scratch::Memory{Limb}, sco::Int=0)
+    if n <= 2
+        v = n == 1 ? UInt128(@inbounds a[ao+1]) :
+            (UInt128(@inbounds a[ao+2]) << 64) | (@inbounds a[ao+1])
+        rt = isqrt(v)
+        rm = v - rt * rt
+        @inbounds s[so+1] = rt % Limb
+        @inbounds a[ao+1] = rm % Limb
+        return Int((rm >> 64) % Limb)
+    end
+    h = (n + 1) >> 1
+    lq = h >> 1       # low-root limbs (the quotient Q)
+    hh = h - lq       # high-root limbs (S')
+    nh = n - 2lq      # limbs of the high part
+    # a = Ahi*β^2lq + A1*β^lq + A0; recurse: Ahi = S'^2 + R', R' <= 2S'.
+    c1 = sqrtrem!(s, so + lq, a, ao + 2lq, nh, scratch, sco)
+    num = sco               # h+1 limbs: (c1, R', A1)
+    dd = sco + h + 1        # hh+1 limbs: 2S'
+    qq = sco + 2h + 2       # lq+2 limbs: quotient Q
+    uu = sco + 3h + 4       # hh+1 limbs: division remainder U
+    q2 = sco + 4h + 5       # 2lq limbs: Q^2
+    @inbounds for i in 1:h
+        scratch[num+i] = a[ao+lq+i]
+    end
+    numlen = h
+    if c1 != 0
+        numlen = h + 1
+        @inbounds scratch[num+numlen] = c1 % Limb
+    end
+    dc = lshift!(scratch, dd, s, so + lq, hh, 1)
+    dl = hh
+    if dc != 0
+        dl = hh + 1
+        @inbounds scratch[dd+dl] = dc
+    end
+    # (Q, U) = divrem(R'*β^lq + A1, 2S'); S = S'*β^lq + Q.
+    # Strip zero top limbs (divrem!'s fast path needs a meaningful a[n]) and
+    # pre-zero the quotient slot so untouched high limbs read as zero.
+    @inbounds while numlen > dl && scratch[num+numlen] == 0
+        numlen -= 1
+    end
+    @inbounds for i in 1:lq+2
+        scratch[qq+i] = 0
+    end
+    divrem!(scratch, qq, scratch, uu, scratch, num, numlen, scratch, dd, dl)
+    qlen = numlen - dl + 1
+    rhi = 0
+    @inbounds for i in 1:hh
+        a[ao+lq+i] = scratch[uu+i]
+    end
+    dl > hh && (rhi = Int(@inbounds scratch[uu+dl]))
+    # Q <= β^lq; if Q = β^lq exactly, clamp to β^lq - 1 and put 2S' back in U
+    # (still >= the true root; the correction loop repairs the remainder).
+    toobig = false
+    @inbounds for i in lq+1:qlen
+        scratch[qq+i] != 0 && (toobig = true)
+    end
+    if toobig
+        @inbounds for i in 1:lq
+            scratch[qq+i] = typemax(Limb)
+        end
+        c = add_n!(a, ao + lq, a, ao + lq, scratch, dd, hh)
+        rhi += Int(c) + (dl > hh ? Int(@inbounds scratch[dd+dl]) : 0)
+    end
+    @inbounds for i in 1:lq
+        s[so+i] = scratch[qq+i]
+    end
+    # R = U*β^lq + A0 - Q^2, tracked as (rhi, a[ao+1..ao+h]) with rhi signed
+    sqr!(scratch, q2, scratch, qq, lq)
+    rhi -= Int(sub!(a, ao, a, ao, h, scratch, q2, 2lq))
+    while rhi < 0
+        # (S+1)^2 overshoots: R += 2S - 1, S -= 1
+        tc = lshift!(scratch, num, s, so, h, 1)
+        sub_1!(scratch, num, scratch, num, h, one(Limb))
+        c = add_n!(a, ao, a, ao, scratch, num, h)
+        rhi += Int(c) + Int(tc)
+        sub_1!(s, so, s, so, h, one(Limb))
+    end
+    return rhi
+end
+
+# ⌊X / 2^pos⌋ for the n-limb magnitude x, truncated to 128 bits (callers
+# guarantee the true value fits). Limbs above n read as zero.
+@inline function extract_window(x::Memory{Limb}, n::Int, pos::Int)
+    i = pos >> 6
+    r = pos & 63
+    w1 = i + 1 <= n ? (@inbounds x[i+1]) : zero(Limb)
+    w2 = i + 2 <= n ? (@inbounds x[i+2]) : zero(Limb)
+    w3 = i + 3 <= n ? (@inbounds x[i+3]) : zero(Limb)
+    if r == 0
+        return (UInt128(w2) << 64) | w1
+    end
+    lo = (w1 >> r) | (w2 << (64 - r))
+    hi = (w2 >> r) | (w3 << (64 - r))
+    return (UInt128(hi) << 64) | lo
+end
+
+# t[1..lt] = a*U + b*V where lt = lu+1, U = u[1..lu], V = v[1..lv], lv <= lu,
+# a and b have opposite signs (or are zero) and the result is nonnegative
+# (rows of a Lehmer cofactor matrix applied to a remainder pair).
+function lehmer_row!(t::Memory{Limb}, to::Int, u::Memory{Limb}, lu::Int,
+                     v::Memory{Limb}, lv::Int, a::Int64, b::Int64)
+    lt = lu + 1
+    if b <= 0
+        hi = mul_1!(t, to, u, 0, lu, Limb(a))
+        @inbounds t[to+lt] = hi
+        if b != 0
+            brw = submul_1!(t, to, v, 0, lv, Limb(-b))
+            sub_1!(t, to + lv, t, to + lv, lt - lv, brw)
+        end
+    else
+        hi = mul_1!(t, to, v, 0, lv, Limb(b))
+        @inbounds t[to+lv+1] = hi
+        @inbounds for i in lv+2:lt
+            t[to+i] = 0
+        end
+        if a != 0
+            brw = submul_1!(t, to, u, 0, lu, Limb(-a))
+            sub_1!(t, to + lu, t, to + lu, lt - lu, brw)
+        end
+    end
+    while lt > 0 && (@inbounds t[to+lt]) == 0
+        lt -= 1
+    end
+    return lt
+end
+
+# gcd of the magnitudes u[1..lu] and v[1..lv]; both buffers are destroyed and
+# must have capacity >= max(lu, lv) + 1. Returns (mem, len) with the result in
+# one of the two buffers. Lehmer's method (Knuth TAOCP §4.5.2, Algorithm L):
+# Euclid on 126-bit leading windows with signed single-limb cofactors, applied
+# to the full operands with mul_1!/submul_1! passes; a full divrem! step when
+# the window test makes no progress; UInt128 binary gcd once v fits two limbs.
+function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
+    cap = max(lu, lv) + 1
+    scratch = Memory{Limb}(undef, 3cap)
+    t1, t2, qb = 0, cap, 2cap
+    while true
+        # invariant maintenance: normalized lengths, u >= v
+        if lu < lv || (lu == lv && cmp_limbs(u, 0, lu, v, 0, lv) < 0)
+            u, v = v, u
+            lu, lv = lv, lu
+        end
+        lv == 0 && return u, lu
+        if lv <= 2
+            if lu > 2
+                divrem!(scratch, qb, scratch, t1, u, 0, lu, v, 0, lv)
+                x = lv == 1 ? UInt128(@inbounds scratch[t1+1]) :
+                    (UInt128(@inbounds scratch[t1+2]) << 64) | (@inbounds scratch[t1+1])
+                y = lv == 1 ? UInt128(@inbounds v[1]) :
+                    (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
+                g = gcd(x, y)
+            else
+                x = (lu == 1 ? UInt128(@inbounds u[1]) :
+                     (UInt128(@inbounds u[2]) << 64) | (@inbounds u[1]))
+                y = lv == 1 ? UInt128(@inbounds v[1]) :
+                    (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
+                g = gcd(x, y)
+            end
+            @inbounds u[1] = g % Limb
+            @inbounds u[2] = (g >> 64) % Limb
+            return u, ((g >> 64) != 0 ? 2 : 1)
+        end
+        ub = 64lu - leading_zeros(@inbounds u[lu])
+        vb = 64lv - leading_zeros(@inbounds v[lv])
+        steps = 0
+        if ub - vb < 64
+            # Euclid on the 126-bit windows; cofactors bracket the truncation
+            # error, so a quotient is accepted only when both extremes agree.
+            pos = ub - 126
+            x = Int128(extract_window(u, lu, pos))
+            y = Int128(extract_window(v, lv, pos))
+            A, B, C, D = Int64(1), Int64(0), Int64(0), Int64(1)
+            while true
+                p2 = (C > 0 ? Int128(C) : Int128(0)) + (D > 0 ? Int128(D) : Int128(0))
+                n2 = Int128(C) + Int128(D) - p2
+                p1 = (A > 0 ? Int128(A) : Int128(0)) + (B > 0 ? Int128(B) : Int128(0))
+                n1 = Int128(A) + Int128(B) - p1
+                y + n2 <= 0 && break
+                q = div(x + n1, y + p2)
+                q != div(x + p1, y + n2) && break
+                q <= 0 && break
+                nC = Int128(A) - q * Int128(C)
+                nD = Int128(B) - q * Int128(D)
+                (abs(nC) > Int128(2)^62 || abs(nD) > Int128(2)^62) && break
+                ny = x - q * y
+                ny < 0 && break
+                x, y = y, ny
+                A, B, C, D = C, D, Int64(nC), Int64(nD)
+                steps += 1
+            end
+        end
+        if steps == 0
+            # window made no progress: one full division step
+            divrem!(scratch, qb, scratch, t1, u, 0, lu, v, 0, lv)
+            u, v = v, u
+            lu = lv
+            @inbounds for i in 1:lu
+                v[i] = scratch[t1+i]
+            end
+            while lv > 0 && (@inbounds v[lv]) == 0
+                lv -= 1
+            end
+        else
+            # (U, V) <- (A*U + B*V, C*U + D*V)
+            l1 = lehmer_row!(scratch, t1, u, lu, v, lv, A, B)
+            l2 = lehmer_row!(scratch, t2, u, lu, v, lv, C, D)
+            @inbounds for i in 1:l1
+                u[i] = scratch[t1+i]
+            end
+            @inbounds for i in 1:l2
+                v[i] = scratch[t2+i]
+            end
+            lu, lv = l1, l2
+        end
+    end
+end
+
+@inline expbit(e::Memory{Limb}, i::Int) = ((@inbounds e[(i>>6)+1]) >> (i & 63)) & 1
+
+# b^e mod m on magnitudes: m has k limbs (m[k] ≠ 0, m > 1), 0 < b < m
+# (lb limbs), e > 0 (le limbs, e[le] ≠ 0). Returns a k-limb Memory
+# (unnormalized). Sliding-window exponentiation; for odd m the values live in
+# Montgomery form with redc! after each mul/sqr, for even m each product is
+# reduced with divrem! instead.
+function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
+                        m::Memory{Limb}, k::Int)
+    odd = isodd(@inbounds m[1])
+    ninv = odd ? mont_ninv(@inbounds m[1]) : zero(Limb)
+    nbits = 64le - leading_zeros(@inbounds e[le])
+    w = nbits <= 8 ? 1 : nbits <= 24 ? 2 : nbits <= 80 ? 3 : nbits <= 240 ? 4 : 5
+    tsize = 1 << (w - 1)   # table of odd powers b^1, b^3, …, b^(2^w - 1)
+    acc = Memory{Limb}(undef, k)
+    prod = Memory{Limb}(undef, 2k + 1)
+    qbuf = Memory{Limb}(undef, k + 2)
+    table = Memory{Limb}(undef, tsize * k)
+
+    # dst[1..k] = x*y (or x^2) brought back into the working domain
+    function mulred!(dst::Memory{Limb}, dsto::Int, x::Memory{Limb}, xo::Int,
+                     y::Memory{Limb}, yo::Int)
+        if x === y && xo == yo
+            sqr!(prod, 0, x, xo, k)
+        else
+            mul!(prod, 0, x, xo, k, y, yo, k)
+        end
+        @inbounds prod[2k+1] = 0
+        if odd
+            redc!(dst, dsto, prod, 0, m, 0, k, ninv)
+        else
+            lt = 2k
+            @inbounds while lt > 0 && prod[lt] == 0
+                lt -= 1
+            end
+            if lt < k || cmp_limbs(prod, 0, lt, m, 0, k) < 0
+                @inbounds for i in 1:lt
+                    dst[dsto+i] = prod[i]
+                end
+                @inbounds for i in lt+1:k
+                    dst[dsto+i] = 0
+                end
+            else
+                divrem!(qbuf, 0, dst, dsto, prod, 0, lt, m, 0, k)
+            end
+        end
+    end
+
+    # table slot 0 = base: b·β^k mod m in Montgomery form, else b zero-padded
+    if odd
+        @inbounds for i in 1:k
+            prod[i] = 0
+        end
+        @inbounds for i in 1:lb
+            prod[k+i] = b[i]
+        end
+        divrem!(qbuf, 0, table, 0, prod, 0, k + lb, m, 0, k)
+    else
+        @inbounds for i in 1:lb
+            table[i] = b[i]
+        end
+        @inbounds for i in lb+1:k
+            table[i] = 0
+        end
+    end
+    if tsize > 1
+        bsq = Memory{Limb}(undef, k)
+        mulred!(bsq, 0, table, 0, table, 0)
+        for j in 1:tsize-1
+            mulred!(table, j * k, table, (j - 1) * k, bsq, 0)
+        end
+    end
+
+    first = true
+    i = nbits - 1
+    while i >= 0
+        if expbit(e, i) == 0
+            first || mulred!(acc, 0, acc, 0, acc, 0)
+            i -= 1
+        else
+            l = min(w, i + 1)
+            while expbit(e, i - l + 1) == 0   # window must end on a set bit
+                l -= 1
+            end
+            val = 0
+            for j in 0:l-1
+                val = (val << 1) | Int(expbit(e, i - j))
+            end
+            if first
+                @inbounds for t in 1:k
+                    acc[t] = table[(val>>1)*k+t]
+                end
+                first = false
+            else
+                for _ in 1:l
+                    mulred!(acc, 0, acc, 0, acc, 0)
+                end
+                mulred!(acc, 0, acc, 0, table, (val >> 1) * k)
+            end
+            i -= l
+        end
+    end
+    if odd   # leave Montgomery form: one reduction of the bare value
+        @inbounds for t in 1:k
+            prod[t] = acc[t]
+        end
+        @inbounds for t in k+1:2k+1
+            prod[t] = 0
+        end
+        redc!(acc, 0, prod, 0, m, 0, k, ninv)
+    end
+    return acc
+end
+
 # Largest power of base that fits in a limb: (base^k, k).
 function big_base(base::Int)
     bb = Limb(base)
@@ -164,6 +505,8 @@ function radix_chunks!(a::Memory{Limb}, n::Int, bb::Limb)
 end
 
 # Quotient/remainder: a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1.
+# For m ≥ 3, a[n] must be nonzero unless n == m (the small-quotient fast
+# path bounds the quotient by a[n]'s bit position).
 # Writes n-m+1 quotient limbs (top may be zero) and m remainder limbs
 # (unnormalized). One scratch Memory holds the shifted numerator copy (n+1
 # limbs) and, for unnormalized d, the shifted divisor; a is not modified.

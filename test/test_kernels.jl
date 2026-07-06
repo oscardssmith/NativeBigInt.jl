@@ -527,3 +527,48 @@ end
         @test toref(r, 0, m) == rref
     end
 end
+
+@testset "mont_ninv / redc!" begin
+    using NativeBigInt: mont_ninv, redc!
+    rng = MersenneTwister(0xedc)
+    for trial in 1:200
+        m0 = rand(rng, UInt64) | 1
+        @test m0 * mont_ninv(m0) == -UInt64(1)
+    end
+    for k in (1, 2, 3, 8, 20), trial in 1:20
+        m = mem(rand(rng, UInt64, k))
+        m[1] |= 1
+        m[k] == 0 && (m[k] = 1)
+        mref = toref(m, 0, k)
+        # T uniform in [0, m*β^k): x*y with x,y < m
+        x = mod(rand(rng, big(0):big(2)^(64k)), mref)
+        y = mod(rand(rng, big(0):big(2)^(64k)), mref)
+        T = x * y
+        t = Memory{UInt64}(undef, 2k + 1)
+        for i in 1:2k+1
+            t[i] = UInt64((T >> (64 * (i - 1))) & typemax(UInt64))
+        end
+        r = Memory{UInt64}(undef, k)
+        redc!(r, 0, t, 0, m, 0, k, mont_ninv(m[1]))
+        @test toref(r, 0, k) == mod(T * invmod(big(2)^(64k), mref), mref)
+    end
+end
+
+@testset "sqrtrem!" begin
+    using NativeBigInt: sqrtrem!
+    rng = MersenneTwister(0x59b)
+    for k in (1, 2, 3, 5, 10, 33), trial in 1:20
+        n = 2k
+        a = mem(rand(rng, UInt64, n))
+        a[n] |= UInt64(1) << 62   # normalization: top limb >= 2^62
+        aref = toref(a, 0, n)
+        h = k
+        s = Memory{UInt64}(undef, h)
+        scratch = Memory{UInt64}(undef, 5h + 8)
+        rhi = sqrtrem!(s, 0, a, 0, n, scratch)
+        sref = toref(s, 0, h)
+        rref = (big(rhi) << (64h)) | toref(a, 0, h)
+        @test sref == isqrt(aref)
+        @test rref == aref - sref^2
+    end
+end

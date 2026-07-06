@@ -167,6 +167,78 @@ function Base.cld(a::NBig, b::NBig)
     return (!iszero(r) && sign(r) == sign(b)) ? q + one(NBig) : q
 end
 
+# Base semantics: result = mod(a^n, m), so the sign follows m.
+function Base.powermod(a::NBig, n::NBig, m::NBig)
+    iszero(m) && throw(DivideError())
+    signbit(n) && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
+    mm = abs(m)
+    k = nlimbs(mm)
+    k == 1 && (@inbounds mm.limbs[1]) == 1 && return NBig(0, EMPTY_LIMBS)
+    b = mod(a, mm)
+    r0 = if iszero(n)
+        one(NBig)
+    elseif iszero(b)
+        NBig(0, EMPTY_LIMBS)
+    else
+        r = powermod_limbs(b.limbs, nlimbs(b), n.limbs, nlimbs(n), mm.limbs, k)
+        nbig_from_limbs(1, r, k)
+    end
+    return signbit(m) && !iszero(r0) ? r0 + m : r0
+end
+Base.powermod(a::NBig, n::Integer, m::NBig) = powermod(a, NBig(n), m)
+
+function Base.gcd(a::NBig, b::NBig)
+    iszero(a) && return abs(b)
+    iszero(b) && return abs(a)
+    la, lb = nlimbs(a), nlimbs(b)
+    cap = max(la, lb) + 1
+    u = Memory{Limb}(undef, cap)
+    v = Memory{Limb}(undef, cap)
+    @inbounds for i in 1:la
+        u[i] = a.limbs[i]
+    end
+    @inbounds for i in 1:lb
+        v[i] = b.limbs[i]
+    end
+    mem, n = gcd!(u, la, v, lb)
+    return nbig_from_limbs(1, mem, n)
+end
+
+# isqrt: normalize by an even bit shift so sqrtrem!'s precondition
+# (top limb >= 2^62) holds, then shift the root back down by half.
+function Base.isqrt(x::NBig)
+    signbit(x) && throw(DomainError(x, "isqrt requires a nonnegative argument"))
+    iszero(x) && return x
+    n = nlimbs(x)
+    if n <= 2
+        v = n == 1 ? UInt128(@inbounds x.limbs[1]) :
+            (UInt128(@inbounds x.limbs[2]) << 64) | (@inbounds x.limbs[1])
+        return NBig(isqrt(v) % Limb)
+    end
+    bits = 64n - leading_zeros(@inbounds x.limbs[n])
+    e = (64n - bits) & ~1
+    # sqrtrem! needs an even limb count; odd n gets a zero low limb (a β
+    # multiply — a further even shift), undone below via the root shift.
+    pad = isodd(n) ? 1 : 0
+    nn = n + pad
+    a = Memory{Limb}(undef, nn)
+    pad == 1 && (@inbounds a[1] = 0)
+    if e == 0
+        @inbounds for i in 1:n
+            a[pad+i] = x.limbs[i]
+        end
+    else
+        lshift!(a, pad, x.limbs, 0, n, e)
+    end
+    h = nn >> 1
+    s = Memory{Limb}(undef, h)
+    scratch = Memory{Limb}(undef, 5h + 8)
+    sqrtrem!(s, 0, a, 0, nn, scratch)
+    sh = (e >> 1) + 32pad
+    sh > 0 && rshift!(s, 0, s, 0, h, sh)
+    return nbig_from_limbs(1, s, h)
+end
+
 function Base.:<<(x::NBig, c::UInt)
     (iszero(x) || c == 0) && return x
     lx = nlimbs(x)
