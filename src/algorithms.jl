@@ -1,4 +1,35 @@
-# Multi-limb algorithms built on the kernels: Karatsuba multiplication.
+# Multi-limb algorithms built on the kernels: Karatsuba multiplication and the
+# Lehmer cofactor-matrix apply. (Montgomery reduction lives in montgomery.jl.)
+
+@inline sterm(c::Int64, x::Limb) =
+    c >= 0 ? Int128(widemul(Limb(c), x)) : -Int128(widemul(Limb(-c), x))
+
+# Fused Lehmer matrix apply: r1 = A*U + B*V, r2 = C*U + D*V in one pass over
+# the operands via exact two's-complement limb accumulation (signed Int128
+# carries; |carry| stays < 2^63 for |cofactor| < 2^62). Valid cofactor
+# matrices give nonnegative results, so the final carries are the top limbs.
+# Writes n+1 limbs each, n = max(lu, lv); returns n+1. u/v are indexed from
+# offset 0 (this is gcd-algorithm glue, not a uniform (mem, offset, len) kernel).
+function lehmer_apply!(r1::Memory{Limb}, r1o::Int, r2::Memory{Limb}, r2o::Int,
+                       u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
+                       A::Int64, B::Int64, C::Int64, D::Int64)
+    n = max(lu, lv)
+    c1 = Int128(0)
+    c2 = Int128(0)
+    @inbounds for i in 1:n
+        ui = i <= lu ? u[i] : zero(Limb)
+        vi = i <= lv ? v[i] : zero(Limb)
+        a1 = c1 + sterm(A, ui) + sterm(B, vi)
+        r1[r1o+i] = a1 % Limb
+        c1 = a1 >> 64
+        a2 = c2 + sterm(C, ui) + sterm(D, vi)
+        r2[r2o+i] = a2 % Limb
+        c2 = a2 >> 64
+    end
+    @inbounds r1[r1o+n+1] = c1 % Limb
+    @inbounds r2[r2o+n+1] = c2 % Limb
+    return n + 1
+end
 
 # Below this operand length (limbs) mul_basecase! wins; benchmark-tuned.
 const KARATSUBA_THRESHOLD = 29
@@ -505,9 +536,7 @@ function radix_chunks!(a::Memory{Limb}, n::Int, bb::Limb)
     chunks = Limb[]
     while n > 0
         push!(chunks, divrem_1!(a, 0, a, 0, n, bb))
-        @inbounds while n > 0 && a[n] == 0
-            n -= 1
-        end
+        n = normlen(a, 0, n)
     end
     return chunks
 end
@@ -554,9 +583,7 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     nn = n + 1
     scratch = Memory{Limb}(undef, nn + (l > 0 ? m : 0))
     if l == 0
-        @inbounds for i in 1:n
-            scratch[i] = a[ao+i]
-        end
+        copyto!(scratch, 1, a, ao + 1, n)
         @inbounds scratch[nn] = zero(Limb)
         dv, dvo = d, do_
     else

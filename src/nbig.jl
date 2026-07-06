@@ -13,50 +13,40 @@ const EMPTY_LIMBS = Memory{Limb}(undef, 0)
 @inline Base.iszero(x::NBig) = x.signlen == 0
 
 function nbig_from_limbs(sgn::Int, limbs::Memory{Limb}, n::Int)
-    while n > 0 && limbs[n] == 0
-        n -= 1
-    end
+    n = normlen(limbs, 0, n)
     n == 0 && return NBig(0, EMPTY_LIMBS)
+    return NBig(sgn * n, limbs)
+end
+
+# Build an NBig with the given sign from an unsigned magnitude `mag` supporting
+# `>>= 64` and `% Limb` (a Julia unsigned, or a nonnegative BigInt).
+function nbig_from_magnitude(sgn::Int, mag)
+    n = 0
+    v = mag
+    while v != 0
+        n += 1
+        v >>= 64
+    end
+    limbs = Memory{Limb}(undef, n)
+    v = mag
+    for i in 1:n
+        limbs[i] = v % Limb
+        v >>= 64
+    end
     return NBig(sgn * n, limbs)
 end
 
 function NBig(x::Integer)
     x == 0 && return NBig(0, EMPTY_LIMBS)
     sgn = x < 0 ? -1 : 1
-    u = unsigned(sgn < 0 ? -widen(x) : widen(x))
-    n = 0
-    v = u
-    while v != 0
-        n += 1
-        v >>= 64
-    end
-    limbs = Memory{Limb}(undef, n)
-    v = u
-    for i in 1:n
-        limbs[i] = v % Limb
-        v >>= 64
-    end
-    return NBig(sgn * n, limbs)
+    return nbig_from_magnitude(sgn, unsigned(sgn < 0 ? -widen(x) : widen(x)))
 end
 NBig(x::Bool) = NBig(Int(x))
 NBig(x::NBig) = x
 
 function NBig(x::BigInt)
     x == 0 && return NBig(0, EMPTY_LIMBS)
-    sgn = x < 0 ? -1 : 1
-    v = abs(x)
-    n = 0
-    while v != 0
-        n += 1
-        v >>= 64
-    end
-    limbs = Memory{Limb}(undef, n)
-    v = abs(x)
-    for i in 1:n
-        limbs[i] = v % Limb
-        v >>= 64
-    end
-    return NBig(sgn * n, limbs)
+    return nbig_from_magnitude(x < 0 ? -1 : 1, abs(x))
 end
 
 function Base.BigInt(x::NBig)
@@ -218,9 +208,7 @@ function Base.isqrt(x::NBig)
     a = Memory{Limb}(undef, nn)
     pad == 1 && (@inbounds a[1] = 0)
     if e == 0
-        @inbounds for i in 1:n
-            a[pad+i] = x.limbs[i]
-        end
+        copyto!(a, pad + 1, x.limbs, 1, n)
     else
         lshift!(a, pad, x.limbs, 0, n, e)
     end
@@ -270,6 +258,15 @@ Base.:>>>(x::NBig, c::UInt) = x >> c
 
 Base.:~(x::NBig) = -(x + one(NBig))
 
+# In-place two's-complement negation of t[1..n]: t <- ~t + 1.
+@inline function negate_twos!(t::Memory{Limb}, n::Int)
+    c = Limb(1)
+    @inbounds for i in 1:n
+        t[i], c = add_limb_c(~t[i], c, zero(Limb))
+    end
+    return t
+end
+
 # Two's-complement image of x in t[1..n]; requires n > nlimbs(x) so the sign
 # extends into at least one full limb.
 function twos_complement!(t::Memory{Limb}, x::NBig, n::Int)
@@ -277,24 +274,14 @@ function twos_complement!(t::Memory{Limb}, x::NBig, n::Int)
     @inbounds for i in 1:n
         t[i] = i <= lx ? x.limbs[i] : zero(Limb)
     end
-    if signbit(x)
-        c = Limb(1)
-        @inbounds for i in 1:n
-            t[i], c = add_limb_c(~t[i], c, zero(Limb))
-        end
-    end
+    signbit(x) && negate_twos!(t, n)
     return t
 end
 
 # Interpret t[1..n] as two's complement (sign limb is all-0 or all-1).
 function from_twos_complement!(t::Memory{Limb}, n::Int)
-    if t[n] >> 63 == 0
-        return nbig_from_limbs(1, t, n)
-    end
-    c = Limb(1)
-    @inbounds for i in 1:n
-        t[i], c = add_limb_c(~t[i], c, zero(Limb))
-    end
+    t[n] >> 63 == 0 && return nbig_from_limbs(1, t, n)
+    negate_twos!(t, n)
     return nbig_from_limbs(-1, t, n)
 end
 
@@ -335,9 +322,7 @@ function Base.string(x::NBig; base::Integer = 10, pad::Integer = 1)
     n = nlimbs(x)
     bb, k = big_base(Int(base))
     scratch = Memory{Limb}(undef, n)
-    @inbounds for i in 1:n
-        scratch[i] = x.limbs[i]
-    end
+    copyto!(scratch, 1, x.limbs, 1, n)
     chunks = radix_chunks!(scratch, n, bb)
     # digit count of the top chunk (chunks may be empty for zero)
     ndig = (length(chunks) - 1) * k
@@ -422,13 +407,13 @@ Base.one(::Type{NBig}) = NBig(1)
 Base.promote_rule(::Type{NBig}, ::Type{<:Integer}) = NBig
 
 function to_uint(::Type{T}, x::NBig) where {T<:Unsigned}
-    signbit(x) && throw(InexactError(:UInt64, T, x))
+    signbit(x) && throw(InexactError(nameof(T), T, x))
     n = nlimbs(x)
     n == 0 && return zero(T)
     bits = sizeof(T) * 8
     if n * 64 > bits
         for i in (bits ÷ 64 + 1):n
-            x.limbs[i] != 0 && throw(InexactError(:UInt64, T, x))
+            x.limbs[i] != 0 && throw(InexactError(nameof(T), T, x))
         end
     end
     r = zero(T)
@@ -438,41 +423,21 @@ function to_uint(::Type{T}, x::NBig) where {T<:Unsigned}
     return r
 end
 
-function Base.UInt64(x::NBig)
-    signbit(x) && throw(InexactError(:UInt64, UInt64, x))
-    n = nlimbs(x)
-    n == 0 && return UInt64(0)
-    n > 1 && throw(InexactError(:UInt64, UInt64, x))
-    return x.limbs[1]
-end
-
-function Base.Int64(x::NBig)
-    n = nlimbs(x)
-    n == 0 && return Int64(0)
-    n > 1 && throw(InexactError(:Int64, Int64, x))
-    v = x.limbs[1]
+# Signed conversion: read the magnitude as unsigned U (the same-width unsigned
+# of S), then apply the sign, allowing exactly typemin(S) = -(typemax + 1).
+function to_sint(::Type{S}, x::NBig) where {S<:Signed}
+    U = unsigned(S)
+    v = to_uint(U, abs(x))
     if signbit(x)
-        v > UInt64(typemax(Int64)) + 1 && throw(InexactError(:Int64, Int64, x))
-        v == UInt64(typemax(Int64)) + 1 && return typemin(Int64)
-        return -Int64(v)
+        v > unsigned(typemax(S)) + one(U) && throw(InexactError(nameof(S), S, x))
+        v == unsigned(typemax(S)) + one(U) && return typemin(S)
+        return -(v % S)
     else
-        v > UInt64(typemax(Int64)) && throw(InexactError(:Int64, Int64, x))
-        return Int64(v)
+        v > unsigned(typemax(S)) && throw(InexactError(nameof(S), S, x))
+        return v % S
     end
 end
 
-function Base.Int128(x::NBig)
-    n = nlimbs(x)
-    n == 0 && return Int128(0)
-    n > 2 && throw(InexactError(:Int128, Int128, x))
-    v = UInt128(x.limbs[1])
-    n == 2 && (v |= UInt128(x.limbs[2]) << 64)
-    if signbit(x)
-        v > UInt128(typemax(Int128)) + 1 && throw(InexactError(:Int128, Int128, x))
-        v == UInt128(typemax(Int128)) + 1 && return typemin(Int128)
-        return -Int128(v)
-    else
-        v > UInt128(typemax(Int128)) && throw(InexactError(:Int128, Int128, x))
-        return Int128(v)
-    end
-end
+Base.UInt64(x::NBig) = to_uint(UInt64, x)
+Base.Int64(x::NBig) = to_sint(Int64, x)
+Base.Int128(x::NBig) = to_sint(Int128, x)
