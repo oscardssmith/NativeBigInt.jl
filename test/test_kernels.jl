@@ -104,6 +104,41 @@ end
     @test toref(r, 0, 7) == toref(a, 0, 4) * toref(b, 0, 3)
 end
 
+@testset "sqr_basecase! / sqr!" begin
+    rng = MersenneTwister(0x59)
+    sqr_basecase! = NativeBigInt.sqr_basecase!
+    sqr! = NativeBigInt.sqr!
+    # every size 1..45: hits n==1/n==2 paths, paired/unpaired last row, and
+    # (via sqr!) both sides of SQR_KARATSUBA_THRESHOLD
+    for n in 1:45, trial in 1:10
+        a = mem(rand(rng, UInt64, n))
+        r = Memory{UInt64}(undef, 2n)
+        sqr_basecase!(r, 0, a, 0, n)
+        @test toref(r, 0, 2n) == toref(a, 0, n)^2
+        fill!(r, 0xdead)
+        sqr!(r, 0, a, 0, n)
+        @test toref(r, 0, 2n) == toref(a, 0, n)^2
+    end
+    # adversarial: all-ones (max carry chains), 2^k patterns, offsets
+    for n in (1, 2, 3, 7, 8, 16, 33)
+        a = mem(fill(typemax(UInt64), n))
+        r = Memory{UInt64}(undef, 2n)
+        sqr_basecase!(r, 0, a, 0, n)
+        @test toref(r, 0, 2n) == toref(a, 0, n)^2
+    end
+    for n in (60, 100, 157)  # Karatsuba recursion, odd/even splits
+        a = mem(rand(rng, UInt64, n))
+        r = Memory{UInt64}(undef, 2n)
+        sqr!(r, 0, a, 0, n)
+        @test toref(r, 0, 2n) == toref(a, 0, n)^2
+    end
+    # nonzero offsets
+    a = mem(rand(rng, UInt64, 9))
+    r = Memory{UInt64}(undef, 16)
+    sqr_basecase!(r, 2, a, 3, 6)
+    @test toref(r, 2, 12) == toref(a, 3, 6)^2
+end
+
 @testset "addmul_2! direct" begin
     rng = MersenneTwister(99)
     addmul_2! = NativeBigInt.addmul_2!

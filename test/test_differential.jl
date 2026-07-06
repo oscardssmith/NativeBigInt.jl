@@ -32,6 +32,8 @@ end
         @test BigInt(na + nb) == a + b
         @test BigInt(na - nb) == a - b
         @test BigInt(na * nb) == a * b
+        @test BigInt(na * na) == a * a   # squaring path (a.limbs === b.limbs)
+        @test BigInt(na^2) == a^2
         if la <= 4
             e = rand(rng, 0:12)
             @test BigInt(na^e) == a^e

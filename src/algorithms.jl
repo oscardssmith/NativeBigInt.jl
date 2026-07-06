@@ -71,6 +71,47 @@ function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
     return nothing
 end
 
+# sqr_basecase! does half the multiplies of mul_basecase!, so squaring stays
+# basecase longer than mul; benchmark-tuned separately.
+const SQR_KARATSUBA_THRESHOLD = 52
+
+# Balanced Karatsuba squaring: r[1..2n] = a[1..n]^2. Same recursion shape as
+# kar_mul! with mid = (a_lo - a_hi)^2 >= 0, so the middle term is always
+# lo + hi - mid and there is no sign tracking. Scratch layout matches
+# kar_scratch_len(n); r must not alias a.
+function kar_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
+                  scratch::Memory{Limb}, so::Int, thr::Int=SQR_KARATSUBA_THRESHOLD)
+    if n < thr
+        return sqr_basecase!(r, ro, a, ao, n)
+    end
+    h2 = (n + 1) >> 1   # low-half length
+    h = n - h2          # high-half length (h2 or h2-1)
+    L = 2h2
+    mid = so            # L limbs: (a_lo - a_hi)^2
+    tmp = so + L        # L limbs: the difference, then lo + hi - mid
+    rec = so + 2L       # recursion scratch
+    abs_diff!(scratch, tmp, a, ao, h2, h)
+    kar_sqr!(scratch, mid, scratch, tmp, h2, scratch, rec, thr)
+    kar_sqr!(r, ro, a, ao, h2, scratch, rec, thr)                 # lo
+    kar_sqr!(r, ro + L, a, ao + h2, h, scratch, rec, thr)         # hi
+    c = add!(scratch, tmp, r, ro, L, r, ro + L, 2h)               # tmp = lo + hi
+    c -= sub_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
+    add_into!(r, ro + h2, 2n - h2, scratch, tmp, L)
+    add_carry!(r, ro + h2, 2n - h2, L + 1, c)
+    return nothing
+end
+
+# r[1..2n] = a[1..n]^2, n >= 1; r must not alias a.
+function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
+              thr::Int=SQR_KARATSUBA_THRESHOLD)
+    if n < thr
+        return sqr_basecase!(r, ro, a, ao, n)
+    end
+    scratch = Memory{Limb}(undef, kar_scratch_len(n, thr))
+    kar_sqr!(r, ro, a, ao, n, scratch, 0, thr)
+    return nothing
+end
+
 # General product r[1..m+n] = a[1..m] * b[1..n], m >= n >= 1; r must not
 # alias a or b. Karatsuba on n-limb chunks of a; each block's low n limbs
 # accumulate into r, its high limbs land in fresh territory (plus carry).

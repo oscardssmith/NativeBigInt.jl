@@ -125,6 +125,12 @@ Base.:-(a::NBig, b::NBig) = a + (-b)
 function Base.:*(a::NBig, b::NBig)
     (iszero(a) || iszero(b)) && return NBig(0, EMPTY_LIMBS)
     la, lb = nlimbs(a), nlimbs(b)
+    if a.limbs === b.limbs
+        # same magnitude (covers x*x and x^2 via power_by_squaring): square it
+        r = Memory{Limb}(undef, 2la)
+        sqr!(r, 0, a.limbs, 0, la)
+        return nbig_from_limbs(sign(a) * sign(b), r, 2la)
+    end
     if la < lb
         a, b = b, a
         la, lb = lb, la

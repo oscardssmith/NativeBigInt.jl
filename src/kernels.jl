@@ -450,6 +450,89 @@ function mul_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::In
     return nothing
 end
 
+# r[1..2n] = a[1..n]^2; r must not alias a. Half the multiplies of
+# mul_basecase!: build the off-diagonal triangle sum_{i<j} a_i*a_j once with
+# paired mul_2!/addmul_2! rows (rows j,j+1 over a[j+2..n] share one pass; the
+# split-off a[j]*a[j+1] term is added separately), then one fused pass doubles
+# the triangle and adds the diagonal squares a_i^2.
+function sqr_basecase!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    @inbounds begin
+        if n == 1
+            p = widemul(a[ao+1], a[ao+1])
+            r[ro+1] = p % Limb
+            r[ro+2] = (p >> 64) % Limb
+            return nothing
+        end
+        # Off-diagonal triangle into r[2..2n-1]: a[j]*a[j+k] lands at limb
+        # index 2j+k-1, so rows j,j+1 over the shared range a[j+2..n] form one
+        # (a[j], a[j+1]) two-row pass based at r[2j+1].
+        if n == 2
+            p = widemul(a[ao+1], a[ao+2])
+            r[ro+2] = p % Limb
+            r[ro+3] = (p >> 64) % Limb
+        else
+            mul_2!(r, ro + 2, a, ao + 2, n - 2, a[ao+1], a[ao+2])
+            p = widemul(a[ao+1], a[ao+2])
+            r[ro+2] = p % Limb
+            t = UInt128(r[ro+3]) + (p >> 64) % Limb
+            r[ro+3] = t % Limb
+            c = (t >> 64) % Limb
+            k = 4
+            while c != zero(Limb)
+                t = UInt128(r[ro+k]) + c
+                r[ro+k] = t % Limb
+                c = (t >> 64) % Limb
+                k += 1
+            end
+            j = 3
+            while j <= n - 2
+                addmul_2!(r, ro + 2j, a, ao + j + 1, n - j - 1, a[ao+j], a[ao+j+1])
+                p = widemul(a[ao+j], a[ao+j+1])
+                t = UInt128(r[ro+2j]) + p % Limb
+                r[ro+2j] = t % Limb
+                # hi(p) <= 2^64-2, so hi + carry cannot overflow a limb
+                c = ((t >> 64) % Limb) + (p >> 64) % Limb
+                k = 2j + 1
+                while c != zero(Limb)
+                    t = UInt128(r[ro+k]) + c
+                    r[ro+k] = t % Limb
+                    c = (t >> 64) % Limb
+                    k += 1
+                end
+                j += 2
+            end
+            if j == n - 1
+                # unpaired last row: the single product a[n-1]*a[n]
+                p = widemul(a[ao+j], a[ao+j+1])
+                t = UInt128(r[ro+2n-2]) + p % Limb
+                r[ro+2n-2] = t % Limb
+                r[ro+2n-1] = ((t >> 64) % Limb) + (p >> 64) % Limb
+            end
+        end
+        # Fused double-and-add-diagonal: slot i covers r[2i-1..2i]; the bit
+        # shifted out of a slot and the additive carry both have weight
+        # 2^128 = bit 0 of the next slot.
+        r[ro+1] = zero(Limb)
+        r[ro+2n] = zero(Limb)
+        bit = zero(Limb)
+        cc = zero(Limb)
+        for i in 1:n
+            u_lo = r[ro+2i-1]
+            u_hi = r[ro+2i]
+            d_lo = (u_lo << 1) | bit
+            d_hi = (u_hi << 1) | (u_lo >> 63)
+            bit = u_hi >> 63
+            p = widemul(a[ao+i], a[ao+i])
+            t = UInt128(d_lo) + (p % Limb) + cc
+            t2 = (t >> 64) + ((p >> 64) % Limb) + d_hi
+            r[ro+2i-1] = t % Limb
+            r[ro+2i] = t2 % Limb
+            cc = (t2 >> 64) % Limb
+        end
+    end
+    return nothing
+end
+
 @inline function lshift!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int, cnt::Int)
     ret = @inbounds a[ao+n] >> (64 - cnt)
     @inbounds for i in n:-1:2
