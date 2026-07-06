@@ -244,46 +244,47 @@ end
     return (UInt128(hi) << 64) | lo
 end
 
-# t[1..lt] = a*U + b*V where lt = lu+1, U = u[1..lu], V = v[1..lv], lv <= lu,
-# a and b have opposite signs (or are zero) and the result is nonnegative
-# (rows of a Lehmer cofactor matrix applied to a remainder pair).
-function lehmer_row!(t::Memory{Limb}, to::Int, u::Memory{Limb}, lu::Int,
-                     v::Memory{Limb}, lv::Int, a::Int64, b::Int64)
-    lt = lu + 1
-    if b <= 0
-        hi = mul_1!(t, to, u, 0, lu, Limb(a))
-        @inbounds t[to+lt] = hi
-        if b != 0
-            brw = submul_1!(t, to, v, 0, lv, Limb(-b))
-            sub_1!(t, to + lv, t, to + lv, lt - lv, brw)
-        end
-    else
-        hi = mul_1!(t, to, v, 0, lv, Limb(b))
-        @inbounds t[to+lv+1] = hi
-        @inbounds for i in lv+2:lt
-            t[to+i] = 0
-        end
-        if a != 0
-            brw = submul_1!(t, to, u, 0, lu, Limb(-a))
-            sub_1!(t, to + lu, t, to + lu, lt - lu, brw)
-        end
+@inline sterm(c::Int64, x::Limb) =
+    c >= 0 ? Int128(widemul(Limb(c), x)) : -Int128(widemul(Limb(-c), x))
+
+# Fused Lehmer matrix apply: r1 = A*U + B*V, r2 = C*U + D*V in one pass over
+# the operands via exact two's-complement limb accumulation (signed Int128
+# carries; |carry| stays < 2^63 for |cofactor| < 2^62). Valid cofactor
+# matrices give nonnegative results, so the final carries are the top limbs.
+# Writes n+1 limbs each, n = max(lu, lv); returns n+1.
+function lehmer_apply!(r1::Memory{Limb}, r1o::Int, r2::Memory{Limb}, r2o::Int,
+                       u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
+                       A::Int64, B::Int64, C::Int64, D::Int64)
+    n = max(lu, lv)
+    c1 = Int128(0)
+    c2 = Int128(0)
+    @inbounds for i in 1:n
+        ui = i <= lu ? u[i] : zero(Limb)
+        vi = i <= lv ? v[i] : zero(Limb)
+        a1 = c1 + sterm(A, ui) + sterm(B, vi)
+        r1[r1o+i] = a1 % Limb
+        c1 = a1 >> 64
+        a2 = c2 + sterm(C, ui) + sterm(D, vi)
+        r2[r2o+i] = a2 % Limb
+        c2 = a2 >> 64
     end
-    while lt > 0 && (@inbounds t[to+lt]) == 0
-        lt -= 1
-    end
-    return lt
+    @inbounds r1[r1o+n+1] = c1 % Limb
+    @inbounds r2[r2o+n+1] = c2 % Limb
+    return n + 1
 end
 
 # gcd of the magnitudes u[1..lu] and v[1..lv]; both buffers are destroyed and
 # must have capacity >= max(lu, lv) + 1. Returns (mem, len) with the result in
 # one of the two buffers. Lehmer's method (Knuth TAOCP §4.5.2, Algorithm L):
 # Euclid on 126-bit leading windows with signed single-limb cofactors, applied
-# to the full operands with mul_1!/submul_1! passes; a full divrem! step when
-# the window test makes no progress; UInt128 binary gcd once v fits two limbs.
+# to the full operands in one fused lehmer_apply! pass with buffer rotation;
+# a full divrem! step when the window test makes no progress; UInt128 binary
+# gcd once v fits two limbs.
 function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
-    cap = max(lu, lv) + 1
-    scratch = Memory{Limb}(undef, 3cap)
-    t1, t2, qb = 0, cap, 2cap
+    cap = max(lu, lv) + 2
+    w1 = Memory{Limb}(undef, cap)
+    w2 = Memory{Limb}(undef, cap)
+    qb = Memory{Limb}(undef, cap)
     while true
         # invariant maintenance: normalized lengths, u >= v
         if lu < lv || (lu == lv && cmp_limbs(u, 0, lu, v, 0, lv) < 0)
@@ -293,19 +294,16 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         lv == 0 && return u, lu
         if lv <= 2
             if lu > 2
-                divrem!(scratch, qb, scratch, t1, u, 0, lu, v, 0, lv)
-                x = lv == 1 ? UInt128(@inbounds scratch[t1+1]) :
-                    (UInt128(@inbounds scratch[t1+2]) << 64) | (@inbounds scratch[t1+1])
-                y = lv == 1 ? UInt128(@inbounds v[1]) :
-                    (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
-                g = gcd(x, y)
+                divrem!(qb, 0, w1, 0, u, 0, lu, v, 0, lv)
+                x = lv == 1 ? UInt128(@inbounds w1[1]) :
+                    (UInt128(@inbounds w1[2]) << 64) | (@inbounds w1[1])
             else
-                x = (lu == 1 ? UInt128(@inbounds u[1]) :
-                     (UInt128(@inbounds u[2]) << 64) | (@inbounds u[1]))
-                y = lv == 1 ? UInt128(@inbounds v[1]) :
-                    (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
-                g = gcd(x, y)
+                x = lu == 1 ? UInt128(@inbounds u[1]) :
+                    (UInt128(@inbounds u[2]) << 64) | (@inbounds u[1])
             end
+            y = lv == 1 ? UInt128(@inbounds v[1]) :
+                (UInt128(@inbounds v[2]) << 64) | (@inbounds v[1])
+            g = gcd(x, y)
             @inbounds u[1] = g % Limb
             @inbounds u[2] = (g >> 64) % Limb
             return u, ((g >> 64) != 0 ? 2 : 1)
@@ -316,51 +314,73 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         if ub - vb < 64
             # Euclid on the 126-bit windows; cofactors bracket the truncation
             # error, so a quotient is accepted only when both extremes agree.
+            # Cofactors are kept as nonnegative magnitudes with implicit
+            # alternating signs (Knuth's formulation): at even step counts the
+            # rows are (+A, -B) / (-C, +D), at odd counts the signs flip. The
+            # update (A,B,C,D) <- (C, D, A+qC, B+qD) is then sign-free.
             pos = ub - 126
-            x = Int128(extract_window(u, lu, pos))
-            y = Int128(extract_window(v, lv, pos))
-            A, B, C, D = Int64(1), Int64(0), Int64(0), Int64(1)
+            x = extract_window(u, lu, pos)
+            y = extract_window(v, lv, pos)
+            A, B, C, D = UInt128(1), UInt128(0), UInt128(0), UInt128(1)
+            even = true
             while true
-                p2 = (C > 0 ? Int128(C) : Int128(0)) + (D > 0 ? Int128(D) : Int128(0))
-                n2 = Int128(C) + Int128(D) - p2
-                p1 = (A > 0 ? Int128(A) : Int128(0)) + (B > 0 ? Int128(B) : Int128(0))
-                n1 = Int128(A) + Int128(B) - p1
-                y + n2 <= 0 && break
-                q = div(x + n1, y + p2)
-                q != div(x + p1, y + n2) && break
-                q <= 0 && break
-                nC = Int128(A) - q * Int128(C)
-                nD = Int128(B) - q * Int128(D)
-                (abs(nC) > Int128(2)^62 || abs(nD) > Int128(2)^62) && break
-                ny = x - q * y
-                ny < 0 && break
-                x, y = y, ny
-                A, B, C, D = C, D, Int64(nC), Int64(nD)
+                # error brackets by parity: true quotient lies between
+                # (x - s1)/(y + s2) and (x + s3)/(y - s4)
+                s1, s2, s3, s4 = even ? (B, D, A, C) : (A, C, B, D)
+                (s1 > x || s4 >= y) && break
+                xl, dh = x - s1, y + s2
+                xh, dl = x + s3, y - s4
+                # q <= 3 covers ~70% of quotients (Gauss–Kuzmin) and needs no
+                # 128-bit divide (__udivti3), just a compare ladder; otherwise
+                # one division plus a multiply/range check. All products stay
+                # below 2^128: dl <= dh < 2^126 + 2^62.
+                xl < dh && break
+                if (xl >> 2) < dh
+                    d2 = dh + dh
+                    q = xl < d2 ? UInt128(1) : xl < d2 + dh ? UInt128(2) : UInt128(3)
+                    xl - q * dh < dh || break   # gate admits xl up to 4dh+3
+                    (q * dl <= xh && xh < (q + 1) * dl) || break
+                else
+                    q = div(xl, dh)
+                    r = xh - q * dl   # xh >= xl >= q*dh >= q*dl
+                    r < dl || break
+                end
+                nC = A + q * C
+                nD = B + q * D
+                (nC > UInt128(2)^62 || nD > UInt128(2)^62) && break
+                x, y = y, x - q * y
+                A, B, C, D = C, D, nC, nD
+                even = !even
                 steps += 1
             end
         end
         if steps == 0
-            # window made no progress: one full division step
-            divrem!(scratch, qb, scratch, t1, u, 0, lu, v, 0, lv)
-            u, v = v, u
-            lu = lv
-            @inbounds for i in 1:lu
-                v[i] = scratch[t1+i]
-            end
+            # window made no progress: one full division step, rotating the
+            # remainder buffer in rather than copying
+            divrem!(qb, 0, w1, 0, u, 0, lu, v, 0, lv)
+            u, v, w1 = v, w1, u
+            lu, lv = lv, lv
             while lv > 0 && (@inbounds v[lv]) == 0
                 lv -= 1
             end
         else
-            # (U, V) <- (A*U + B*V, C*U + D*V)
-            l1 = lehmer_row!(scratch, t1, u, lu, v, lv, A, B)
-            l2 = lehmer_row!(scratch, t2, u, lu, v, lv, C, D)
-            @inbounds for i in 1:l1
-                u[i] = scratch[t1+i]
+            # (U, V) <- (A*U + B*V, C*U + D*V), one fused pass, then rotate
+            sA, sB, sC, sD = Int64(A), Int64(B), Int64(C), Int64(D)
+            if even
+                sB, sC = -sB, -sC
+            else
+                sA, sD = -sA, -sD
             end
-            @inbounds for i in 1:l2
-                v[i] = scratch[t2+i]
+            n = lehmer_apply!(w1, 0, w2, 0, u, lu, v, lv, sA, sB, sC, sD)
+            u, w1 = w1, u
+            v, w2 = w2, v
+            lu = lv = n
+            while lu > 0 && (@inbounds u[lu]) == 0
+                lu -= 1
             end
-            lu, lv = l1, l2
+            while lv > 0 && (@inbounds v[lv]) == 0
+                lv -= 1
+            end
         end
     end
 end
