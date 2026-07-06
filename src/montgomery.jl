@@ -22,9 +22,7 @@ function redc!(r::Memory{Limb}, ro::Int, t::Memory{Limb}, to::Int,
     if (@inbounds t[to+2k+1]) != 0 || cmp_limbs(t, to + k, k, m, mo, k) >= 0
         sub_n!(r, ro, t, to + k, m, mo, k)
     else
-        @inbounds for i in 1:k
-            r[ro+i] = t[to+k+i]
-        end
+        copyto!(r, ro + 1, t, to + k + 1, k)
     end
     return nothing
 end

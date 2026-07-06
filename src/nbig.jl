@@ -227,9 +227,7 @@ function Base.:<<(x::NBig, c::UInt)
     lw, cnt = Int(c >> 6), Int(c & 63)
     n = lx + lw + 1
     r = Memory{Limb}(undef, n)
-    @inbounds for i in 1:lw
-        r[i] = 0
-    end
+    fill!(view(r, 1:lw), zero(Limb))
     @inbounds r[n] = lshift!(r, lw, x.limbs, 0, lx, cnt)
     return nbig_from_limbs(sign(x), r, n)
 end
@@ -271,9 +269,8 @@ end
 # extends into at least one full limb.
 function twos_complement!(t::Memory{Limb}, x::NBig, n::Int)
     lx = nlimbs(x)
-    @inbounds for i in 1:n
-        t[i] = i <= lx ? x.limbs[i] : zero(Limb)
-    end
+    copyto!(t, 1, x.limbs, 1, lx)
+    fill!(view(t, lx+1:n), zero(Limb))
     signbit(x) && negate_twos!(t, n)
     return t
 end

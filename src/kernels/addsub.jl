@@ -68,12 +68,12 @@ end
 end
 
 # Once the carry/borrow dies (expected after ~1 limb), the rest of the tail is
-# a plain copy; keeping it out of the carry loop lets LLVM vectorize it.
+# a plain memcpy. The alias guard skips the common in-place case (r === a) where
+# source and dest coincide; otherwise the ranges are disjoint (partial overlap
+# is unsupported), so copyto! is safe.
 @inline function copy_tail!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, from::Int, to::Int)
     (r === a && ro == ao) && return nothing
-    @inbounds for i in from:to
-        r[ro+i] = a[ao+i]
-    end
+    from <= to && copyto!(r, ro + from, a, ao + from, to - from + 1)
     return nothing
 end
 

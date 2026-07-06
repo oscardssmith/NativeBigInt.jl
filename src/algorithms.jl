@@ -53,9 +53,7 @@ function abs_diff!(d::Memory{Limb}, dof::Int, x::Memory{Limb}, xo::Int, lo_len::
     else
         # x_lo < x_hi < B^hi_len forces x_lo's limbs above hi_len to be zero
         sub_n!(d, dof, x, xo + lo_len, x, xo, hi_len)
-        @inbounds for i in hi_len+1:lo_len
-            d[dof+i] = 0
-        end
+        fill!(view(d, dof+hi_len+1:dof+lo_len), zero(Limb))
         return true
     end
 end
@@ -199,9 +197,7 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     qq = sco + 2h + 2       # lq+2 limbs: quotient Q
     uu = sco + 3h + 4       # hh+1 limbs: division remainder U
     q2 = sco + 4h + 5       # 2lq limbs: Q^2
-    @inbounds for i in 1:h
-        scratch[num+i] = a[ao+lq+i]
-    end
+    copyto!(scratch, num + 1, a, ao + lq + 1, h)
     numlen = h
     if c1 != 0
         numlen = h + 1
@@ -219,15 +215,11 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     @inbounds while numlen > dl && scratch[num+numlen] == 0
         numlen -= 1
     end
-    @inbounds for i in 1:lq+2
-        scratch[qq+i] = 0
-    end
+    fill!(view(scratch, qq+1:qq+lq+2), zero(Limb))
     divrem!(scratch, qq, scratch, uu, scratch, num, numlen, scratch, dd, dl)
     qlen = numlen - dl + 1
     rhi = 0
-    @inbounds for i in 1:hh
-        a[ao+lq+i] = scratch[uu+i]
-    end
+    copyto!(a, ao + lq + 1, scratch, uu + 1, hh)
     dl > hh && (rhi = Int(@inbounds scratch[uu+dl]))
     # Q <= β^lq; if Q = β^lq exactly, clamp to β^lq - 1 and put 2S' back in U
     # (still >= the true root; the correction loop repairs the remainder).
@@ -236,15 +228,11 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
         scratch[qq+i] != 0 && (toobig = true)
     end
     if toobig
-        @inbounds for i in 1:lq
-            scratch[qq+i] = typemax(Limb)
-        end
+        fill!(view(scratch, qq+1:qq+lq), typemax(Limb))
         c = add_n!(a, ao + lq, a, ao + lq, scratch, dd, hh)
         rhi += Int(c) + (dl > hh ? Int(@inbounds scratch[dd+dl]) : 0)
     end
-    @inbounds for i in 1:lq
-        s[so+i] = scratch[qq+i]
-    end
+    copyto!(s, so + 1, scratch, qq + 1, lq)
     # R = U*β^lq + A0 - Q^2, tracked as (rhi, a[ao+1..ao+h]) with rhi signed
     sqr!(scratch, q2, scratch, qq, lq)
     rhi -= Int(sub!(a, ao, a, ao, h, scratch, q2, 2lq))
@@ -440,12 +428,8 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
                 lt -= 1
             end
             if lt < k || cmp_limbs(prod, 0, lt, m, 0, k) < 0
-                @inbounds for i in 1:lt
-                    dst[dsto+i] = prod[i]
-                end
-                @inbounds for i in lt+1:k
-                    dst[dsto+i] = 0
-                end
+                copyto!(dst, dsto + 1, prod, 1, lt)
+                fill!(view(dst, dsto+lt+1:dsto+k), zero(Limb))
             else
                 divrem!(qbuf, 0, dst, dsto, prod, 0, lt, m, 0, k)
             end
@@ -454,20 +438,12 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
 
     # table slot 0 = base: b·β^k mod m in Montgomery form, else b zero-padded
     if odd
-        @inbounds for i in 1:k
-            prod[i] = 0
-        end
-        @inbounds for i in 1:lb
-            prod[k+i] = b[i]
-        end
+        fill!(view(prod, 1:k), zero(Limb))
+        copyto!(prod, k + 1, b, 1, lb)
         divrem!(qbuf, 0, table, 0, prod, 0, k + lb, m, 0, k)
     else
-        @inbounds for i in 1:lb
-            table[i] = b[i]
-        end
-        @inbounds for i in lb+1:k
-            table[i] = 0
-        end
+        copyto!(table, 1, b, 1, lb)
+        fill!(view(table, lb+1:k), zero(Limb))
     end
     if tsize > 1
         bsq = Memory{Limb}(undef, k)
@@ -493,9 +469,7 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
                 val = (val << 1) | Int(expbit(e, i - j))
             end
             if first
-                @inbounds for t in 1:k
-                    acc[t] = table[(val>>1)*k+t]
-                end
+                copyto!(acc, 1, table, (val >> 1) * k + 1, k)
                 first = false
             else
                 for _ in 1:l
@@ -507,12 +481,8 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
         end
     end
     if odd   # leave Montgomery form: one reduction of the bare value
-        @inbounds for t in 1:k
-            prod[t] = acc[t]
-        end
-        @inbounds for t in k+1:2k+1
-            prod[t] = 0
-        end
+        copyto!(prod, 1, acc, 1, k)
+        fill!(view(prod, k+1:2k+1), zero(Limb))
         redc!(acc, 0, prod, 0, m, 0, k, ninv)
     end
     return acc
@@ -594,9 +564,7 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
     divrem_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)   # qh == 0: Q < β^(nn-m)
     if l == 0
-        @inbounds for i in 1:m
-            r[ro+i] = scratch[i]
-        end
+        copyto!(r, ro + 1, scratch, 1, m)
     else
         rshift!(r, ro, scratch, 0, m, l)
     end
