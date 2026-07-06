@@ -496,12 +496,35 @@ end
 
 # Little-endian base^k digit chunks of the n-limb magnitude in a (destroyed:
 # a is divided down in place). Repeated divrem_1! — O(n²), fine for v1;
-# divide-and-conquer is a post-v1 extension for very large n.
+# divide-and-conquer is a post-v1 extension for very large n. A power-of-two
+# base^k = 2^c needs no division: each chunk is a fixed-width c-bit window (O(n)).
 function radix_chunks!(a::Memory{Limb}, n::Int, bb::Limb)
+    ispow2(bb) && return radix_chunks_pow2(a, n, trailing_zeros(bb))
     chunks = Limb[]
     while n > 0
         push!(chunks, divrem_1!(a, 0, a, 0, n, bb))
         n = normlen(a, 0, n)
+    end
+    return chunks
+end
+
+# Little-endian c-bit windows of the n-limb magnitude (a[n] ≠ 0, c ≤ 63):
+# identical output to repeatedly dividing by 2^c, but O(n). Does not touch a.
+function radix_chunks_pow2(a::Memory{Limb}, n::Int, c::Int)
+    n == 0 && return Limb[]
+    bitlen = 64n - leading_zeros(@inbounds a[n])
+    nchunks = cld(bitlen, c)
+    chunks = Vector{Limb}(undef, nchunks)
+    mask = (one(Limb) << c) - one(Limb)
+    @inbounds for t in 0:nchunks-1
+        b = t * c
+        q = b >> 6
+        off = b & 63
+        w = a[q+1] >> off
+        if off != 0 && q+2 <= n   # window straddles a limb boundary
+            w |= a[q+2] << (64 - off)
+        end
+        chunks[t+1] = w & mask
     end
     return chunks
 end

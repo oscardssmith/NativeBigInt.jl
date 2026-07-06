@@ -108,6 +108,9 @@ end
         @test string(na) == string(a)
         @test string(na, base = 16) == string(a, base = 16)
         @test string(na, base = 2, pad = 100) == string(a, base = 2, pad = 100)
+        @test string(na, base = 8) == string(a, base = 8)
+        @test string(na, base = 4) == string(a, base = 4)
+        @test string(na, base = 32) == string(a, base = 32)
         @test parse(NBig, string(a)) == na
         @test hash(na) == hash(a)
         @test Float64(na) == Float64(a)
