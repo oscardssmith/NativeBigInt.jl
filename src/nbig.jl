@@ -190,40 +190,42 @@ function Base.gcd(a::NBig, b::NBig)
     return nbig_from_limbs(1, mem, n)
 end
 
-# Extended Euclid on NBig values, leaning on the fast Knuth-D divrem.
-# Mirrors Base's generic gcdx loop (truncated divrem keeps the invariants
-# s0*a + t0*b == x valid for any sign combination).
-function Base.gcdx(a::NBig, b::NBig)
-    # Base convention: gcdx(0, 0) == (0, 0, 0), not the loop's (0, 1, 0).
-    iszero(a) && iszero(b) && return (a, a, a)
-    s0, s1 = one(NBig), NBig(0, EMPTY_LIMBS)
-    t0, t1 = NBig(0, EMPTY_LIMBS), one(NBig)
-    x, y = a, b
-    while !iszero(y)
-        q, r = divrem(x, y)
-        x, y = y, r
-        s0, s1 = s1, s0 - q * s1
-        t0, t1 = t1, t0 - q * t1
-    end
-    return signbit(x) ? (-x, -s0, -t0) : (x, s0, t0)
+# Run gcdext! on the magnitudes of (x, y); returns (g, t) as NBigs with
+# s*|x| + t*|y| == g for the (recoverable) s.
+function gcdext_nbig(x::NBig, y::NBig)
+    lx, ly = nlimbs(x), nlimbs(y)
+    cap = max(lx, ly) + 1
+    u = Memory{Limb}(undef, cap)
+    v = Memory{Limb}(undef, cap)
+    copyto!(u, 1, x.limbs, 1, lx)
+    copyto!(v, 1, y.limbs, 1, ly)
+    g, lg, t, lt, tpos = gcdext!(u, lx, v, ly)
+    return nbig_from_limbs(1, g, lg), nbig_from_limbs(tpos ? 1 : -1, t, lt)
 end
 
-# Extended Euclid tracking only the m-cofactor; the final t0 lies in
-# (-|m|, |m|), so one conditional add/sub yields Base's sign convention
-# (result follows the sign of m).
+# Extended Lehmer gcd (gcdext! in algorithms.jl) on the magnitudes; the
+# a-cofactor is recovered from the identity s = (g - t*|b|) / |a| (exact),
+# then both cofactors flip with their operand's sign. Matches Base's
+# generic gcdx values (Euclid cofactors are unique given g and t).
+function Base.gcdx(a::NBig, b::NBig)
+    iszero(b) && return (abs(a), NBig(sign(a)), NBig(0, EMPTY_LIMBS))
+    iszero(a) && return (abs(b), NBig(0, EMPTY_LIMBS), NBig(sign(b)))
+    g, t = gcdext_nbig(a, b)
+    s = div(g - t * abs(b), abs(a))
+    return (g, signbit(a) ? -s : s, signbit(b) ? -t : t)
+end
+
+# Extended Lehmer gcd tracking only the m-cofactor; |t| < |m|, so one
+# conditional add/sub yields Base's sign convention (result follows m).
 function Base.invmod(a::NBig, m::NBig)
     iszero(m) && throw(DomainError(m, "`m` must be nonzero."))
     ma = abs(m)
     nlimbs(ma) == 1 && (@inbounds ma.limbs[1]) == 1 && return NBig(0, EMPTY_LIMBS)
-    r0, r1 = ma, mod(a, ma)
-    t0, t1 = NBig(0, EMPTY_LIMBS), one(NBig)
-    while !iszero(r1)
-        q, r = divrem(r0, r1)
-        r0, r1 = r1, r
-        t0, t1 = t1, t0 - q * t1
-    end
-    r0 == 1 || throw(DomainError((a, m), "Greatest common divisor is $(r0)."))
-    x = signbit(t0) ? t0 + ma : t0
+    r = mod(a, ma)
+    iszero(r) && throw(DomainError((a, m), "Greatest common divisor is $(ma)."))
+    g, t = gcdext_nbig(ma, r)
+    g == 1 || throw(DomainError((a, m), "Greatest common divisor is $(g)."))
+    x = signbit(t) ? t + ma : t
     return signbit(m) && !iszero(x) ? x - ma : x
 end
 
