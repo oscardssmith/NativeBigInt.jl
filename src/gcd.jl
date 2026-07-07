@@ -109,36 +109,6 @@ end
     return A, B, C, D, even, steps
 end
 
-# One batch of exact extended Euclid on 128-bit values: quotient steps
-# accumulate the nonnegative cofactor matrix (Knuth's alternating-sign
-# formulation, lehmer63's convention) until an entry would pass 2^62 or y
-# hits zero. Values are exact so no bracket verification is needed; q <= 2
-# (~80%, Gauss–Kuzmin) comes from a subtract chain. Requires x >= y.
-@inline function euclid128(x::UInt128, y::UInt128)
-    A, B, C, D = UInt64(1), UInt64(0), UInt64(0), UInt64(1)
-    even = true
-    steps = 0
-    while y != 0
-        r1 = x - y
-        if r1 < y
-            q, r = UInt128(1), r1
-        elseif r1 - y < y
-            q, r = UInt128(2), r1 - y
-        else
-            q, r = divrem(x, y)
-        end
-        (q >> 62) != 0 && break
-        nC = widemul(q % UInt64, C) + A
-        nD = widemul(q % UInt64, D) + B
-        (nC >= UInt128(2)^62 || nD >= UInt128(2)^62) && break
-        x, y = y, r
-        A, B, C, D = C, D, nC % UInt64, nD % UInt64
-        even = !even
-        steps += 1
-    end
-    return x, y, A, B, C, D, even, steps
-end
-
 # The V-cofactor pair (t_u, t_v) carried alongside gcd_core!'s (u, v).
 # Cofactor signs alternate (Knuth's formulation), so only magnitudes are
 # stored: sign(t_u) = (tpos ? + : -) and sign(t_v) is the opposite.
@@ -220,8 +190,8 @@ end
 # t === nothing is plain gcd, finishing with UInt128 binary gcd once v fits
 # two limbs. A Cofactors t carries the V-cofactor pair through every swap,
 # window apply, and division step (the branches on t are compile-time), and
-# the tail instead runs exact 128-bit Euclid in capped matrix batches
-# (euclid128), which the binary tail could not track.
+# the tail instead keeps running lehmer63 batches on the in-register values
+# (which the binary tail could not track).
 function gcd_core!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
                    t::Union{Cofactors, Nothing})
     cap = max(lu, lv) + 1
@@ -251,9 +221,15 @@ function gcd_core!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
             x = extract_window(u, lu, 0)
             y = extract_window(v, lv, 0)
             while y != 0
-                x, y, A, B, C, D, even, steps = euclid128(x, y)
-                steps > 0 && apply!(t, A, B, C, D, even)
-                if y != 0   # oversized quotient stalled the batch: one exact step
+                # lehmer63 on the values' 63-bit tops (slack 0: plain
+                # truncation), wrap-exact matrix apply to the values.
+                sh = max(65 - leading_zeros(x), 0)   # 63-bit tops
+                A, B, C, D, even, steps = lehmer63(UInt64(x >> sh), UInt64(y >> sh), UInt64(0))
+                if steps > 0
+                    x, y = even ? (A * x - B * y, D * y - C * x) :
+                                  (B * y - A * x, C * x - D * y)
+                    apply!(t, A, B, C, D, even)
+                else   # window stalled: one exact division step
                     q, r = divrem(x, y)
                     @inbounds w2[1] = q % Limb
                     @inbounds w2[2] = (q >> 64) % Limb
