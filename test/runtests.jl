@@ -5,4 +5,5 @@ using NativeBigInt, Test, Random
     include("test_algorithms.jl")
     include("test_nbig.jl")
     include("test_differential.jl")
+    include("test_mixed.jl")
 end

@@ -403,6 +403,157 @@ Base.one(::Type{NBig}) = NBig(1)
 
 Base.promote_rule(::Type{NBig}, ::Type{<:Integer}) = NBig
 
+# --- NBig ↔ BitInteger64 fast paths -----------------------------------------
+# A BitInteger64 operand is a single limb of magnitude, so these route through
+# the _1! kernels instead of promoting (which allocates a temp NBig and runs
+# the full n-limb paths). 128-bit ints keep the promotion path.
+
+const BitInt64 = Base.BitInteger64
+
+# (sign, magnitude-as-Limb); flipsign on typemin(Int64) wraps to typemin,
+# whose unsigned reinterpretation 0x80… is the correct magnitude.
+@inline limb_split(b::Base.BitSigned64) = (Int(sign(b)), unsigned(flipsign(Int64(b), b)) % Limb)
+@inline limb_split(b::Base.BitUnsigned64) = (Int(!iszero(b)), Limb(b))
+
+@inline function nbig_from_limb(sgn::Int, mag::Limb)
+    (sgn == 0 || mag == 0) && return NBig(0, EMPTY_LIMBS)
+    m = Memory{Limb}(undef, 1)
+    @inbounds m[1] = mag
+    return NBig(sgn, m)
+end
+
+function add_small(a::NBig, s::Int, mag::Limb)
+    s == 0 && return a
+    iszero(a) && return nbig_from_limb(s, mag)
+    la = nlimbs(a)
+    if sign(a) == s
+        r = Memory{Limb}(undef, la + 1)
+        copyto!(r, 1, a.limbs, 1, la)
+        @inbounds r[la+1] = 0
+        add_carry!(r, 0, la + 1, 1, mag)
+        return nbig_from_limbs(s, r, la + 1)
+    elseif la == 1
+        al = @inbounds a.limbs[1]
+        return al >= mag ? nbig_from_limb(sign(a), al - mag) : nbig_from_limb(s, mag - al)
+    else
+        r = Memory{Limb}(undef, la)
+        sub_1!(r, 0, a.limbs, 0, la, mag)
+        return nbig_from_limbs(sign(a), r, la)
+    end
+end
+
+Base.:+(a::NBig, b::BitInt64) = ((s, mag) = limb_split(b); add_small(a, s, mag))
+Base.:+(b::BitInt64, a::NBig) = a + b
+Base.:-(a::NBig, b::BitInt64) = ((s, mag) = limb_split(b); add_small(a, -s, mag))
+Base.:-(b::BitInt64, a::NBig) = ((s, mag) = limb_split(b); add_small(-a, s, mag))
+
+function Base.:*(a::NBig, b::BitInt64)
+    s, mag = limb_split(b)
+    (iszero(a) || s == 0) && return NBig(0, EMPTY_LIMBS)
+    la = nlimbs(a)
+    r = Memory{Limb}(undef, la + 1)
+    @inbounds r[la+1] = mul_1!(r, 0, a.limbs, 0, la, mag)
+    return nbig_from_limbs(sign(a) * s, r, la + 1)
+end
+Base.:*(b::BitInt64, a::NBig) = a * b
+
+function Base.cmp(a::NBig, b::BitInt64)
+    s, mag = limb_split(b)
+    sa = sign(a)
+    sa != s && return sa < s ? -1 : 1
+    sa == 0 && return 0
+    al = @inbounds a.limbs[1]
+    c = nlimbs(a) > 1 ? 1 : (al == mag ? 0 : (al < mag ? -1 : 1))
+    return sa < 0 ? -c : c
+end
+Base.cmp(b::BitInt64, a::NBig) = -cmp(a, b)
+Base.:(==)(a::NBig, b::BitInt64) = cmp(a, b) == 0
+Base.:(==)(b::BitInt64, a::NBig) = cmp(a, b) == 0
+Base.:<(a::NBig, b::BitInt64) = cmp(a, b) < 0
+Base.:<(b::BitInt64, a::NBig) = cmp(a, b) > 0
+Base.:<=(a::NBig, b::BitInt64) = cmp(a, b) <= 0
+Base.:<=(b::BitInt64, a::NBig) = cmp(a, b) >= 0
+Base.isless(a::NBig, b::BitInt64) = cmp(a, b) < 0
+Base.isless(b::BitInt64, a::NBig) = cmp(a, b) > 0
+
+# Small divisor: one divrem_1! pass on the magnitude, then sign fixups.
+function Base.divrem(a::NBig, b::BitInt64)
+    s, mag = limb_split(b)
+    s == 0 && throw(DivideError())
+    iszero(a) && return (NBig(0, EMPTY_LIMBS), NBig(0, EMPTY_LIMBS))
+    la = nlimbs(a)
+    q = Memory{Limb}(undef, la)
+    r = divrem_1!(q, 0, a.limbs, 0, la, mag)
+    return (nbig_from_limbs(sign(a) * s, q, la), nbig_from_limb(sign(a), r))
+end
+
+# Small dividend: |b| is one limb, so the quotient is 0 unless a is too.
+function Base.divrem(b::BitInt64, a::NBig)
+    iszero(a) && throw(DivideError())
+    s, mag = limb_split(b)
+    s == 0 && return (NBig(0, EMPTY_LIMBS), NBig(0, EMPTY_LIMBS))
+    al = @inbounds a.limbs[1]
+    (nlimbs(a) > 1 || al > mag) && return (NBig(0, EMPTY_LIMBS), nbig_from_limb(s, mag))
+    qm, rm = divrem(mag, al)
+    return (nbig_from_limb(s * sign(a), qm), nbig_from_limb(s, rm))
+end
+
+for (A, B) in ((:NBig, :BitInt64), (:BitInt64, :NBig))
+    @eval begin
+        Base.div(a::$A, b::$B) = divrem(a, b)[1]
+        Base.rem(a::$A, b::$B) = divrem(a, b)[2]
+        function Base.mod(a::$A, b::$B)
+            r = rem(a, b)
+            return (iszero(r) || sign(r) == sign(b)) ? r : r + b
+        end
+        function Base.fld(a::$A, b::$B)
+            q, r = divrem(a, b)
+            return (!iszero(r) && sign(r) != sign(b)) ? q - 1 : q
+        end
+        function Base.cld(a::$A, b::$B)
+            q, r = divrem(a, b)
+            return (!iszero(r) && sign(r) == sign(b)) ? q + 1 : q
+        end
+    end
+end
+
+function Base.gcd(a::NBig, b::BitInt64)
+    s, mag = limb_split(b)
+    s == 0 && return abs(a)
+    iszero(a) && return nbig_from_limb(1, mag)
+    la = nlimbs(a)
+    q = Memory{Limb}(undef, la)
+    r = divrem_1!(q, 0, a.limbs, 0, la, mag)
+    return nbig_from_limb(1, gcd(r, mag))
+end
+Base.gcd(b::BitInt64, a::NBig) = gcd(a, b)
+
+# Reduce the base to a native int (mod(a, m) follows m's sign, so it is
+# exactly representable in typeof(m)), then square-and-multiply in native
+# arithmetic: every product of residues fits the widemul type. Native
+# exponents delegate to Base.powermod; NBig exponents walk limbs directly
+# (Base's prevpow(2, p) can't take an NBig).
+function Base.powermod(a::NBig, n::Integer, m::T) where {T<:BitInt64}
+    iszero(m) && throw(DivideError())
+    r = mod(a, m)
+    rl = iszero(r) ? zero(Limb) : @inbounds r.limbs[1]
+    b = T <: Unsigned ? rl % T : flipsign(rl % Int64, r.signlen) % T
+    n isa NBig || return powermod(b, n, m)
+    signbit(n) && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
+    res = mod(one(T), m)  # covers n == 0 and m == ±1
+    ln = nlimbs(n)
+    @inbounds for i in ln:-1:1
+        limb = n.limbs[i]
+        for j in (i == ln ? 63 - leading_zeros(limb) : 63):-1:0
+            res = mod(widemul(res, res), m) % T
+            if (limb >> j) & 1 == 1
+                res = mod(widemul(res, b), m) % T
+            end
+        end
+    end
+    return res
+end
+
 function to_uint(::Type{T}, x::NBig) where {T<:Unsigned}
     signbit(x) && throw(InexactError(nameof(T), T, x))
     n = nlimbs(x)
