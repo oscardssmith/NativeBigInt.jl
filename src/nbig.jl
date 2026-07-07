@@ -161,7 +161,7 @@ end
 # is any Integer: powermod_limbs reads it via expbit/expbits, no conversion.
 function Base.powermod(a::NBig, n::Integer, m::NBig)
     iszero(m) && throw(DivideError())
-    signbit(n) && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
+    signbit(n) && return powermod(invmod(a, m), -n, m)
     mm = abs(m)
     k = nlimbs(mm)
     k == 1 && (@inbounds mm.limbs[1]) == 1 && return NBig(0, EMPTY_LIMBS)
@@ -188,6 +188,43 @@ function Base.gcd(a::NBig, b::NBig)
     copyto!(v, 1, b.limbs, 1, lb)
     mem, n = gcd!(u, la, v, lb)
     return nbig_from_limbs(1, mem, n)
+end
+
+# Extended Euclid on NBig values, leaning on the fast Knuth-D divrem.
+# Mirrors Base's generic gcdx loop (truncated divrem keeps the invariants
+# s0*a + t0*b == x valid for any sign combination).
+function Base.gcdx(a::NBig, b::NBig)
+    # Base convention: gcdx(0, 0) == (0, 0, 0), not the loop's (0, 1, 0).
+    iszero(a) && iszero(b) && return (a, a, a)
+    s0, s1 = one(NBig), NBig(0, EMPTY_LIMBS)
+    t0, t1 = NBig(0, EMPTY_LIMBS), one(NBig)
+    x, y = a, b
+    while !iszero(y)
+        q, r = divrem(x, y)
+        x, y = y, r
+        s0, s1 = s1, s0 - q * s1
+        t0, t1 = t1, t0 - q * t1
+    end
+    return signbit(x) ? (-x, -s0, -t0) : (x, s0, t0)
+end
+
+# Extended Euclid tracking only the m-cofactor; the final t0 lies in
+# (-|m|, |m|), so one conditional add/sub yields Base's sign convention
+# (result follows the sign of m).
+function Base.invmod(a::NBig, m::NBig)
+    iszero(m) && throw(DomainError(m, "`m` must be nonzero."))
+    ma = abs(m)
+    nlimbs(ma) == 1 && (@inbounds ma.limbs[1]) == 1 && return NBig(0, EMPTY_LIMBS)
+    r0, r1 = ma, mod(a, ma)
+    t0, t1 = NBig(0, EMPTY_LIMBS), one(NBig)
+    while !iszero(r1)
+        q, r = divrem(r0, r1)
+        r0, r1 = r1, r
+        t0, t1 = t1, t0 - q * t1
+    end
+    r0 == 1 || throw(DomainError((a, m), "Greatest common divisor is $(r0)."))
+    x = signbit(t0) ? t0 + ma : t0
+    return signbit(m) && !iszero(x) ? x - ma : x
 end
 
 # isqrt: normalize by an even bit shift so sqrtrem!'s precondition
@@ -528,6 +565,17 @@ function Base.gcd(a::NBig, b::BitInt64)
 end
 Base.gcd(b::BitInt64, a::NBig) = gcd(a, b)
 
+# mod(a, m) follows m's sign, so the residue is exactly representable in
+# typeof(m); the whole inverse then runs in native arithmetic.
+function Base.invmod(a::NBig, m::T) where {T<:BitInt64}
+    iszero(m) && throw(DomainError(m, "`m` must be nonzero."))
+    r = mod(a, m)
+    rl = iszero(r) ? zero(Limb) : @inbounds r.limbs[1]
+    b = T <: Unsigned ? rl % T : flipsign(rl % Int64, r.signlen) % T
+    return invmod(b, m)
+end
+Base.invmod(b::BitInt64, m::NBig) = invmod(NBig(b), m)
+
 # NBig overloads of the powermod exponent-bit accessors (algorithms.jl).
 @inline expbit(n::NBig, j::Int) = ((@inbounds n.limbs[(j >>> 6) + 1]) >> (j & 63)) % Bool
 @inline expbits(n::NBig) = 64 * nlimbs(n) - leading_zeros(@inbounds n.limbs[nlimbs(n)])
@@ -541,9 +589,10 @@ function Base.powermod(a::NBig, n::Integer, m::T) where {T<:BitInt64}
     rl = iszero(r) ? zero(Limb) : @inbounds r.limbs[1]
     b = T <: Unsigned ? rl % T : flipsign(rl % Int64, r.signlen) % T
     if signbit(n)
-        # Base's invmod path handles negative native exponents
-        n isa NBig && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
-        return powermod(b, n, m)
+        # Base handles negative native exponents; NBig exponents invert here
+        # and re-enter this method with -n (no overflow risk for NBig).
+        n isa NBig || return powermod(b, n, m)
+        return powermod(NBig(invmod(b, m)), -n, m)
     end
     res = mod(one(T), m)  # covers n == 0 and m == ±1
     iszero(n) && return res

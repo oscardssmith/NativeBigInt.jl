@@ -53,12 +53,22 @@ end
         @test BigInt(gcd(NBig(a), NBig(a))) == abs(a)
         @test BigInt(gcd(NBig(a * b), NBig(b))) == gcd(a * b, b)
     end
+
+    @test which(gcdx, Tuple{NBig, NBig}).module === NativeBigInt
+    @test (big(gcdx(NBig(0), NBig(0))[1]), ) == (gcdx(big(0), big(0))[1], )
+    for trial in 1:200
+        a = diff_randbig(rng, rand(rng, 0:8))
+        b = diff_randbig(rng, rand(rng, 0:8))
+        g, x, y = gcdx(NBig(a), NBig(b))
+        @test (big(g), big(x), big(y)) == gcdx(a, b)
+    end
 end
 
 @testset "differential powermod" begin
     rng = MersenneTwister(0x90d)
     @test_throws DivideError powermod(NBig(2), NBig(5), NBig(0))
-    @test_throws DomainError powermod(NBig(2), NBig(-1), NBig(7))
+    @test BigInt(powermod(NBig(2), NBig(-1), NBig(7))) == 4
+    @test_throws DomainError powermod(NBig(2), NBig(-1), NBig(8))  # not coprime
     @test BigInt(powermod(NBig(0), NBig(0), NBig(7))) == 1
     for trial in 1:150
         lm = rand(rng, 1:8)

@@ -110,3 +110,66 @@ end
     end
     @test_throws DivideError powermod(NBig(2), NBig(5), 0)
 end
+
+@testset "invmod" begin
+    for at in ((NBig, NBig), (NBig, Int64), (Int64, NBig), (NBig, UInt8))
+        @test which(invmod, Tuple{at...}).module === NativeBigInt
+    end
+
+    rng = MersenneTwister(0xacc5)
+    for trial in 1:200
+        a = diff_randbig(rng, rand(rng, 0:8))
+        m = diff_randbig(rng, rand(rng, 1:8))
+        iszero(m) && (m = big(7))
+        na, nm = NBig(a), NBig(m)
+        if gcd(a, m) == 1
+            r = invmod(na, nm)
+            @test r isa NBig
+            @test big(r) == invmod(a, m)
+        else
+            @test_throws DomainError invmod(na, nm)
+        end
+    end
+    # mixed invmod: native modulus returns typeof(m); NBig modulus returns NBig
+    for T in (Int8, Int64, UInt8, UInt64), trial in 1:60
+        m = rand(rng, T)
+        (iszero(m) || m == typemin(T)) && (m = T(5))
+        a = diff_randbig(rng, rand(rng, 0:5))
+        if gcd(a, big(m)) == 1
+            r = invmod(NBig(a), m)
+            @test r isa T
+            @test big(r) == invmod(a, big(m))
+        else
+            @test_throws DomainError invmod(NBig(a), m)
+        end
+        b = rand(rng, T)
+        mm = diff_randbig(rng, rand(rng, 1:4))
+        iszero(mm) && (mm = big(9))
+        if gcd(big(b), mm) == 1
+            @test big(invmod(b, NBig(mm))) == invmod(big(b), mm)
+        else
+            @test_throws DomainError invmod(b, NBig(mm))
+        end
+    end
+    # edge cases (Base semantics: result sign follows m; |m| == 1 -> 0)
+    @test_throws DomainError invmod(NBig(3), NBig(0))
+    @test_throws DomainError invmod(NBig(0), NBig(5))
+    @test invmod(NBig(3), NBig(1)) == 0
+    @test invmod(NBig(3), NBig(-1)) == 0
+    @test big(invmod(NBig(3), NBig(-5))) == invmod(big(3), big(-5))
+
+    # negative exponents in powermod now route through invmod
+    for trial in 1:60
+        m = diff_randbig(rng, rand(rng, 1:4))
+        (iszero(m) || abs(m) == 1) && (m = big(10)^9 + 7)
+        a = diff_randbig(rng, rand(rng, 0:5))
+        gcd(a, m) == 1 || continue
+        n = abs(diff_randbig(rng, rand(rng, 1:2)))
+        iszero(n) && (n = big(3))
+        @test big(powermod(NBig(a), NBig(-n), NBig(m))) == powermod(a, -n, m)
+        nm64 = rand(rng, Int64) | 1  # odd, nonzero
+        if gcd(a, big(nm64)) == 1
+            @test big(powermod(NBig(a), NBig(-n), nm64)) == powermod(a, -n, big(nm64))
+        end
+    end
+end
