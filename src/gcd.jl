@@ -4,8 +4,7 @@
 # kernels and on algorithms.jl's mul!/divrem!.
 
 # ⌊X / 2^pos⌋ for the n-limb magnitude x, truncated to 128 bits (callers
-# guarantee the true value fits). Limbs above n read as zero. Also used by
-# isqrt (nbig.jl) with pos = 0.
+# guarantee the true value fits). Limbs above n read as zero.
 @inline function extract_window(x::Memory{Limb}, n::Int, pos::Int)
     i = pos >> 6
     r = pos & 63

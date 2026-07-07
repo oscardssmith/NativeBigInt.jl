@@ -236,7 +236,9 @@ function Base.isqrt(x::NBig)
     iszero(x) && return x
     n = nlimbs(x)
     if n <= 2
-        return NBig(isqrt(extract_window(x.limbs, n, 0)) % Limb)
+        hi = n == 2 ? (@inbounds x.limbs[2]) : zero(Limb)
+        v = (UInt128(hi) << 64) | (@inbounds x.limbs[1])
+        return NBig(isqrt(v) % Limb)
     end
     bits = 64n - leading_zeros(@inbounds x.limbs[n])
     e = (64n - bits) & ~1
