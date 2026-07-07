@@ -528,27 +528,31 @@ function Base.gcd(a::NBig, b::BitInt64)
 end
 Base.gcd(b::BitInt64, a::NBig) = gcd(a, b)
 
+# O(1) bit access for the powermod exponent loop.
+@inline expbit(n::Integer, j::Int) = (n >>> j) % Bool
+@inline expbit(n::NBig, j::Int) = ((@inbounds n.limbs[(j >>> 6) + 1]) >> (j & 63)) % Bool
+@inline expbits(n::Integer) = Base.top_set_bit(n)
+@inline expbits(n::NBig) = 64 * nlimbs(n) - leading_zeros(@inbounds n.limbs[nlimbs(n)])
+
 # Reduce the base to a native int (mod(a, m) follows m's sign, so it is
 # exactly representable in typeof(m)), then square-and-multiply in native
-# arithmetic: every product of residues fits the widemul type. Native
-# exponents delegate to Base.powermod; NBig exponents walk limbs directly
-# (Base's prevpow(2, p) can't take an NBig).
+# arithmetic: every product of residues fits the widemul type.
 function Base.powermod(a::NBig, n::Integer, m::T) where {T<:BitInt64}
     iszero(m) && throw(DivideError())
     r = mod(a, m)
     rl = iszero(r) ? zero(Limb) : @inbounds r.limbs[1]
     b = T <: Unsigned ? rl % T : flipsign(rl % Int64, r.signlen) % T
-    n isa NBig || return powermod(b, n, m)
-    signbit(n) && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
+    if signbit(n)
+        # Base's invmod path handles negative native exponents
+        n isa NBig && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
+        return powermod(b, n, m)
+    end
     res = mod(one(T), m)  # covers n == 0 and m == ±1
-    ln = nlimbs(n)
-    @inbounds for i in ln:-1:1
-        limb = n.limbs[i]
-        for j in (i == ln ? 63 - leading_zeros(limb) : 63):-1:0
-            res = mod(widemul(res, res), m) % T
-            if (limb >> j) & 1 == 1
-                res = mod(widemul(res, b), m) % T
-            end
+    iszero(n) && return res
+    for j in (expbits(n)-1):-1:0
+        res = mod(widemul(res, res), m) % T
+        if expbit(n, j)
+            res = mod(widemul(res, b), m) % T
         end
     end
     return res

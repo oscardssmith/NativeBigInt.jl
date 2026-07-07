@@ -101,6 +101,11 @@ end
             @test r isa typeof(powermod(0, 0, m))
             @test big(r) == powermod(a, n, big(m))
             @test big(powermod(NBig(a), NBig(e), m)) == powermod(a, big(e), big(m))
+            @test big(powermod(NBig(a), e, m)) == powermod(a, big(e), big(m))
+            @test big(powermod(NBig(a), UInt16(e), m)) == powermod(a, big(e), big(m))
+            if gcd(a, big(m)) == 1
+                @test big(powermod(NBig(a), -e, m)) == powermod(a, -big(e), big(m))
+            end
         end
     end
     @test_throws DivideError powermod(NBig(2), NBig(5), 0)
