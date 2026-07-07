@@ -390,18 +390,20 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
     end
 end
 
-@inline expbit(e::Memory{Limb}, i::Int) = ((@inbounds e[(i>>6)+1]) >> (i & 63)) & 1
+# O(1) exponent bit access; NBig overloads live in nbig.jl.
+@inline expbit(e::Integer, i::Int) = (e >>> i) % Bool
+@inline expbits(e::Integer) = Base.top_set_bit(e)
 
 # b^e mod m on magnitudes: m has k limbs (m[k] ≠ 0, m > 1), 0 < b < m
-# (lb limbs), e > 0 (le limbs, e[le] ≠ 0). Returns a k-limb Memory
-# (unnormalized). Sliding-window exponentiation; for odd m the values live in
-# Montgomery form with redc! after each mul/sqr, for even m each product is
-# reduced with divrem! instead.
-function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
+# (lb limbs), e > 0 any Integer supporting expbit/expbits. Returns a k-limb
+# Memory (unnormalized). Sliding-window exponentiation; for odd m the values
+# live in Montgomery form with redc! after each mul/sqr, for even m each
+# product is reduced with divrem! instead.
+function powermod_limbs(b::Memory{Limb}, lb::Int, e::Integer,
                         m::Memory{Limb}, k::Int)
     odd = isodd(@inbounds m[1])
     ninv = odd ? mont_ninv(@inbounds m[1]) : zero(Limb)
-    nbits = 64le - leading_zeros(@inbounds e[le])
+    nbits = expbits(e)
     w = nbits <= 8 ? 1 : nbits <= 24 ? 2 : nbits <= 80 ? 3 : nbits <= 240 ? 4 : 5
     tsize = 1 << (w - 1)   # table of odd powers b^1, b^3, …, b^(2^w - 1)
     acc = Memory{Limb}(undef, k)
@@ -451,12 +453,12 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Memory{Limb}, le::Int,
     first = true
     i = nbits - 1
     while i >= 0
-        if expbit(e, i) == 0
+        if !expbit(e, i)
             first || mulred!(acc, 0, acc, 0, acc, 0)
             i -= 1
         else
             l = min(w, i + 1)
-            while expbit(e, i - l + 1) == 0   # window must end on a set bit
+            while !expbit(e, i - l + 1)   # window must end on a set bit
                 l -= 1
             end
             val = 0

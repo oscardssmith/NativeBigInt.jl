@@ -157,8 +157,9 @@ function Base.cld(a::NBig, b::NBig)
     return (!iszero(r) && sign(r) == sign(b)) ? q + one(NBig) : q
 end
 
-# Base semantics: result = mod(a^n, m), so the sign follows m.
-function Base.powermod(a::NBig, n::NBig, m::NBig)
+# Base semantics: result = mod(a^n, m), so the sign follows m. The exponent
+# is any Integer: powermod_limbs reads it via expbit/expbits, no conversion.
+function Base.powermod(a::NBig, n::Integer, m::NBig)
     iszero(m) && throw(DivideError())
     signbit(n) && throw(DomainError(n, "powermod: negative exponent (invmod not implemented)"))
     mm = abs(m)
@@ -170,12 +171,11 @@ function Base.powermod(a::NBig, n::NBig, m::NBig)
     elseif iszero(b)
         NBig(0, EMPTY_LIMBS)
     else
-        r = powermod_limbs(b.limbs, nlimbs(b), n.limbs, nlimbs(n), mm.limbs, k)
+        r = powermod_limbs(b.limbs, nlimbs(b), n, mm.limbs, k)
         nbig_from_limbs(1, r, k)
     end
     return signbit(m) && !iszero(r0) ? r0 + m : r0
 end
-Base.powermod(a::NBig, n::Integer, m::NBig) = powermod(a, NBig(n), m)
 
 function Base.gcd(a::NBig, b::NBig)
     iszero(a) && return abs(b)
@@ -528,10 +528,8 @@ function Base.gcd(a::NBig, b::BitInt64)
 end
 Base.gcd(b::BitInt64, a::NBig) = gcd(a, b)
 
-# O(1) bit access for the powermod exponent loop.
-@inline expbit(n::Integer, j::Int) = (n >>> j) % Bool
+# NBig overloads of the powermod exponent-bit accessors (algorithms.jl).
 @inline expbit(n::NBig, j::Int) = ((@inbounds n.limbs[(j >>> 6) + 1]) >> (j & 63)) % Bool
-@inline expbits(n::Integer) = Base.top_set_bit(n)
 @inline expbits(n::NBig) = 64 * nlimbs(n) - leading_zeros(@inbounds n.limbs[nlimbs(n)])
 
 # Reduce the base to a native int (mod(a, m) follows m's sign, so it is
