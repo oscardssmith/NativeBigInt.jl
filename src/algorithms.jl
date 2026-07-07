@@ -216,22 +216,6 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     return rhi
 end
 
-# ⌊X / 2^pos⌋ for the n-limb magnitude x, truncated to 128 bits (callers
-# guarantee the true value fits). Limbs above n read as zero.
-@inline function extract_window(x::Memory{Limb}, n::Int, pos::Int)
-    i = pos >> 6
-    r = pos & 63
-    w1 = i + 1 <= n ? (@inbounds x[i+1]) : zero(Limb)
-    w2 = i + 2 <= n ? (@inbounds x[i+2]) : zero(Limb)
-    w3 = i + 3 <= n ? (@inbounds x[i+3]) : zero(Limb)
-    if r == 0
-        return (UInt128(w2) << 64) | w1
-    end
-    lo = (w1 >> r) | (w2 << (64 - r))
-    hi = (w2 >> r) | (w3 << (64 - r))
-    return (UInt128(hi) << 64) | lo
-end
-
 # O(1) exponent bit access; NBig overloads live in nbig.jl.
 @inline expbit(e::Integer, i::Int) = (e >>> i) % Bool
 @inline expbits(e::Integer) = Base.top_set_bit(e)

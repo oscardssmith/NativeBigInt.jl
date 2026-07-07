@@ -1,7 +1,24 @@
 # Lehmer gcd and extended gcd (Knuth TAOCP §4.5.2, Algorithm L) on magnitude
 # buffers: one shared window/apply/division loop (gcd_core!), with extended
 # runs carrying the V-cofactor pair (Cofactors) in lockstep. Built on the
-# kernels and on algorithms.jl's mul!/divrem!/extract_window.
+# kernels and on algorithms.jl's mul!/divrem!.
+
+# ⌊X / 2^pos⌋ for the n-limb magnitude x, truncated to 128 bits (callers
+# guarantee the true value fits). Limbs above n read as zero. Also used by
+# isqrt (nbig.jl) with pos = 0.
+@inline function extract_window(x::Memory{Limb}, n::Int, pos::Int)
+    i = pos >> 6
+    r = pos & 63
+    w1 = i + 1 <= n ? (@inbounds x[i+1]) : zero(Limb)
+    w2 = i + 2 <= n ? (@inbounds x[i+2]) : zero(Limb)
+    w3 = i + 3 <= n ? (@inbounds x[i+3]) : zero(Limb)
+    if r == 0
+        return (UInt128(w2) << 64) | w1
+    end
+    lo = (w1 >> r) | (w2 << (64 - r))
+    hi = (w2 >> r) | (w3 << (64 - r))
+    return (UInt128(hi) << 64) | lo
+end
 
 @inline sterm(c::Int64, x::Limb) =
     c >= 0 ? Int128(widemul(Limb(c), x)) : -Int128(widemul(Limb(-c), x))
