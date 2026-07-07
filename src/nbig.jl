@@ -609,38 +609,34 @@ function Base.powermod(a::NBig, n::Integer, m::T) where {T<:BitInt64}
     return res
 end
 
-function to_uint(::Type{T}, x::NBig) where {T<:Unsigned}
-    signbit(x) && throw(InexactError(nameof(T), T, x))
-    n = nlimbs(x)
-    n == 0 && return zero(T)
-    bits = sizeof(T) * 8
-    if n * 64 > bits
-        for i in (bits ÷ 64 + 1):n
-            x.limbs[i] != 0 && throw(InexactError(nameof(T), T, x))
-        end
+# Two's-complement truncation to any native width (BigInt-compatible x % T).
+function Base.rem(x::NBig, ::Type{T}) where {T<:Union{Base.BitUnsigned, Base.BitSigned}}
+    u = zero(T)
+    for l in 1:min(nlimbs(x), cld(sizeof(T), 8))
+        u += (@inbounds x.limbs[l] % T) << (64 * (l - 1))
     end
-    r = zero(T)
-    for i in min(n, cld(bits, 64)):-1:1
-        r = (r << 64) | (T(x.limbs[i]))
-    end
-    return r
+    return flipsign(u, x.signlen)
 end
 
-# Signed conversion: read the magnitude as unsigned U (the same-width unsigned
-# of S), then apply the sign, allowing exactly typemin(S) = -(typemax + 1).
-function to_sint(::Type{S}, x::NBig) where {S<:Signed}
-    U = unsigned(S)
-    v = to_uint(U, abs(x))
-    if signbit(x)
-        v > unsigned(typemax(S)) + one(U) && throw(InexactError(nameof(S), S, x))
-        v == unsigned(typemax(S)) + one(U) && return typemin(S)
-        return -(v % S)
+# Checked constructors, mirroring Base's BigInt versions: sub-limb types
+# go through the checked Limb-width conversion, wider ones bound the limb
+# count so x % T is exact (with a sign-consistency check for signed T).
+function (::Type{T})(x::NBig) where {T<:Base.BitUnsigned}
+    if sizeof(T) < sizeof(Limb)
+        return convert(T, convert(Limb, x))
     else
-        v > unsigned(typemax(S)) && throw(InexactError(nameof(S), S, x))
-        return v % S
+        0 <= x.signlen <= cld(sizeof(T), sizeof(Limb)) || throw(InexactError(nameof(T), T, x))
+        return x % T
     end
 end
 
-Base.UInt64(x::NBig) = to_uint(UInt64, x)
-Base.Int64(x::NBig) = to_sint(Int64, x)
-Base.Int128(x::NBig) = to_sint(Int128, x)
+function (::Type{T})(x::NBig) where {T<:Base.BitSigned}
+    if sizeof(T) < sizeof(Limb)
+        return convert(T, convert(Int64, x))
+    else
+        nlimbs(x) <= cld(sizeof(T), sizeof(Limb)) || throw(InexactError(nameof(T), T, x))
+        y = x % T
+        (x.signlen > 0) ⊻ (y > 0) && throw(InexactError(nameof(T), T, x))  # catch overflow
+        return y
+    end
+end

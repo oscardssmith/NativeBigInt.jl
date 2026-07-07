@@ -111,6 +111,35 @@ end
     @test_throws DivideError powermod(NBig(2), NBig(5), 0)
 end
 
+@testset "native conversions" begin
+    BITS = (Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128)
+    for T in BITS
+        @test which(rem, Tuple{NBig, Type{T}}).module === NativeBigInt
+        @test which(T, Tuple{NBig}).module === NativeBigInt
+    end
+    rng = MersenneTwister(0xc0417)
+    for trial in 1:400
+        a = trial % 3 == 0 ? big(rand(rng, -300:300)) :
+                             diff_randbig(rng, rand(rng, 0:4))
+        na = NBig(a)
+        for T in BITS
+            @test rem(na, T) === rem(a, T)
+            if typemin(T) <= a <= typemax(T)
+                @test T(na) === T(a)
+            else
+                @test_throws InexactError T(na)
+            end
+        end
+    end
+    for T in BITS
+        lo, hi = big(typemin(T)), big(typemax(T))
+        @test T(NBig(lo)) === typemin(T)
+        @test T(NBig(hi)) === typemax(T)
+        @test_throws InexactError T(NBig(hi + 1))
+        @test_throws InexactError T(NBig(lo - 1))
+    end
+end
+
 @testset "invmod" begin
     for at in ((NBig, NBig), (NBig, Int64), (Int64, NBig), (NBig, UInt8))
         @test which(invmod, Tuple{at...}).module === NativeBigInt
