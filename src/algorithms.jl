@@ -306,6 +306,37 @@ end
     return A, B, C, D, even, steps
 end
 
+# Cofactor matrix for one leading window of (U, V), ub/vb their bit lengths
+# with ub - vb < 64. Two single-word phases per 126-bit window
+# (hgcd2-flavoured): phase 1 on the exact 63-bit tops, then the phase-1
+# matrix is applied to the window (wrap-exact), fresh tops are extracted and
+# phase 2 runs with brackets widened by 2 to absorb the inherited truncation
+# error (< 2^30 window-ulps, < 1 ulp after a >= 31-bit shift). Composed
+# magnitudes stay <= 2^61. steps == 0 means the window made no progress.
+@inline function lehmer_window(u::Memory{Limb}, lu::Int, ub::Int,
+                               v::Memory{Limb}, lv::Int)
+    pos = ub - 126
+    x = extract_window(u, lu, pos)
+    y = extract_window(v, lv, pos)
+    A, B, C, D, even, steps = lehmer63(UInt64(x >> 63), UInt64(y >> 63), UInt64(0))
+    if steps > 0
+        xn, yn = even ? (A * x - B * y, D * y - C * x) :
+                        (B * y - A * x, C * x - D * y)
+        nb = 128 - leading_zeros(xn)
+        if nb >= 94 && yn != 0
+            sh = nb - 63
+            A2, B2, C2, D2, even2, steps2 =
+                lehmer63(UInt64(xn >> sh), UInt64(yn >> sh), UInt64(2))
+            if steps2 > 0   # compose: M <- M2 * M1, parities add
+                A, B, C, D = A2 * A + B2 * C, A2 * B + B2 * D,
+                             C2 * A + D2 * C, C2 * B + D2 * D
+                even = even == even2
+            end
+        end
+    end
+    return A, B, C, D, even, steps
+end
+
 # gcd of the magnitudes u[1..lu] and v[1..lv]; both buffers are destroyed and
 # must have capacity >= max(lu, lv) + 1. Returns (mem, len) with the result in
 # one of the two buffers. Lehmer's method (Knuth TAOCP §4.5.2, Algorithm L):
@@ -338,33 +369,11 @@ function gcd!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
         end
         ub = 64lu - leading_zeros(@inbounds u[lu])
         vb = 64lv - leading_zeros(@inbounds v[lv])
+        A = B = C = D = UInt64(0)
+        even = true
         steps = 0
         if ub - vb < 64
-            # Two single-word phases per 126-bit window (hgcd2-flavoured):
-            # phase 1 on the exact 63-bit tops, then the phase-1 matrix is
-            # applied to the window (wrap-exact), fresh tops are extracted and
-            # phase 2 runs with brackets widened by 2 to absorb the inherited
-            # truncation error (< 2^30 window-ulps, < 1 ulp after a >= 31-bit
-            # shift). Composed magnitudes stay <= 2^61.
-            pos = ub - 126
-            x = extract_window(u, lu, pos)
-            y = extract_window(v, lv, pos)
-            A, B, C, D, even, steps = lehmer63(UInt64(x >> 63), UInt64(y >> 63), UInt64(0))
-            if steps > 0
-                xn, yn = even ? (A * x - B * y, D * y - C * x) :
-                                (B * y - A * x, C * x - D * y)
-                nb = 128 - leading_zeros(xn)
-                if nb >= 94 && yn != 0
-                    sh = nb - 63
-                    A2, B2, C2, D2, even2, steps2 =
-                        lehmer63(UInt64(xn >> sh), UInt64(yn >> sh), UInt64(2))
-                    if steps2 > 0   # compose: M <- M2 * M1, parities add
-                        A, B, C, D = A2 * A + B2 * C, A2 * B + B2 * D,
-                                     C2 * A + D2 * C, C2 * B + D2 * D
-                        even = even == even2
-                    end
-                end
-            end
+            A, B, C, D, even, steps = lehmer_window(u, lu, ub, v, lv)
         end
         if steps == 0
             # window made no progress: one full division step, rotating the
@@ -420,143 +429,132 @@ end
     return x, y, A, B, C, D, even, steps
 end
 
-# x1[1..ret] = t_u + q * t_v on cofactor magnitudes (the alternating-sign
-# invariant makes a full division step's cofactor update additive).
-# x1 must not alias tu/tv/q and needs capacity max(lq + ltv, ltu) + 1.
-function cofactor_step!(x1::Memory{Limb}, tu::Memory{Limb}, ltu::Int,
-                        tv::Memory{Limb}, ltv::Int, q::Memory{Limb}, lq::Int)
+# The V-cofactor pair (t_u, t_v) carried alongside gcdext!'s (u, v).
+# Cofactor signs alternate (Knuth's formulation), so only magnitudes are
+# stored: sign(t_u) = (tpos ? + : -) and sign(t_v) is the opposite.
+# Even-parity matrices preserve the pattern; odd ones, division steps, and
+# swaps flip it. x1/x2 are the rotation buffers.
+mutable struct Cofactors
+    tu::Memory{Limb}
+    tv::Memory{Limb}
+    x1::Memory{Limb}
+    x2::Memory{Limb}
+    ltu::Int
+    ltv::Int
+    tpos::Bool
+end
+function Cofactors(cap::Int)
+    t = Cofactors(Memory{Limb}(undef, cap), Memory{Limb}(undef, cap),
+                  Memory{Limb}(undef, cap), Memory{Limb}(undef, cap),
+                  0, 1, false)   # (t_u, t_v) = (0, +1)
+    @inbounds t.tv[1] = one(Limb)
+    return t
+end
+
+function swap!(t::Cofactors)
+    t.tu, t.tv = t.tv, t.tu
+    t.ltu, t.ltv = t.ltv, t.ltu
+    t.tpos = !t.tpos
+    return nothing
+end
+
+# (t_u, t_v) <- (A*t_u + B*t_v, C*t_u + D*t_v): the positive-magnitude image
+# of the signed matrix applied to the numbers.
+function apply!(t::Cofactors, A::UInt64, B::UInt64, C::UInt64, D::UInt64, even::Bool)
+    n = lehmer_apply!(t.x1, 0, t.x2, 0, t.tu, t.ltu, t.tv, t.ltv,
+                      Int64(A), Int64(B), Int64(C), Int64(D))
+    t.tu, t.x1 = t.x1, t.tu
+    t.tv, t.x2 = t.x2, t.tv
+    t.ltu = normlen(t.tu, 0, n)
+    t.ltv = normlen(t.tv, 0, n)
+    even || (t.tpos = !t.tpos)
+    return nothing
+end
+
+# One full division step u = q*v + r: (t_u, t_v) <- (t_v, t_u + q*t_v).
+# The alternating-sign invariant makes the update additive in magnitudes.
+function divstep!(t::Cofactors, q::Memory{Limb}, lq::Int)
+    x1, tu, ltu, tv, ltv = t.x1, t.tu, t.ltu, t.tv, t.ltv
     if ltv == 0 || lq == 0
         copyto!(x1, 1, tu, 1, ltu)
-        return ltu
-    end
-    if lq >= ltv
-        mul!(x1, 0, q, 0, lq, tv, 0, ltv)
-    else
-        mul!(x1, 0, tv, 0, ltv, q, 0, lq)
-    end
-    lp = normlen(x1, 0, lq + ltv)
-    ltu == 0 && return lp
-    if lp >= ltu
-        c = add!(x1, 0, x1, 0, lp, tu, 0, ltu)
-    else
-        c = add!(x1, 0, tu, 0, ltu, x1, 0, lp)
         lp = ltu
+    else
+        lq >= ltv ? mul!(x1, 0, q, 0, lq, tv, 0, ltv) :
+                    mul!(x1, 0, tv, 0, ltv, q, 0, lq)
+        lp = normlen(x1, 0, lq + ltv)
+        if ltu > 0
+            if lp >= ltu
+                c = add!(x1, 0, x1, 0, lp, tu, 0, ltu)
+            else
+                c = add!(x1, 0, tu, 0, ltu, x1, 0, lp)
+                lp = ltu
+            end
+            if c != 0
+                lp += 1
+                @inbounds x1[lp] = c
+            end
+        end
     end
-    if c != 0
-        lp += 1
-        @inbounds x1[lp] = c
-    end
-    return lp
+    t.tu, t.tv, t.x1 = tv, x1, tu
+    t.ltu, t.ltv = ltv, lp
+    t.tpos = !t.tpos
+    return nothing
 end
 
 # Extended gcd of the magnitudes U = u[1..lu], V = v[1..lv]: gcd!'s loop with
 # the V-cofactor pair carried in lockstep through every window apply, division
 # step, and swap. Both buffers are destroyed (capacity >= max(lu, lv) + 1).
 # Returns (g, lg, t, lt, tpos) with g = gcd(U, V) and s*U + (tpos ? t : -t)*V
-# == g for some s; |t| <= max(U, V) / gcd. Cofactor signs alternate (Knuth),
-# so only magnitudes are stored: sign(t_u) = (tpos ? + : -), sign(t_v) the
-# opposite; even-parity matrices preserve the pattern, odd ones and
-# division/swap steps flip it. The two-limb tail runs exact 128-bit Euclid
-# batches (euclid128) instead of gcd!'s cofactor-blind binary gcd.
+# == g for some s; |t| <= max(U, V) / gcd. Once u fits two limbs the values
+# move into exact 128-bit Euclid batches (euclid128) instead of gcd!'s
+# cofactor-blind binary gcd.
 function gcdext!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
     cap = max(lu, lv) + 1
-    capt = cap + 2
     w1 = Memory{Limb}(undef, cap)
     w2 = Memory{Limb}(undef, cap)   # also serves as divrem!'s quotient buffer
-    tu = Memory{Limb}(undef, capt)
-    tv = Memory{Limb}(undef, capt)
-    x1 = Memory{Limb}(undef, capt)
-    x2 = Memory{Limb}(undef, capt)
-    ltu, ltv = 0, 1
-    @inbounds tv[1] = one(Limb)
-    tpos = false            # t_u = 0 <= 0, t_v = 1 >= 0
+    t = Cofactors(cap + 2)
     while true
+        # invariant maintenance: normalized lengths, u >= v
         if lu < lv || (lu == lv && cmp_limbs(u, 0, lu, v, 0, lv) < 0)
             u, v = v, u
             lu, lv = lv, lu
-            tu, tv = tv, tu
-            ltu, ltv = ltv, ltu
-            tpos = !tpos
+            swap!(t)
         end
-        lv == 0 && return u, lu, tu, ltu, tpos
-        if lv <= 2
-            if lu > 2
-                # one full division step brings u down to two limbs
-                divrem!(w2, 0, w1, 0, u, 0, lu, v, 0, lv)
-                lq = normlen(w2, 0, lu - lv + 1)
-                lt = cofactor_step!(x1, tu, ltu, tv, ltv, w2, lq)
-                u, v, w1 = v, w1, u
-                lu, lv = lv, normlen(v, 0, lv)
-                tu, tv, x1 = tv, x1, tu
-                ltu, ltv = ltv, lt
-                tpos = !tpos
-            end
+        lv == 0 && return u, lu, t.tu, t.ltu, t.tpos
+        if lu <= 2
             x = extract_window(u, lu, 0)
-            y = lv == 0 ? UInt128(0) : extract_window(v, lv, 0)
+            y = extract_window(v, lv, 0)
             while y != 0
                 x, y, A, B, C, D, even, steps = euclid128(x, y)
-                if steps > 0
-                    n = lehmer_apply!(x1, 0, x2, 0, tu, ltu, tv, ltv,
-                                      Int64(A), Int64(B), Int64(C), Int64(D))
-                    tu, x1 = x1, tu
-                    tv, x2 = x2, tv
-                    ltu = normlen(tu, 0, n)
-                    ltv = normlen(tv, 0, n)
-                    even || (tpos = !tpos)
-                end
+                steps > 0 && apply!(t, A, B, C, D, even)
                 if y != 0   # oversized quotient stalled the batch: one exact step
                     q, r = divrem(x, y)
                     @inbounds w2[1] = q % Limb
                     @inbounds w2[2] = (q >> 64) % Limb
-                    lq = (q >> 64) != 0 ? 2 : Int(q != 0)
-                    lt = cofactor_step!(x1, tu, ltu, tv, ltv, w2, lq)
-                    tu, tv, x1 = tv, x1, tu
-                    ltu, ltv = ltv, lt
-                    tpos = !tpos
+                    divstep!(t, w2, (q >> 64) != 0 ? 2 : 1)
                     x, y = y, r
                 end
             end
             @inbounds u[1] = x % Limb
             @inbounds u[2] = (x >> 64) % Limb
-            return u, ((x >> 64) != 0 ? 2 : 1), tu, ltu, tpos
+            return u, ((x >> 64) != 0 ? 2 : 1), t.tu, t.ltu, t.tpos
         end
         ub = 64lu - leading_zeros(@inbounds u[lu])
         vb = 64lv - leading_zeros(@inbounds v[lv])
+        A = B = C = D = UInt64(0)
+        even = true
         steps = 0
         if ub - vb < 64
-            # identical window construction to gcd! (see comments there)
-            pos = ub - 126
-            x = extract_window(u, lu, pos)
-            y = extract_window(v, lv, pos)
-            A, B, C, D, even, steps = lehmer63(UInt64(x >> 63), UInt64(y >> 63), UInt64(0))
-            if steps > 0
-                xn, yn = even ? (A * x - B * y, D * y - C * x) :
-                                (B * y - A * x, C * x - D * y)
-                nb = 128 - leading_zeros(xn)
-                if nb >= 94 && yn != 0
-                    sh = nb - 63
-                    A2, B2, C2, D2, even2, steps2 =
-                        lehmer63(UInt64(xn >> sh), UInt64(yn >> sh), UInt64(2))
-                    if steps2 > 0
-                        A, B, C, D = A2 * A + B2 * C, A2 * B + B2 * D,
-                                     C2 * A + D2 * C, C2 * B + D2 * D
-                        even = even == even2
-                    end
-                end
-            end
+            A, B, C, D, even, steps = lehmer_window(u, lu, ub, v, lv)
         end
         if steps == 0
             # window made no progress: one full division step
             divrem!(w2, 0, w1, 0, u, 0, lu, v, 0, lv)
-            lq = normlen(w2, 0, lu - lv + 1)
-            lt = cofactor_step!(x1, tu, ltu, tv, ltv, w2, lq)
+            divstep!(t, w2, normlen(w2, 0, lu - lv + 1))
             u, v, w1 = v, w1, u
             lu, lv = lv, normlen(v, 0, lv)
-            tu, tv, x1 = tv, x1, tu
-            ltu, ltv = ltv, lt
-            tpos = !tpos
         else
-            # numbers get the signed matrix, cofactor magnitudes the positive one
+            # numbers get the signed matrix, cofactors the positive magnitudes
             sA, sB, sC, sD = Int64(A), Int64(B), Int64(C), Int64(D)
             if even
                 sB, sC = -sB, -sC
@@ -564,17 +562,11 @@ function gcdext!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int)
                 sA, sD = -sA, -sD
             end
             n = lehmer_apply!(w1, 0, w2, 0, u, lu, v, lv, sA, sB, sC, sD)
-            nt = lehmer_apply!(x1, 0, x2, 0, tu, ltu, tv, ltv,
-                               Int64(A), Int64(B), Int64(C), Int64(D))
+            apply!(t, A, B, C, D, even)
             u, w1 = w1, u
             v, w2 = w2, v
-            tu, x1 = x1, tu
-            tv, x2 = x2, tv
             lu = normlen(u, 0, n)
             lv = normlen(v, 0, n)
-            ltu = normlen(tu, 0, nt)
-            ltv = normlen(tv, 0, nt)
-            even || (tpos = !tpos)
         end
     end
 end
