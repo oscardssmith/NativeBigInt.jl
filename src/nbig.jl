@@ -609,6 +609,25 @@ function Base.powermod(a::NBig, n::Integer, m::T) where {T<:BitInt64}
     return res
 end
 
+Base.widen(::Type{NBig}) = NBig
+
+function Base.top_set_bit(x::NBig)
+    n = nlimbs(x)
+    n == 0 && return 0
+    return 64 * (n - 1) + Base.top_set_bit(@inbounds x.limbs[n])
+end
+
+# Arbitrary precision never overflows (matches Base's BigInt methods).
+Base.Checked.add_with_overflow(a::NBig, b::NBig) = a + b, false
+Base.Checked.sub_with_overflow(a::NBig, b::NBig) = a - b, false
+Base.Checked.mul_with_overflow(a::NBig, b::NBig) = a * b, false
+
+# Base's generic powermod assumes fixed-width tricks (unsigned/prevpow);
+# route mixed calls with an NBig modulus to the Montgomery implementation.
+Base.powermod(a::Integer, n::Integer, m::NBig) = powermod(NBig(a), n, m)
+
+Base.rem(x::NBig, ::Type{Bool}) = isodd(x)
+
 # Two's-complement truncation to any native width (BigInt-compatible x % T).
 function Base.rem(x::NBig, ::Type{T}) where {T<:Union{Base.BitUnsigned, Base.BitSigned}}
     u = zero(T)
