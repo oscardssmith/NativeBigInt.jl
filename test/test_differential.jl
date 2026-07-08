@@ -83,6 +83,23 @@ end
         @test BigInt(powermod(NBig(a), NBig(e), NBig(m))) == powermod(a, big(e), m)
         m2 = big(2)^rand(rng, 1:200) # even / power-of-two modulus path
         @test BigInt(powermod(NBig(a), NBig(n), NBig(m2))) == powermod(a, n, m2)
+        # non-NBig base with NBig modulus routes to the Montgomery method
+        @test BigInt(powermod(3, NBig(n), NBig(m))) == powermod(3, n, m)
+    end
+end
+
+@testset "differential widen/top_set_bit/checked/Bool-rem" begin
+    rng = MersenneTwister(0xb17)
+    @test widen(NBig) === NBig
+    @test Base.top_set_bit(NBig(0)) == 0
+    for trial in 1:200
+        x = diff_randbig(rng, rand(rng, 0:8))
+        y = diff_randbig(rng, rand(rng, 0:8))
+        @test Base.top_set_bit(NBig(abs(x))) == Base.top_set_bit(abs(x))
+        @test (NBig(x) % Bool) == (x % Bool)
+        @test Base.Checked.add_with_overflow(NBig(x), NBig(y)) == (NBig(x + y), false)
+        @test Base.Checked.sub_with_overflow(NBig(x), NBig(y)) == (NBig(x - y), false)
+        @test Base.Checked.mul_with_overflow(NBig(x), NBig(y)) == (NBig(x * y), false)
     end
 end
 
