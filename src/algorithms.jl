@@ -340,7 +340,7 @@ end
 # identical output to repeatedly dividing by 2^c, but O(n). Does not touch a.
 function radix_chunks_pow2(a::Memory{Limb}, n::Int, c::Int)
     n == 0 && return Limb[]
-    bitlen = 64n - leading_zeros(@inbounds a[n])
+    bitlen = 64 * (n - 1) + Base.top_set_bit(@inbounds a[n])
     nchunks = cld(bitlen, c)
     chunks = Vector{Limb}(undef, nchunks)
     mask = (one(Limb) << c) - one(Limb)
@@ -379,8 +379,8 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     # quotient below 8 (a/d < 2^(Δ+1)), so at most 7 subtraction sweeps beat
     # the scratch-alloc + normalize + invert + basecase machinery. Δ ≤ 2 also
     # forces n ≤ m+1 with a[n] < 4, so the value fits r plus one register.
-    dbits = 64n - leading_zeros(@inbounds a[ao+n]) -
-            (64m - leading_zeros(@inbounds d[do_+m]))
+    dbits = 64 * (n - m) + Base.top_set_bit(@inbounds a[ao+n]) -
+            Base.top_set_bit(@inbounds d[do_+m])
     if dbits <= 2
         copyto!(r, ro + 1, a, ao + 1, m)
         t = n > m ? (@inbounds a[ao+n]) : zero(Limb)

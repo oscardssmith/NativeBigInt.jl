@@ -240,7 +240,7 @@ function Base.isqrt(x::NBig)
         v = (UInt128(hi) << 64) | (@inbounds x.limbs[1])
         return NBig(isqrt(v) % Limb)
     end
-    bits = 64n - leading_zeros(@inbounds x.limbs[n])
+    bits = 64 * (n - 1) + Base.top_set_bit(@inbounds x.limbs[n])
     e = (64n - bits) & ~1
     # sqrtrem! needs an even limb count; odd n gets a zero low limb (a β
     # multiply — a further even shift), undone below via the root shift.
@@ -582,7 +582,7 @@ Base.invmod(b::BitInt64, m::NBig) = invmod(NBig(b), m)
 
 # NBig overloads of the powermod exponent-bit accessors (algorithms.jl).
 @inline expbit(n::NBig, j::Int) = ((@inbounds n.limbs[(j >>> 6) + 1]) >> (j & 63)) % Bool
-@inline expbits(n::NBig) = 64 * nlimbs(n) - leading_zeros(@inbounds n.limbs[nlimbs(n)])
+@inline expbits(n::NBig) = Base.top_set_bit(n)
 
 # Reduce the base to a native int (mod(a, m) follows m's sign, so it is
 # exactly representable in typeof(m)), then square-and-multiply in native

@@ -110,7 +110,7 @@ end
     if steps > 0
         xn, yn = even ? (A * x - B * y, D * y - C * x) :
                         (B * y - A * x, C * x - D * y)
-        nb = 128 - leading_zeros(xn)
+        nb = Base.top_set_bit(xn)
         if nb >= 94 && yn != 0
             sh = nb - 63
             A2, B2, C2, D2, even2, steps2 =
@@ -257,8 +257,8 @@ function gcd_core!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
             @inbounds u[2] = (x >> 64) % Limb
             return u, ((x >> 64) != 0 ? 2 : 1)
         end
-        ub = 64lu - leading_zeros(@inbounds u[lu])
-        vb = 64lv - leading_zeros(@inbounds v[lv])
+        ub = 64 * (lu - 1) + Base.top_set_bit(@inbounds u[lu])
+        vb = 64 * (lv - 1) + Base.top_set_bit(@inbounds v[lv])
         A = B = C = D = UInt64(0)
         even = true
         steps = 0
