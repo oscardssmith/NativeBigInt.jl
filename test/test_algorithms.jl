@@ -103,73 +103,22 @@ using NativeBigInt: mul!
     end
 end
 
-using NativeBigInt: mul_toom3!, sqr_toom3!, mul_scratch_len, sqr_scratch_len,
-                    MUL_TOOM3_THRESHOLD, SQR_TOOM3_THRESHOLD, sqr!
+using NativeBigInt: MUL_FPNTT_THRESHOLD, SQR_FPNTT_THRESHOLD, sqr!
 
-@testset "mul_toom3! balanced" begin
-    rng = MersenneTwister(31)
-    T3 = MUL_TOOM3_THRESHOLD
-    check(n, a, b) = begin
-        r = Memory{UInt64}(undef, 2n)
-        scratch = Memory{UInt64}(undef, mul_scratch_len(n))
-        mul_toom3!(r, 0, a, 0, b, 0, n, scratch, 0)
-        @test atoref(r, 0, 2n) == atoref(a, 0, n) * atoref(b, 0, n)
-    end
-    # sizes spanning the threshold, all residues mod 3, two+ recursion levels
-    for n in (T3, T3 + 1, T3 + 2, 2T3, 3T3 + 1, 3T3 + 2), trial in 1:5
-        check(n, amem(rand(rng, UInt64, n)), amem(rand(rng, UInt64, n)))
-    end
-    # all-ones limbs: maximum carry chaining everywhere
-    for n in (T3, T3 + 1)
-        a = amem(fill(typemax(UInt64), n))
-        check(n, a, a)
-    end
-    # negative vm1 on one side only: middle third huge, outer thirds tiny
-    for n in (T3, T3 + 1, T3 + 2)
-        k = (n + 2) ÷ 3
-        av = zeros(UInt64, n); av[k+1:2k] .= typemax(UInt64); av[1] = 1; av[n] = 1
-        check(n, amem(av), amem(rand(rng, UInt64, n)))
-        # negative on both sides (signs cancel)
-        check(n, amem(av), amem(copy(av)))
-    end
-    # zero blocks: a0 == 0 and a2 sparse
-    n = T3 + 1
-    av = zeros(UInt64, n); av[end] = 1; av[2(n+2)÷3] = 5
-    check(n, amem(av), amem(rand(rng, UInt64, n)))
-end
-
-@testset "sqr_toom3!" begin
-    rng = MersenneTwister(37)
-    T3 = SQR_TOOM3_THRESHOLD
-    check(n, a) = begin
-        r = Memory{UInt64}(undef, 2n)
-        scratch = Memory{UInt64}(undef, sqr_scratch_len(n))
-        sqr_toom3!(r, 0, a, 0, n, scratch, 0)
-        @test atoref(r, 0, 2n) == atoref(a, 0, n)^2
-    end
-    for n in (T3, T3 + 1, T3 + 2, 2T3, 3T3 + 1), trial in 1:5
-        check(n, amem(rand(rng, UInt64, n)))
-    end
-    for n in (T3, T3 + 1)
-        check(n, amem(fill(typemax(UInt64), n)))
-        k = (n + 2) ÷ 3
-        av = zeros(UInt64, n); av[k+1:2k] .= typemax(UInt64); av[1] = 1; av[n] = 1
-        check(n, amem(av))   # negative eval at -1 (squared away)
-    end
-end
-
-@testset "mul!/sqr! through the Toom-3 range" begin
+@testset "mul!/sqr! across the Karatsuba → NTT crossover" begin
     rng = MersenneTwister(41)
-    T3 = MUL_TOOM3_THRESHOLD
-    # balanced and unbalanced end-to-end sizes that exercise the toom path
-    for (m, n) in ((T3, T3), (2T3 + 1, 2T3 + 1), (3T3, T3 + 2), (2T3 + T3 ÷ 2, T3 + 1)),
+    T = MUL_FPNTT_THRESHOLD
+    # balanced and unbalanced end-to-end sizes straddling the dispatch switch
+    for (m, n) in ((T - 1, T - 1), (T, T), (T + 1, T + 1), (3T, T ÷ 2),
+                   (2T + T ÷ 2, T + 1)),
         trial in 1:3
         a = amem(rand(rng, UInt64, m)); b = amem(rand(rng, UInt64, n))
         r = Memory{UInt64}(undef, m + n)
         mul!(r, 0, a, 0, m, b, 0, n)
         @test atoref(r, 0, m + n) == atoref(a, 0, m) * atoref(b, 0, n)
     end
-    for n in (SQR_TOOM3_THRESHOLD, 2SQR_TOOM3_THRESHOLD + 1), trial in 1:3
+    for n in (SQR_FPNTT_THRESHOLD - 1, SQR_FPNTT_THRESHOLD,
+              2SQR_FPNTT_THRESHOLD + 1), trial in 1:3
         a = amem(rand(rng, UInt64, n))
         r = Memory{UInt64}(undef, 2n)
         sqr!(r, 0, a, 0, n)

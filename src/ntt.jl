@@ -1,6 +1,9 @@
 # NTT multiplication over the Goldilocks field GF(p), p = 2^64 - 2^32 + 1.
-# mul!/sqr! in algorithms.jl dispatch here above the MUL_NTT_*/SQR_NTT_*
-# thresholds.
+# The fpntt.jl engine superseded this in mul!/sqr! dispatch except above the
+# MUL_INTNTT_*/SQR_INTNTT_* thresholds (~131k limbs), where the fp engine's
+# single-prime chunk density decays past parity and this one wins again
+# (until a two-prime fp CRT extension reclaims that range).  Also the
+# known-good integer-domain cross-check.
 #
 # p - 1 = 2^32·(2^32 - 1) and 2^32 - 1 = 3·5·17·257·65537, so power-of-two
 # transforms exist up to length 2^32 and lengths m·2^k for m in (3, 5, 15)
@@ -478,7 +481,7 @@ end
 # shuffles as hand-written per-Q versions.
 const IOTA16 = ntuple(i -> i - 1, 16)
 
-@generated function ntt_gather4(::Val{Q}, v0::V8, v1::V8, v2::V8, v3::V8) where {Q}
+@generated function ntt_gather4(::Val{Q}, v0, v1, v2, v3) where {Q}
     role(t) = ntuple(l -> ((l - 1) ÷ Q) * 4Q + t * Q + (l - 1) % Q, 8)
     return quote
         $(Expr(:meta, :inline))
@@ -491,7 +494,7 @@ const IOTA16 = ntuple(i -> i - 1, 16)
     end
 end
 
-@generated function ntt_scatter4(::Val{Q}, a::V8, b::V8, c::V8, d::V8) where {Q}
+@generated function ntt_scatter4(::Val{Q}, a, b, c, d) where {Q}
     # global position g pulls role (g%4Q)÷Q, lane (g÷4Q)·Q + g%Q; roles are
     # concatenated in order, so the combined source index is role·8 + lane
     out(o) = ntuple(8) do l
@@ -837,9 +840,8 @@ function ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{UInt64},
 end
 
 # ---------------------------------------------------------------------------
-# mpn-layer entry points.  mul!/sqr! in algorithms.jl dispatch here above
-# the MUL_NTT_*/SQR_NTT_* thresholds defined alongside the other tuned
-# constants at the top of algorithms.jl.
+# mpn-layer entry points, same contracts as mul_fpntt!/sqr_fpntt! (which
+# have replaced these in the mul!/sqr! dispatch).
 
 # r[ro+1..ro+m+n] = a[ao+1..ao+m] * b[bo+1..bo+n], both nonzero; r must not
 # alias a or b.  magnitude_bits tolerates an unnormalized (zero) top limb,
