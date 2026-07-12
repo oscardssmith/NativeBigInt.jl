@@ -110,7 +110,7 @@ function fp_generator(F::FpCtx)
 end
 
 # ---------------------------------------------------------------------------
-# Transform plan, mirroring NttPlan: N = m·2^k, m in (1, 3, 5, 15),
+# Transform plan: N = m·2^k, m in (1, 3, 5, 15),
 # 2^k | p - 1.  Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient
 # estimate is a table load.
 
@@ -245,7 +245,7 @@ function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
 end
 
 # ---------------------------------------------------------------------------
-# Odd-radix stages.  Same Winograd radix-3 / plain radix-5 shapes as ntt.jl;
+# Odd-radix stages, Winograd radix-3 / plain radix-5;
 # the ω^0 output is fp_reduced, and inverse stages fp_reduce t0 on load.
 
 function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
@@ -430,7 +430,7 @@ end
 
 # ---------------------------------------------------------------------------
 # Radix-4 butterfly cores.  i^-1 == -i, so the inverse keeps the same wi and
-# swaps the add/sub pair around w, mirroring dft4_fwd/dft4_inv in ntt.jl.
+# swaps the add/sub pair around w.
 # y0 is returned unreduced; callers fp_reduce before storing.
 
 @inline function fp_dft4_fwd(a, b, c, d, wi, wip, F::FpCtx)
@@ -449,7 +449,50 @@ end
     return u + v, p_ - w, u - v, p_ + w
 end
 
-# small-q pow2 stages via the shared gather/scatter shuffles from ntt.jl
+# Small-q pow2 stages (q in (1,2,4)): butterfly partners sit closer together
+# than a vector, so 32 consecutive elements (four V8 loads) are shuffled
+# into quarter-role vectors a,b,c,d, put through the ordinary vector
+# butterfly, and shuffled back.  The twiddle tables' repeated 8-entry
+# patterns line up with the gathered lane order.
+#
+# Lane l of role t lives at global position (l÷Q)·4Q + t·Q + l%Q within the
+# 32 elements; scatter applies the inverse permutation.  The generators
+# concatenate the inputs into two Vec{16}s and emit one index-tuple shuffle
+# per output vector; LLVM folds the shuffle trees into the same machine
+# shuffles as hand-written per-Q versions.
+const IOTA16 = ntuple(i -> i - 1, 16)
+
+@generated function ntt_gather4(::Val{Q}, v0, v1, v2, v3) where {Q}
+    role(t) = ntuple(l -> ((l - 1) ÷ Q) * 4Q + t * Q + (l - 1) % Q, 8)
+    return quote
+        $(Expr(:meta, :inline))
+        lo = SIMD.shufflevector(v0, v1, Val(IOTA16))
+        hi = SIMD.shufflevector(v2, v3, Val(IOTA16))
+        return (SIMD.shufflevector(lo, hi, Val($(role(0)))),
+                SIMD.shufflevector(lo, hi, Val($(role(1)))),
+                SIMD.shufflevector(lo, hi, Val($(role(2)))),
+                SIMD.shufflevector(lo, hi, Val($(role(3)))))
+    end
+end
+
+@generated function ntt_scatter4(::Val{Q}, a, b, c, d) where {Q}
+    # global position g pulls role (g%4Q)÷Q, lane (g÷4Q)·Q + g%Q; roles are
+    # concatenated in order, so the combined source index is role·8 + lane
+    out(o) = ntuple(8) do l
+        g = 8o + l - 1
+        ((g % 4Q) ÷ Q) * 8 + (g ÷ 4Q) * Q + g % Q
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        ab = SIMD.shufflevector(a, b, Val(IOTA16))
+        cd = SIMD.shufflevector(c, d, Val(IOTA16))
+        return (SIMD.shufflevector(ab, cd, Val($(out(0)))),
+                SIMD.shufflevector(ab, cd, Val($(out(1)))),
+                SIMD.shufflevector(ab, cd, Val($(out(2)))),
+                SIMD.shufflevector(ab, cd, Val($(out(3)))))
+    end
+end
+
 function fp_smallq_fwd!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
                         stg::FpNttStage, vwi::VF8, vwip::VF8, F::FpCtx) where {Q}
     vw1 = SIMD.vload(VF8, stg.w1, 1); vw1p = SIMD.vload(VF8, stg.w1p, 1)
@@ -499,7 +542,7 @@ function fp_smallq_inv!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
 end
 
 # ---------------------------------------------------------------------------
-# Power-of-two pipelines, mirroring ntt_fwd_pow2!/ntt_inv_pow2!.
+# Power-of-two pipelines: radix-4 DIF forward / DIT inverse.
 
 function fp_fwd_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
     F = plan.ctx
@@ -667,7 +710,20 @@ function fp_ntt_inv!(x::Vector{Float64}, plan::FpNttPlan)
 end
 
 # ---------------------------------------------------------------------------
-# Coefficient-domain layer.  Same pipeline as ntt.jl with Float64 points.
+# Coefficient-domain layer, in pipeline order: size the transform (ntt_len,
+# fp_ntt_params), split limbs into chunk coefficients (fp_ntt_pack), multiply
+# lanewise between the transforms (fp_ntt_pointwise!), and reassemble the
+# product limbs (fp_ntt_unpack!).
+
+# smallest supported transform length >= T: m·2^k, m in (1, 3, 5, 15), k >= 2
+function ntt_len(T::Int)
+    best = nextpow(2, max(T, 4))
+    for m in (3, 5, 15)
+        c = m * nextpow(2, max(cld(T, m), 4))
+        c < best && (best = c)
+    end
+    return best
+end
 
 # chunk width and transform length: exactness needs every convolution
 # coefficient (a sum of min(nca, ncb) chunk products) below p, so b <= 24
@@ -682,8 +738,8 @@ function fp_ntt_params(bits_a::Int, bits_b::Int)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# ntt_pack with Float64 output; chunks < 2^b <= 2^52 are exact doubles and,
-# being smaller than every prime, already canonical residues
+# b-bit chunk extraction into Float64 points; chunks < 2^b <= 2^52 are exact
+# doubles and, being smaller than every prime, already canonical residues
 function fp_ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::Int)
     x = Vector{Float64}(undef, N)
     mask = (UInt64(1) << b) - 1
@@ -726,10 +782,11 @@ function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     return xa
 end
 
-# canonicalize each coefficient to [0, p) and stream limbs out, as in
-# ntt_unpack!.  Coefficients < 2^49 with b <= 24 leave far more accumulator
-# margin than the Goldilocks unpack (whose bound was coefficients < 2^64,
-# b <= 32), so the same single-UInt128 flush cadence is safe.
+# canonicalize each coefficient to [0, p) and stream limbs out.
+# Coefficients < 2^49 at b <= 24 spacing never hold more than 64 + 49 live
+# bits, so a single-UInt128 accumulator with one flushed limb per 64 output
+# bits never overflows, and (contributions being nonnegative, starting at
+# bit i·b >= outbit + 64 after each flush) every flushed limb is final.
 function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
                         nconv::Int, b::Int, F::FpCtx)
     acc = UInt128(0)
@@ -758,7 +815,7 @@ function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
 end
 
 # ---------------------------------------------------------------------------
-# mpn-layer entry points, same contracts as mul_ntt!/sqr_ntt!.
+# mpn-layer entry points: r[1..m+n] = a·b (r must not alias the inputs).
 
 function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                     b::Memory{Limb}, bo::Int, n::Int)

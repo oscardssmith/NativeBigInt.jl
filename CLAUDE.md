@@ -48,11 +48,13 @@ against `bench/` and, where relevant, the generated asm (`bench/asm_dump.jl`).
 subtractive Karatsuba (threshold ~29 limbs, benchmark-tuned via
 `bench/bench_kar_thr.jl`) with an unbalanced-operand path, and the
 `mul!`/`sqr!` entry points that hand off to the fp NTT (`src/fpntt.jl`,
-FLINT-fft_small-style Float64 engine over p = 2^49 − 2^33 + 1) at ~336
-balanced limbs (~400 for squaring).  Toom-3 used to sit between Karatsuba
-and the NTT but was deleted when the fp NTT shrank its winning band to
-240–340 limbs; `src/ntt.jl` (the integer Goldilocks NTT it replaced) is kept
-unwired as a known-good cross-check.
+FLINT-fft_small-style Float64 engine over p₁ = 2^49 − 2^33 + 1) at ~336
+balanced limbs (~400 for squaring), switching to its two-prime CRT variant
+(second prime p₂ = 255·2^41 + 1, Garner recombination in the unpack) above
+~37k limbs (~41k for squaring) where single-prime chunk density decays.
+Toom-3 and the integer Goldilocks NTT (`src/ntt.jl`) used to occupy parts of
+this range; both were deleted once the fp engine beat them everywhere
+(git history has them if ever needed).
 `algorithms.jl` has multi-limb `divrem!` (Knuth Algorithm D over
 `divrem_bc!`), Karatsuba sqrt, powermod, and radix conversion for
 `string`/`parse`. `montgomery.jl` and `gcd.jl` (Lehmer gcd / extended gcd,

@@ -17,7 +17,6 @@ include("mul.jl")
 include("algorithms.jl")
 include("gcd.jl")
 include("nbig.jl")
-include("ntt.jl")
 include("fpntt.jl")
 
 end
