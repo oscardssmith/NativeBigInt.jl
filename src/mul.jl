@@ -19,12 +19,12 @@ const SQR_KARATSUBA_THRESHOLD = 52
 const MUL_FPNTT_MIN = 128        # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 336  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 400  # operand at least this many limbs
-# fp NTT → integer (Goldilocks) NTT: the fp engine's single-prime chunk
-# density decays with size (b ≈ (49 − log2 N)/2 vs the 2^64 bound's
-# b ≈ (64 − log2 N)/2); measured parity at ~131k limbs, Goldilocks ahead
-# beyond.  A two-prime CRT fp extension would reclaim this range.
-const MUL_INTNTT_THRESHOLD = 131072
-const SQR_INTNTT_THRESHOLD = 131072
+# single-prime → two-prime fp NTT: single-prime chunk density decays with
+# size (b ≈ (49 − log2 N)/2), the two-prime CRT engine holds b ≈ 40-44 but
+# runs every transform twice; measured crossover ~37k limbs balanced mul,
+# ~41k squaring (benchmark sweep, this machine).
+const MUL_FPNTT2_THRESHOLD = 36864
+const SQR_FPNTT2_THRESHOLD = 40960
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -131,10 +131,10 @@ function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
         sqr_basecase!(r, ro, a, ao, n)
     elseif n < SQR_FPNTT_THRESHOLD
         sqr_kar!(r, ro, a, ao, n, scratch, so)
-    elseif n < SQR_INTNTT_THRESHOLD
+    elseif n < SQR_FPNTT2_THRESHOLD
         sqr_fpntt!(r, ro, a, ao, n)
     else
-        sqr_ntt!(r, ro, a, ao, n)
+        sqr_fpntt2!(r, ro, a, ao, n)
     end
     return nothing
 end
@@ -145,8 +145,8 @@ function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     if n < SQR_KARATSUBA_THRESHOLD
         return sqr_basecase!(r, ro, a, ao, n)
     end
-    if n >= SQR_INTNTT_THRESHOLD
-        return sqr_ntt!(r, ro, a, ao, n)
+    if n >= SQR_FPNTT2_THRESHOLD
+        return sqr_fpntt2!(r, ro, a, ao, n)
     end
     if n >= SQR_FPNTT_THRESHOLD
         return sqr_fpntt!(r, ro, a, ao, n)
@@ -163,10 +163,10 @@ function mul_bal!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
         mul_basecase!(r, ro, a, ao, n, b, bo, n)
     elseif n < MUL_FPNTT_THRESHOLD
         mul_kar!(r, ro, a, ao, b, bo, n, scratch, so)
-    elseif n < MUL_INTNTT_THRESHOLD
+    elseif n < MUL_FPNTT2_THRESHOLD
         mul_fpntt!(r, ro, a, ao, n, b, bo, n)
     else
-        mul_ntt!(r, ro, a, ao, n, b, bo, n)
+        mul_fpntt2!(r, ro, a, ao, n, b, bo, n)
     end
     return nothing
 end
@@ -180,8 +180,8 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
     if n >= MUL_FPNTT_MIN && m + n >= 2MUL_FPNTT_THRESHOLD
-        if m + n >= 2MUL_INTNTT_THRESHOLD
-            return mul_ntt!(r, ro, a, ao, m, b, bo, n)
+        if m + n >= 2MUL_FPNTT2_THRESHOLD
+            return mul_fpntt2!(r, ro, a, ao, m, b, bo, n)
         end
         return mul_fpntt!(r, ro, a, ao, m, b, bo, n)
     end

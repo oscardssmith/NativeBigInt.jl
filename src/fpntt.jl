@@ -802,6 +802,8 @@ const FP_PI2 = 0x0001_FE00_0000_0001           # 560750930165761 = 255·2^41 + 1
 const FP_CTX2 = FpCtx(FP_PI2, (2, 3, 5, 17))   # p2 - 1 = 2^41 · 3 · 5 · 17
 const FP_PI12 = UInt128(FP_PI) * FP_PI2
 const FP_P1INV2 = fpi_inv(FP_PI % FP_PI2, FP_PI2)  # p1^-1 mod p2 (Garner)
+const FP_G2  = Float64(FP_P1INV2)                  # ... as an fp_mulmod twiddle
+const FP_G2P = FP_G2 / Float64(FP_PI2)
 
 # chunk width and transform length against the CRT modulus p1·p2.  The bound
 # min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
@@ -820,8 +822,17 @@ function fp_ntt_params2(bits_a::Int, bits_b::Int)
 end
 
 # Garner recombination + limb streaming.  Each coefficient is recovered from
-# its residues as c = c1 + p1·((c2 - c1)·p1^-1 mod p2) ∈ [0, p1·p2) ⊂ [0, 2^99)
-# — exact integer arithmetic throughout, no fp bounds involved.
+# its residues as c = c1 + p1·((c2 - c1)·p1^-1 mod p2) ∈ [0, p1·p2) ⊂ [0, 2^99).
+# The mod-p2 step stays in the fp domain (the residues are already Float64,
+# and ·p1^-1 is a mulmod by a fixed twiddle): c1 is canonicalized first
+# (v1 - p1 is a different value mod p2!), then t = v2 - fp_reduce(v1, F2) has
+# |t| < 1.5·p2 <= 4p, so u = fp_mulmod(t, g, gp, F2) is exact.  Only the
+# final c1 + u·p1 is integer arithmetic.
+#
+# The fp work runs 8-wide into small buffers: per-coefficient it is one long
+# serial dependency chain (reduce → canon → reduce → mulmod → canon), and a
+# scalar loop is latency-bound on it (measured ~7 ns/coeff, ~30% of the whole
+# multiply); batching leaves only the integer accumulate on the critical path.
 #
 # Accumulator proof.  (hi, acc) is a 192-bit window holding the pending sum of
 # contributions to bits [outbit, outbit+192); coefficient i contributes
@@ -837,34 +848,56 @@ end
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64},
                          nconv::Int, b::Int)
+    c1buf = Vector{UInt64}(undef, 8)
+    ubuf = Vector{UInt64}(undef, 8)
+    vg, vgp = VF8(FP_G2), VF8(FP_G2P)
+    # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
+    # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
+    vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
     acc = UInt128(0)
     hi = UInt64(0)
     outw = 1
     outbit = 0
-    @inbounds for i in 0:nconv-1
-        v1 = fp_reduce(x1[i+1], FP_CTX1)
-        v1 < 0.0 && (v1 += FP_CTX1.p)
-        v2 = fp_reduce(x2[i+1], FP_CTX2)
-        v2 < 0.0 && (v2 += FP_CTX2.p)
-        c1 = unsafe_trunc(UInt64, v1)
-        c2 = unsafe_trunc(UInt64, v2)
-        c1m = c1 >= FP_PI2 ? c1 - FP_PI2 : c1      # c1 mod p2 (c1 < p1 < 2p2)
-        d = c2 >= c1m ? c2 - c1m : c2 + (FP_PI2 - c1m)
-        u = (UInt128(d) * FP_P1INV2 % FP_PI2) % UInt64
-        c = UInt128(c1) + UInt128(u) * FP_PI
-        s = i * b - outbit
-        if s >= 64
-            r[ro+outw] = acc % UInt64
-            acc = (acc >> 64) | (UInt128(hi) << 64)
-            hi = 0
-            outw += 1
-            outbit += 64
-            s -= 64
+    i = 0
+    @inbounds while i < nconv
+        blk = min(8, nconv - i)
+        if blk == 8
+            v1 = fp_reduce(SIMD.vload(VF8, x1, i + 1), FP_CTX1)
+            v1 = SIMD.vifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+            v2 = fp_reduce(SIMD.vload(VF8, x2, i + 1), FP_CTX2)
+            u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
+            u = SIMD.vifelse(u < 0.0, u + FP_CTX2.p, u)
+            SIMD.vstore(reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask,
+                        c1buf, 1)
+            SIMD.vstore(reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask,
+                        ubuf, 1)
+        else
+            for j in 1:blk
+                v1 = fp_reduce(x1[i+j], FP_CTX1)
+                v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+                v2 = fp_reduce(x2[i+j], FP_CTX2)
+                u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), FP_G2, FP_G2P, FP_CTX2)
+                ubuf[j] = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
+                c1buf[j] = unsafe_trunc(UInt64, v1)
+            end
         end
-        lo = c << s
-        t = acc + lo
-        hi += ((c >> 1) >> (127 - s)) % UInt64 + (t < acc)
-        acc = t
+        for j in 1:blk
+            c = UInt128(c1buf[j]) + UInt128(ubuf[j]) * FP_PI
+            s = (i + j - 1) * b - outbit
+            if s >= 64
+                r[ro+outw] = acc % UInt64
+                acc = (acc >> 64) | (UInt128(hi) << 64)
+                hi = 0
+                outw += 1
+                outbit += 64
+                s -= 64
+            end
+            lo = c << s
+            t = acc + lo
+            hi += ((c >> 1) >> (127 - s)) % UInt64 + (t < acc)
+            acc = t
+        end
+        i += blk
     end
     @inbounds while outw <= rn
         r[ro+outw] = acc % UInt64
