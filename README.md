@@ -3,8 +3,10 @@
 Pure-Julia arbitrary-precision integer type (`NBig`) targeting GMP-competitive
 performance from ~100 bits up: faster than GMP for `+`/`-`/`*` overall
 (multiplication pulls well ahead above ~14k bits thanks to a floating-point
-NTT), and competitive below ~4k bits for `divrem`/roots/`gcd` and friends,
-which are still quadratic and fall behind above that.
+NTT), at or ahead of GMP for `divrem` across the range (schoolbook below
+~8k bits, divide-and-conquer above riding the NTT multiplies), and
+competitive below ~4k bits for roots/`gcd` and friends, which are still
+quadratic and fall behind above that.
 Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
@@ -26,10 +28,13 @@ Three layers, mirroring GMP's mpn/mpz split:
   `sqr!` hand off to the fp NTT at ~224 balanced limbs. This NTT implementation
   benchmarks better than Toom-3 for all sizes (and thus presumably better than
   the higher degree Toom algorithms as well).
-- **Algorithms (`src/algorithms.jl`):** multi-limb `divrem!` (Knuth
-  Algorithm D basecase over `divrem_bc!`); Karatsuba sqrt; power by repeated
-  squaring; radix conversion for `string`/`parse` (per-limb `divrem_1!` for
-  small values, divide-and-conquer for large).
+- **Algorithms (`src/algorithms.jl`):** multi-limb `divrem!` — Knuth
+  Algorithm D over `divrem_bc!` below ~100 limbs, GMP-`dcpi1`-style
+  divide-and-conquer division (recursive 2n/n blocks over `mul!`, so it
+  inherits Karatsuba and the NTT; 0.82–0.96× GMP's `mpn_tdiv_qr` from the
+  crossover through at least 2048 limbs) above; Karatsuba sqrt; power by
+  repeated squaring; radix conversion for `string`/`parse` (per-limb
+  `divrem_1!` for small values, divide-and-conquer for large).
 - **fp NTT multiplication (`src/fpntt.jl`):** the sole large-size engine —
   number-theoretic transforms computed entirely in `Float64` in the style
   of FLINT's `fft_small`, with the convolution recombined by CRT over two
@@ -93,4 +98,4 @@ through the largest sizes that fit in memory.
 
 Kernel-level benchmarks against GMP's `__gmpn_*` functions directly live
 alongside this one in `bench/` (see `bench/bench_kernels.jl`,
-`bench/bench_mul.jl`, `bench/bench_divrem.jl`, etc.).
+`bench/bench_mul.jl`, `bench/div_vs_gmp.jl`, `bench/bench_dc_thr.jl`, etc.).

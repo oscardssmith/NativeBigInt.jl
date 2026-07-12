@@ -28,54 +28,31 @@ There is no build/lint step — it's a plain Julia package.
 
 ## Architecture
 
-Three layers mirror GMP's mpn/mpz split. The module include order in
-`src/NativeBigInt.jl` reflects the dependency direction (kernels → algorithms →
-NBig).
+**The layer structure (kernels → algorithms → NBig, mirroring GMP's mpn/mpz
+split) and the per-layer algorithm inventory are documented in `README.md` —
+read its Algorithms section for orientation, and update it there (not here)
+when algorithms change.** The module include order in `src/NativeBigInt.jl`
+reflects the dependency direction. Agent-relevant notes the README doesn't
+cover:
 
-**Kernels (`src/kernels/*.jl`) — the mpn layer.** Sign-free primitives operating
-on raw `Memory{Limb}` (`Limb == UInt64`) buffers with explicit offsets and
-lengths. `addsub.jl` (`add_n!`/`sub_n!`), `mul.jl` (`mul_1!`/`addmul_1!`,
-`mul_2!`/`addmul_2!`, `mul_basecase!`, squaring), `shift.jl`, `div.jl`
-(reciprocal-based `divrem_1!` via Möller–Granlund normalized inverse, `div_3by2`
-quotient estimation, radix-β² `divrem_bc!` Knuth Algorithm D). Kernels are
-written so LLVM emits `adc`/`mulx` chains, with SIMD.jl fast paths (`V8` =
-`SIMD.Vec{8,Limb}`, the shared width) and scalar cold paths for carry-chaining
-edge cases. Performance here is the whole point — changes should be checked
-against `bench/` and, where relevant, the generated asm (`bench/asm_dump.jl`).
-
-**Algorithms (`src/mul.jl`, `src/algorithms.jl`) — mpn-level composite ops.**
-`mul.jl` holds the multiplication chain and its dispatch thresholds:
-subtractive Karatsuba (threshold ~29 limbs, benchmark-tuned via
-`bench/bench_kar_thr.jl`) with an unbalanced-operand path, and the
-`mul!`/`sqr!` entry points that hand off to the two-prime CRT fp NTT
-(`src/fpntt.jl`, FLINT-fft_small-style Float64 engine over
-p₁ = 2^49 − 2^33 + 1 and p₂ = 255·2^41 + 1, Garner recombination in the
-unpack) at ~224 balanced limbs (mul and sqr).  Toom-3, the integer
-Goldilocks NTT (`src/ntt.jl`), and the single-prime fp pipeline were all
-deleted once the two-prime fp engine beat them everywhere (git history has
-them if ever needed).
-`algorithms.jl` has multi-limb `divrem!` (Knuth Algorithm D over
-`divrem_bc!`), Karatsuba sqrt, powermod, and radix conversion for
-`string`/`parse`. `montgomery.jl` and `gcd.jl` (Lehmer gcd / extended gcd,
-Knuth TAOCP §4.5.2 Algorithm L) also build on the kernels and on
-`mul!`/`divrem!`.
-
-**`NBig` (`src/nbig.jl`) — the mpz layer.** The public sign-magnitude value type:
-
-```julia
-struct NBig <: Signed
-    signlen::Int         # sign(x) * limb count; 0 ⟺ x == 0
-    limbs::Memory{Limb}  # little-endian, normalized (top limb ≠ 0), may be over-allocated
-end
-```
-
-This is where signs, normalization, and the Base interface live: comparison,
-`+`/`-`/`*`, `divrem`/`div`/`rem`/`mod`/`fld`/`cld`, shifts, two's-complement
-bitwise ops, `^`, base 2–36 string conversion, and conversions to/from
-`Int64`/`UInt64`/`Int128`/`BigInt`/`Float64`.
-
-**Random extension (`ext/NativeBigIntRandomExt.jl`).** Weak-dependency extension
-loaded when `Random` is available; provides `rand` over `NBig` ranges.
+- **Kernels (`src/kernels/*.jl`)** are sign-free primitives over raw
+  `Memory{Limb}` (`Limb == UInt64`) with explicit offsets and lengths, written
+  so LLVM emits `adc`/`mulx` chains, with SIMD.jl fast paths (`V8` =
+  `SIMD.Vec{8,Limb}`, the shared width) and scalar cold paths for
+  carry-chaining edge cases. Performance here is the whole point — check
+  changes against `bench/` and, where relevant, the generated asm
+  (`bench/asm_dump.jl`).
+- **Dispatch thresholds live at the mpn layer** (`src/mul.jl`,
+  `src/algorithms.jl`), never at the NBig level, and are benchmark-tuned:
+  Karatsuba ~29 limbs (`bench/bench_kar_thr.jl`), fp NTT ~224 balanced limbs,
+  divide-and-conquer division `DC_DIV_THRESHOLD` = 100
+  (`bench/bench_dc_thr.jl`).
+- **Deleted algorithms:** Toom-3, the integer Goldilocks NTT (`src/ntt.jl`),
+  and the single-prime fp pipeline were removed once the two-prime fp NTT
+  beat them everywhere — git history has them; don't reintroduce variants
+  without benchmark cause.
+- `ext/NativeBigIntRandomExt.jl` is a weak-dependency extension (loaded when
+  `Random` is available) providing `rand` over `NBig` ranges.
 
 ## Conventions and invariants
 
