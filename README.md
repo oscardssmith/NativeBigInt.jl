@@ -1,8 +1,9 @@
 # NativeBigInt.jl
 
 Pure-Julia arbitrary-precision integer type (`NBig`) targeting GMP-competitive
-performance from ~100 bits up: within ~1.2× of GMP through the Karatsuba
-range, and faster than GMP above ~100k bits thanks to an NTT multiplication.
+performance from ~100 bits up: within ~1.25× of GMP through the Karatsuba
+and Toom-3 range, and faster than GMP above ~100k bits thanks to an NTT
+multiplication.
 Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
@@ -19,12 +20,15 @@ Three layers, mirroring GMP's mpn/mpz split:
   `submul_2!`, with a small-quotient subtraction fast path for near-equal
   bit lengths. Kernels are written so LLVM emits `adc`/`mulx` chains, with
   SIMD.jl fast paths and scalar cold paths for carry-chaining edge cases.
-- **Algorithms (`src/algorithms.jl`):** subtractive Karatsuba multiplication
-  (threshold ~29 limbs, benchmark-tuned) with a general unbalanced-operand
-  path; multi-limb `divrem!` (Knuth Algorithm D basecase over `divrem_bc!`);
-  power by repeated squaring; radix conversion for `string`/`parse`
-  (per-limb `divrem_1!` for small values, divide-and-conquer for large).
-- **NTT multiplication (`src/ntt.jl`):** above ~1800 combined limbs,
+- **Multiplication (`src/mul.jl`):** subtractive Karatsuba (threshold ~29
+  limbs, benchmark-tuned) with a general unbalanced-operand path, and Toom-3
+  above ~240 balanced limbs (~384 for squaring) with an exact-division-by-3
+  interpolation kernel; `mul!`/`sqr!` hand off to the NTT at ~1024 limbs.
+- **Algorithms (`src/algorithms.jl`):** multi-limb `divrem!` (Knuth
+  Algorithm D basecase over `divrem_bc!`); Karatsuba sqrt; power by repeated
+  squaring; radix conversion for `string`/`parse` (per-limb `divrem_1!` for
+  small values, divide-and-conquer for large).
+- **NTT multiplication (`src/ntt.jl`):** above ~1024 limbs per operand,
   `mul!`/`sqr!` dispatch to a number-theoretic transform over the Goldilocks
   field GF(2^64 − 2^32 + 1). Radix-4 DIF/DIT with fully vectorized
   butterflies (the 64×64 products are assembled from widening 32×32
@@ -57,16 +61,19 @@ NBig time / BigInt time — lower is better; ≤1.0 means NBig is faster.
 NBig matches or beats `BigInt` across the whole 128–4096 bit range for
 `+`/`-`/`*`, and is within ~1.15× for `divrem` at the top of the range.
 
-Above that, the NTT takes over (`bench/bench_mul.jl`, AVX-512 machine;
-ratio is NBig `*` / BigInt `*`):
+Above that, Toom-3 carries ~15k–65k bits and the NTT takes over from ~65k
+(`bench/bench_mul.jl`, AVX-512 machine; ratio is `mul!` / `__gmpn_mul` on
+two equal operands of the given bit size):
 
-| bits    | 33k  | 66k  | 131k | 262k | 524k | 2.1M | 16.8M | 268M |
-|---------|------|------|------|------|------|------|-------|------|
-| `*`     | 1.12 | 1.15 | 0.93 | 0.85 | 0.81 | 0.69 | 0.64  | 0.74 |
+| bits    | 33k  | 49k  | 66k  | 98k  | 131k | 262k | 524k | 2.1M | 16.8M | 268M |
+|---------|------|------|------|------|------|------|------|------|-------|------|
+| `*`     | 1.23 | 1.26 | 1.13 | 1.01 | 0.92 | 0.85 | 0.81 | 0.69 | 0.64  | 0.74 |
 
-GMP parity lands around ~100k bits, and the lead holds at roughly 1.3–1.5×
-through the largest sizes measured (268M bits). Squaring crosses over at the
-same point with a slightly larger lead. Asymptotically the fixed-prime NTT's
+The Toom-3 window is GMP's strongest range (its hand-tuned Toom-3/4/6.5
+assembly), so NBig sits within ~1.25× there — about 10% closer than
+Karatsuba alone managed. GMP parity lands around ~100k bits, and the lead
+holds at roughly 1.3–1.5× through the largest sizes measured (268M bits).
+Squaring crosses over at the same point with a slightly larger lead. Asymptotically the fixed-prime NTT's
 chunk width shrinks as operands grow, so Schönhage–Strassen would win again
 somewhere around 10^11 bits — beyond both memory and the field's 2-adicity
 limit, so it never matters in practice.

@@ -43,13 +43,17 @@ written so LLVM emits `adc`/`mulx` chains, with SIMD.jl fast paths (`V8` =
 edge cases. Performance here is the whole point — changes should be checked
 against `bench/` and, where relevant, the generated asm (`bench/asm_dump.jl`).
 
-**Algorithms (`src/algorithms.jl`) — mpn-level composite ops.** Subtractive
-Karatsuba multiplication (threshold ~29 limbs, benchmark-tuned via
-`bench/bench_kar_thr.jl`) with an unbalanced-operand path; multi-limb `divrem!`
-(Knuth Algorithm D over `divrem_bc!`); power by repeated squaring; radix
-conversion for `string`/`parse`. `montgomery.jl` and `gcd.jl` (Lehmer gcd /
-extended gcd, Knuth TAOCP §4.5.2 Algorithm L) also build on the kernels and on
-`algorithms.jl`'s `mul!`/`divrem!`.
+**Algorithms (`src/mul.jl`, `src/algorithms.jl`) — mpn-level composite ops.**
+`mul.jl` holds the multiplication chain and its dispatch thresholds:
+subtractive Karatsuba (threshold ~29 limbs, benchmark-tuned via
+`bench/bench_kar_thr.jl`) with an unbalanced-operand path, Toom-3 above ~240
+limbs balanced (~384 for squaring, tuned via `bench/bench_toom_thr.jl`), and
+the `mul!`/`sqr!` entry points that hand off to the NTT at ~1024 limbs.
+`algorithms.jl` has multi-limb `divrem!` (Knuth Algorithm D over
+`divrem_bc!`), Karatsuba sqrt, powermod, and radix conversion for
+`string`/`parse`. `montgomery.jl` and `gcd.jl` (Lehmer gcd / extended gcd,
+Knuth TAOCP §4.5.2 Algorithm L) also build on the kernels and on
+`mul!`/`divrem!`.
 
 **`NBig` (`src/nbig.jl`) — the mpz layer.** The public sign-magnitude value type:
 

@@ -2,8 +2,8 @@
 # SQR_KARATSUBA_THRESHOLD (basecase vs Karatsuba) and SQR_NTT_THRESHOLD
 # (Karatsuba vs NTT) tuning.
 using NativeBigInt, BenchmarkTools
-using NativeBigInt: Limb, sqr!, sqr_basecase!, sqr_kar!, sqr_ntt!,
-                    kar_scratch_len, mul!
+using NativeBigInt: Limb, sqr!, sqr_basecase!, sqr_kar!, sqr_toom3!, sqr_ntt!,
+                    kar_scratch_len, sqr_scratch_len, mul!
 
 g_sqr!(r, a, n) = ccall((:__gmpn_sqr, :libgmp), Cvoid,
                         (Ptr{Limb}, Ptr{Limb}, Clong), r, a, n)
@@ -34,14 +34,16 @@ for n in (24, 32, 40, 48, 56, 64, 80)
             lpad(round(tb/tk, digits=2), 7))
 end
 
-println("\ncrossover: Karatsuba vs NTT")
+println("\ncrossover: Karatsuba/Toom-3 vs NTT")
 for n in (640, 768, 896, 1024, 1152, 1280, 1536, 2048)
     a = Memory{Limb}(rand(Limb, n))
     r = Memory{Limb}(undef, 2n)
-    s = Memory{Limb}(undef, kar_scratch_len(n))
+    s = Memory{Limb}(undef, max(kar_scratch_len(n), sqr_scratch_len(n)))
     tk = @belapsed sqr_kar!($r, 0, $a, 0, $n, $s, 0)
+    tt = @belapsed sqr_toom3!($r, 0, $a, 0, $n, $s, 0)
     tn = @belapsed sqr_ntt!($r, 0, $a, 0, $n)
     println(rpad(n, 6), lpad(round(tk*1e6, digits=1), 8), " us kar",
+            lpad(round(tt*1e6, digits=1), 8), " us toom",
             lpad(round(tn*1e6, digits=1), 8), " us ntt",
-            lpad(round(tn/tk, digits=2), 7))
+            lpad(round(tn/tt, digits=2), 7))
 end

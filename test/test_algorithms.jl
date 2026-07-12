@@ -1,5 +1,5 @@
 # Algorithm tests
-using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, KARATSUBA_THRESHOLD, divrem!
+using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, MUL_KARATSUBA_THRESHOLD, divrem!
 using Random: MersenneTwister
 
 amem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -35,17 +35,17 @@ afrombig(x::BigInt, n) = (v = zeros(UInt64, n); for i in 1:n; v[i] = UInt64(x & 
     @test r2[1] == 7
 
     # kar_scratch_len
-    @test kar_scratch_len(KARATSUBA_THRESHOLD - 1) == 0
-    h2 = (KARATSUBA_THRESHOLD + 1) >> 1
-    @test kar_scratch_len(KARATSUBA_THRESHOLD) == 4h2 + kar_scratch_len(h2)
-    @test kar_scratch_len(4 * KARATSUBA_THRESHOLD) > kar_scratch_len(2 * KARATSUBA_THRESHOLD)
+    @test kar_scratch_len(MUL_KARATSUBA_THRESHOLD - 1) == 0
+    h2 = (MUL_KARATSUBA_THRESHOLD + 1) >> 1
+    @test kar_scratch_len(MUL_KARATSUBA_THRESHOLD) == 4h2 + kar_scratch_len(h2)
+    @test kar_scratch_len(4 * MUL_KARATSUBA_THRESHOLD) > kar_scratch_len(2 * MUL_KARATSUBA_THRESHOLD)
 end
 
 using NativeBigInt: mul_kar!
 
 @testset "mul_kar! balanced" begin
     rng = MersenneTwister(123)
-    T = KARATSUBA_THRESHOLD
+    T = MUL_KARATSUBA_THRESHOLD
     check(n, a, b) = begin
         r = Memory{UInt64}(undef, 2n)
         scratch = Memory{UInt64}(undef, kar_scratch_len(n))
@@ -77,7 +77,7 @@ using NativeBigInt: mul!
 
 @testset "mul! general" begin
     rng = MersenneTwister(7)
-    T = KARATSUBA_THRESHOLD
+    T = MUL_KARATSUBA_THRESHOLD
     checkmul(m, n, a, b) = begin
         r = Memory{UInt64}(undef, m + n)
         mul!(r, 0, a, 0, m, b, 0, n)
@@ -100,6 +100,80 @@ using NativeBigInt: mul!
     for trial in 1:60
         m = rand(rng, 1:3T); n = rand(rng, 1:m)
         checkmul(m, n, amem(rand(rng, UInt64, m)), amem(rand(rng, UInt64, n)))
+    end
+end
+
+using NativeBigInt: mul_toom3!, sqr_toom3!, mul_scratch_len, sqr_scratch_len,
+                    MUL_TOOM3_THRESHOLD, SQR_TOOM3_THRESHOLD, sqr!
+
+@testset "mul_toom3! balanced" begin
+    rng = MersenneTwister(31)
+    T3 = MUL_TOOM3_THRESHOLD
+    check(n, a, b) = begin
+        r = Memory{UInt64}(undef, 2n)
+        scratch = Memory{UInt64}(undef, mul_scratch_len(n))
+        mul_toom3!(r, 0, a, 0, b, 0, n, scratch, 0)
+        @test atoref(r, 0, 2n) == atoref(a, 0, n) * atoref(b, 0, n)
+    end
+    # sizes spanning the threshold, all residues mod 3, two+ recursion levels
+    for n in (T3, T3 + 1, T3 + 2, 2T3, 3T3 + 1, 3T3 + 2), trial in 1:5
+        check(n, amem(rand(rng, UInt64, n)), amem(rand(rng, UInt64, n)))
+    end
+    # all-ones limbs: maximum carry chaining everywhere
+    for n in (T3, T3 + 1)
+        a = amem(fill(typemax(UInt64), n))
+        check(n, a, a)
+    end
+    # negative vm1 on one side only: middle third huge, outer thirds tiny
+    for n in (T3, T3 + 1, T3 + 2)
+        k = (n + 2) ÷ 3
+        av = zeros(UInt64, n); av[k+1:2k] .= typemax(UInt64); av[1] = 1; av[n] = 1
+        check(n, amem(av), amem(rand(rng, UInt64, n)))
+        # negative on both sides (signs cancel)
+        check(n, amem(av), amem(copy(av)))
+    end
+    # zero blocks: a0 == 0 and a2 sparse
+    n = T3 + 1
+    av = zeros(UInt64, n); av[end] = 1; av[2(n+2)÷3] = 5
+    check(n, amem(av), amem(rand(rng, UInt64, n)))
+end
+
+@testset "sqr_toom3!" begin
+    rng = MersenneTwister(37)
+    T3 = SQR_TOOM3_THRESHOLD
+    check(n, a) = begin
+        r = Memory{UInt64}(undef, 2n)
+        scratch = Memory{UInt64}(undef, sqr_scratch_len(n))
+        sqr_toom3!(r, 0, a, 0, n, scratch, 0)
+        @test atoref(r, 0, 2n) == atoref(a, 0, n)^2
+    end
+    for n in (T3, T3 + 1, T3 + 2, 2T3, 3T3 + 1), trial in 1:5
+        check(n, amem(rand(rng, UInt64, n)))
+    end
+    for n in (T3, T3 + 1)
+        check(n, amem(fill(typemax(UInt64), n)))
+        k = (n + 2) ÷ 3
+        av = zeros(UInt64, n); av[k+1:2k] .= typemax(UInt64); av[1] = 1; av[n] = 1
+        check(n, amem(av))   # negative eval at -1 (squared away)
+    end
+end
+
+@testset "mul!/sqr! through the Toom-3 range" begin
+    rng = MersenneTwister(41)
+    T3 = MUL_TOOM3_THRESHOLD
+    # balanced and unbalanced end-to-end sizes that exercise the toom path
+    for (m, n) in ((T3, T3), (2T3 + 1, 2T3 + 1), (3T3, T3 + 2), (2T3 + T3 ÷ 2, T3 + 1)),
+        trial in 1:3
+        a = amem(rand(rng, UInt64, m)); b = amem(rand(rng, UInt64, n))
+        r = Memory{UInt64}(undef, m + n)
+        mul!(r, 0, a, 0, m, b, 0, n)
+        @test atoref(r, 0, m + n) == atoref(a, 0, m) * atoref(b, 0, n)
+    end
+    for n in (SQR_TOOM3_THRESHOLD, 2SQR_TOOM3_THRESHOLD + 1), trial in 1:3
+        a = amem(rand(rng, UInt64, n))
+        r = Memory{UInt64}(undef, 2n)
+        sqr!(r, 0, a, 0, n)
+        @test atoref(r, 0, 2n) == atoref(a, 0, n)^2
     end
 end
 

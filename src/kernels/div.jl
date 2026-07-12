@@ -207,6 +207,24 @@ function divrem_1!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int, d
     return rem >> l
 end
 
+# Exact division by 3 (Jebelean): r[1..n] = a[1..n] / 3, valid only when 3
+# divides the n-limb value. Low-to-high: each quotient limb is s·3⁻¹ mod β
+# (s = current limb minus incoming borrow), and the borrow forward is
+# mulhi(q, 3) plus the subtraction's own borrow — no division instruction.
+# r may alias a at the same offset. Inherently serial (2 mul + adds per limb),
+# but exactness makes it ~3x cheaper than divrem_1! by 3.
+@inline function divexact_by3!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    inv3 = 0xaaaaaaaaaaaaaaab   # 3⁻¹ mod 2⁶⁴
+    brw = zero(Limb)
+    @inbounds for i in 1:n
+        s, o = Base.sub_with_overflow(a[ao+i], brw)
+        q = s * inv3
+        r[ro+i] = q
+        brw = (widemul(q, Limb(3)) >>> 64) % Limb + Limb(o)
+    end
+    return nothing
+end
+
 # a[1..n] ÷ ⟨d1,d0⟩ (d1 ≠ 0, n ≥ 2): writes n-1 quotient limbs (top may be
 # zero), returns the remainder (r1, r0). The two-limb remainder window stays in
 # registers and unnormalized divisors are handled by shifting the numerator on

@@ -219,6 +219,32 @@ end
     end
 end
 
+using NativeBigInt: divexact_by3!
+
+@testset "divexact_by3!" begin
+    rng = MersenneTwister(19)
+    for n in (1, 2, 3, 9, 40), trial in 1:30
+        # random n-limb multiple of 3 (top limb may be zero after ÷3·3 dance)
+        x = (toref(mem(rand(rng, UInt64, n)), 0, n) ÷ 3) * 3
+        a = mem(zeros(UInt64, n))
+        for i in 1:n; a[i] = UInt64((x >> (64 * (i - 1))) & typemax(UInt64)); end
+        r = Memory{UInt64}(undef, n)
+        divexact_by3!(r, 0, a, 0, n)
+        @test toref(r, 0, n) == x ÷ 3
+        # in-place
+        divexact_by3!(a, 0, a, 0, n)
+        @test toref(a, 0, n) == x ÷ 3
+    end
+    # borrow-heavy pattern: 3 * (β^n - 1) / 3 round trip on all-ones limbs
+    n = 6
+    ones_ = (big(1) << (64n)) - 1
+    x = (ones_ ÷ 3) * 3
+    a = mem(zeros(UInt64, n))
+    for i in 1:n; a[i] = UInt64((x >> (64 * (i - 1))) & typemax(UInt64)); end
+    divexact_by3!(a, 0, a, 0, n)
+    @test toref(a, 0, n) == x ÷ 3
+end
+
 @testset "invert_limb / div_2by1" begin
     rng = MersenneTwister(11)
     β = big(1) << 64
