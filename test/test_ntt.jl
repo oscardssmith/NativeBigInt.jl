@@ -145,3 +145,13 @@ end
         @test BigInt(x * -x) == -(a^2)
     end
 end
+
+@testset "mpn-level ntt dispatch" begin
+    # ^ and isqrt reach the NTT through mul!/sqr! on raw limb buffers, not
+    # through Base.:* — this is what NBig-level dispatch would miss
+    rng = MersenneTwister(0x3717)
+    a = abs(ntt_randbig(rng, 900))
+    @test BigInt(NBig(a)^3) == a^3
+    d = abs(ntt_randbig(rng, 2400))
+    @test BigInt(isqrt(NBig(d))) == isqrt(d)
+end

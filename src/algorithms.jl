@@ -107,6 +107,9 @@ function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
     if n < thr
         return sqr_basecase!(r, ro, a, ao, n)
     end
+    if 2n >= NTT_MUL_SUM
+        return ntt_sqr!(r, ro, a, ao, n)
+    end
     scratch = Memory{Limb}(undef, kar_scratch_len(n, thr))
     kar_sqr!(r, ro, a, ao, n, scratch, 0, thr)
     return nothing
@@ -119,6 +122,9 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
               b::Memory{Limb}, bo::Int, n::Int, thr::Int=KARATSUBA_THRESHOLD)
     if n < thr
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
+    end
+    if n >= NTT_MUL_MIN && m + n >= NTT_MUL_SUM
+        return ntt_mul!(r, ro, a, ao, m, b, bo, n)
     end
     scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n, thr))
     kar_mul!(r, ro, a, ao, b, bo, n, scratch, 2n, thr)

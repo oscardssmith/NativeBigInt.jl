@@ -751,12 +751,12 @@ function ntt_params(bits_a::Int, bits_b::Int)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# split the first `nch` b-bit chunks of an n-limb magnitude into a
-# zero-padded length-N coefficient vector.  The main loop reads a two-limb
-# window branch-free (Julia defines x << 64 == 0, so sh == 0 needs no
-# special case); only the last few chunks, where limbs[w+2] may not exist,
-# take the guarded path.
-function ntt_pack(limbs::Memory{Limb}, n::Int, b::Int, nch::Int, N::Int)
+# split the first `nch` b-bit chunks of the n-limb magnitude at limbs[lo+1..]
+# into a zero-padded length-N coefficient vector.  The main loop reads a
+# two-limb window branch-free (Julia defines x << 64 == 0, so sh == 0 needs
+# no special case); only the last few chunks, where limbs[lo+w+2] may not
+# exist, take the guarded path.
+function ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::Int)
     x = zeros(UInt64, N)
     mask = (UInt64(1) << b) - 1
     imax = min(nch - 1, (64 * (n - 1) - 1) ÷ b)   # b*i < 64(n-1) ⟹ w+2 <= n
@@ -764,35 +764,37 @@ function ntt_pack(limbs::Memory{Limb}, n::Int, b::Int, nch::Int, N::Int)
         bit = i * b
         w = bit >> 6
         sh = bit & 63
-        c = (limbs[w+1] >>> sh) | (limbs[w+2] << (64 - sh))
+        c = (limbs[lo+w+1] >>> sh) | (limbs[lo+w+2] << (64 - sh))
         x[i+1] = c & mask
     end
     @inbounds for i in imax+1:nch-1
         bit = i * b
         w = bit >> 6
         sh = bit & 63
-        c = limbs[w+1] >>> sh
+        c = limbs[lo+w+1] >>> sh
         if sh + b > 64 && w + 2 <= n
-            c |= limbs[w+2] << (64 - sh)
+            c |= limbs[lo+w+2] << (64 - sh)
         end
         x[i+1] = c & mask
     end
     return x
 end
 
-# Accumulate coefficients x[1:nconv] (each < 2^63) into r as Σ x[i+1]·2^(b·i).
-# Coefficients arrive in increasing bit order, so a streaming 128-bit
-# accumulator absorbs all carries: between flushes the pending contributions
-# total < 2^128 (each added term is < 2^(63+64) and successive terms shift
-# up by b), and each iteration needs at most one flush since b <= 32 < 64.
-function ntt_unpack!(r::Memory{Limb}, rn::Int, x::Vector{UInt64}, nconv::Int, b::Int)
+# Accumulate coefficients x[1:nconv] (each < 2^63) into r[ro+1..ro+rn] as
+# Σ x[i+1]·2^(b·i).  Coefficients arrive in increasing bit order, so a
+# streaming 128-bit accumulator absorbs all carries: between flushes the
+# pending contributions total < 2^128 (each added term is < 2^(63+64) and
+# successive terms shift up by b), and each iteration needs at most one
+# flush since b <= 32 < 64.
+function ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{UInt64},
+                     nconv::Int, b::Int)
     acc = UInt128(0)
     outw = 1
     outbit = 0
     @inbounds for i in 0:nconv-1
         s = i * b - outbit
         if s >= 64
-            r[outw] = acc % UInt64
+            r[ro+outw] = acc % UInt64
             acc >>= 64
             outw += 1
             outbit += 64
@@ -802,7 +804,7 @@ function ntt_unpack!(r::Memory{Limb}, rn::Int, x::Vector{UInt64}, nconv::Int, b:
     end
     # drain the accumulator and zero-fill the rest (the product fits rn limbs)
     @inbounds while outw <= rn
-        r[outw] = acc % UInt64
+        r[ro+outw] = acc % UInt64
         acc >>= 64
         outw += 1
     end
@@ -810,27 +812,16 @@ function ntt_unpack!(r::Memory{Limb}, rn::Int, x::Vector{UInt64}, nconv::Int, b:
 end
 
 # ---------------------------------------------------------------------------
-# Dispatch thresholds for Base.:* (benchmark-tuned via bench/bench_ntt.jl):
-# the NTT beats Karatsuba from ~800 balanced limbs, and for unbalanced
-# operands only once the smaller one is substantial (Karatsuba's unbalanced
-# path is ~max·min^0.585 while the NTT pays for the combined length).
+# mpn-layer entry points.  mul!/sqr! in algorithms.jl dispatch here above the
+# thresholds (benchmark-tuned via bench/bench_ntt.jl): the NTT beats
+# Karatsuba from ~800 balanced limbs, and for unbalanced operands only once
+# the smaller one is substantial (Karatsuba's unbalanced path is
+# ~max·min^0.585 while the NTT pays for the combined length).
 const NTT_MUL_MIN = 256    # smaller operand at least this many limbs
 const NTT_MUL_SUM = 1792   # combined limb count at least this
 
-# Multiply via the Goldilocks NTT; falls back to `*` below NTT sizes.
-function ntt_mul(a::NBig, b::NBig)
-    (iszero(a) || iszero(b)) && return NBig(0, EMPTY_LIMBS)
-    la, lb = nlimbs(a), nlimbs(b)
-    (la < 16 || lb < 16) && return a * b
-    bits_a = 64 * (la - 1) + Base.top_set_bit(@inbounds a.limbs[la])
-    bits_b = 64 * (lb - 1) + Base.top_set_bit(@inbounds b.limbs[lb])
-    bch, N = ntt_params(bits_a, bits_b)
-    plan = ntt_plan(N)
-    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
-    xa = ntt_pack(a.limbs, la, bch, nca, N)
-    xb = ntt_pack(b.limbs, lb, bch, ncb, N)
-    ntt_fwd!(xa, plan)
-    ntt_fwd!(xb, plan)
+# lanewise xa .= xa .* xb in GF(p); N is a supported transform length
+function ntt_pointwise!(xa::Vector{UInt64}, xb::Vector{UInt64})
     n = length(xa)
     i = 1
     if n >= 8
@@ -843,41 +834,64 @@ function ntt_mul(a::NBig, b::NBig)
         xa[i] = gf_mul(xa[i], xb[i])
         i += 1
     end
-    ntt_inv!(xa, plan)
-    rn = la + lb
-    r = Memory{Limb}(undef, rn)
-    ntt_unpack!(r, rn, xa, nca + ncb - 1, bch)
-    return nbig_from_limbs(sign(a) * sign(b), r, rn)
+    return xa
 end
 
-# Square via the Goldilocks NTT: one forward transform instead of two.
-# Returns the (nonnegative) square of the magnitude.
+# bit length of the m-limb magnitude at a[ao+1..]; tolerates an unnormalized
+# (zero) top limb, in which case it's a valid upper bound
+@inline ntt_bits(a::Memory{Limb}, ao::Int, m::Int) =
+    max(64 * (m - 1) + Base.top_set_bit(@inbounds a[ao+m]), 1)
+
+# r[ro+1..ro+m+n] = a[ao+1..ao+m] * b[bo+1..bo+n]; r must not alias a or b
+function ntt_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
+                  b::Memory{Limb}, bo::Int, n::Int)
+    bits_a = ntt_bits(a, ao, m)
+    bits_b = ntt_bits(b, bo, n)
+    bch, N = ntt_params(bits_a, bits_b)
+    plan = ntt_plan(N)
+    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
+    xa = ntt_pack(a, ao, m, bch, nca, N)
+    xb = ntt_pack(b, bo, n, bch, ncb, N)
+    ntt_fwd!(xa, plan)
+    ntt_fwd!(xb, plan)
+    ntt_pointwise!(xa, xb)
+    ntt_inv!(xa, plan)
+    ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch)
+    return nothing
+end
+
+# r[ro+1..ro+2n] = a[ao+1..ao+n]^2 with one forward transform instead of two;
+# r must not alias a
+function ntt_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    bits = ntt_bits(a, ao, n)
+    bch, N = ntt_params(bits, bits)
+    plan = ntt_plan(N)
+    nca = cld(bits, bch)
+    xa = ntt_pack(a, ao, n, bch, nca, N)
+    ntt_fwd!(xa, plan)
+    ntt_pointwise!(xa, xa)
+    ntt_inv!(xa, plan)
+    ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch)
+    return nothing
+end
+
+# NBig-level wrappers (used by the tests and benchmarks; production traffic
+# reaches the NTT through mul!/sqr!'s threshold dispatch)
+function ntt_mul(a::NBig, b::NBig)
+    (iszero(a) || iszero(b)) && return NBig(0, EMPTY_LIMBS)
+    la, lb = nlimbs(a), nlimbs(b)
+    (la < 16 || lb < 16) && return a * b
+    r = Memory{Limb}(undef, la + lb)
+    ntt_mul!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
+end
+
+# the (nonnegative) square of a's magnitude
 function ntt_square(a::NBig)
     iszero(a) && return NBig(0, EMPTY_LIMBS)
     la = nlimbs(a)
     la < 16 && return a * a
-    bits = 64 * (la - 1) + Base.top_set_bit(@inbounds a.limbs[la])
-    bch, N = ntt_params(bits, bits)
-    plan = ntt_plan(N)
-    nca = cld(bits, bch)
-    xa = ntt_pack(a.limbs, la, bch, nca, N)
-    ntt_fwd!(xa, plan)
-    n = length(xa)
-    i = 1
-    if n >= 8
-        @inbounds while i + 7 <= n
-            v = SIMD.vload(V8, xa, i)
-            SIMD.vstore(gf_mulv(v, v), xa, i)
-            i += 8
-        end
-    end
-    @inbounds while i <= n
-        xa[i] = gf_mul(xa[i], xa[i])
-        i += 1
-    end
-    ntt_inv!(xa, plan)
-    rn = 2la
-    r = Memory{Limb}(undef, rn)
-    ntt_unpack!(r, rn, xa, 2nca - 1, bch)
-    return nbig_from_limbs(1, r, rn)
+    r = Memory{Limb}(undef, 2la)
+    ntt_sqr!(r, 0, a.limbs, 0, la)
+    return nbig_from_limbs(1, r, 2la)
 end
