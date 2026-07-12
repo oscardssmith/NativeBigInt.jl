@@ -784,14 +784,15 @@ end
 # chunk width and transform length against the CRT modulus p1·p2.  The bound
 # min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
 # overflows UInt128 at large b with large operands, and the descending search
-# visits large b first regardless of operand size.  Chunks < 2^48 < p2 < p1
-# are already canonical residues mod both primes, so one pack serves both.
-function fp_ntt_params2(bits_a::Int, bits_b::Int)
-    for b in 48:-1:1
+# visits large b first regardless of operand size.  The search starts at the
+# largest b keeping chunks below both primes (48 here), so one pack serves
+# both residues.
+function fp_ntt_params2(bits_a::Int, bits_b::Int, F1::FpCtx, F2::FpCtx)
+    for b in Base.top_set_bit(min(F1.pi, F2.pi))-1:-1:1
         nca = cld(bits_a, b)
         ncb = cld(bits_b, b)
         if UInt128(min(nca, ncb)) <=
-           (UInt128(FP_CTX1.pi) * FP_CTX2.pi - 1) ÷ (UInt128(2)^b - 1)^2
+           (UInt128(F1.pi) * F2.pi - 1) ÷ (UInt128(2)^b - 1)^2
             return b, ntt_len(nca + ncb - 1)
         end
     end
@@ -926,7 +927,7 @@ function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                      b::Memory{Limb}, bo::Int, n::Int)
     bits_a = magnitude_bits(a, ao, m)
     bits_b = magnitude_bits(b, bo, n)
-    bch, N = fp_ntt_params2(bits_a, bits_b)
+    bch, N = fp_ntt_params2(bits_a, bits_b, FP_CTX1, FP_CTX2)
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
@@ -948,7 +949,7 @@ end
 
 function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     bits = magnitude_bits(a, ao, n)
-    bch, N = fp_ntt_params2(bits, bits)
+    bch, N = fp_ntt_params2(bits, bits, FP_CTX1, FP_CTX2)
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca = cld(bits, bch)
@@ -972,12 +973,13 @@ end
 # two-prime pipeline above.
 
 # chunk width and transform length: exactness needs every convolution
-# coefficient (a sum of min(nca, ncb) chunk products) below p, so b <= 24
-function fp_ntt_params(bits_a::Int, bits_b::Int)
-    for b in 24:-1:1
+# coefficient (a sum of min(nca, ncb) chunk products) below p, so the
+# search starts at the largest b with (2^b-1)^2 < p (24 here)
+function fp_ntt_params(bits_a::Int, bits_b::Int, F::FpCtx)
+    for b in (Base.top_set_bit(F.pi) - 1) >> 1:-1:1
         nca = cld(bits_a, b)
         ncb = cld(bits_b, b)
-        if UInt128(min(nca, ncb)) * (UInt128(2)^b - 1)^2 < FP_CTX1.pi
+        if UInt128(min(nca, ncb)) * (UInt128(2)^b - 1)^2 < F.pi
             return b, ntt_len(nca + ncb - 1)
         end
     end
@@ -1020,7 +1022,7 @@ function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                     b::Memory{Limb}, bo::Int, n::Int)
     bits_a = magnitude_bits(a, ao, m)
     bits_b = magnitude_bits(b, bo, n)
-    bch, N = fp_ntt_params(bits_a, bits_b)
+    bch, N = fp_ntt_params(bits_a, bits_b, FP_CTX1)
     plan = fp_ntt_plan(N, FP_CTX1)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
     xa = fp_ntt_pack(a, ao, m, bch, nca, N)
@@ -1035,7 +1037,7 @@ end
 
 function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     bits = magnitude_bits(a, ao, n)
-    bch, N = fp_ntt_params(bits, bits)
+    bch, N = fp_ntt_params(bits, bits, FP_CTX1)
     plan = fp_ntt_plan(N, FP_CTX1)
     nca = cld(bits, bch)
     xa = fp_ntt_pack(a, ao, n, bch, nca, N)
