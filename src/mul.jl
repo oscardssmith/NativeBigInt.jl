@@ -11,19 +11,19 @@
 # basecase longer.
 const MUL_KARATSUBA_THRESHOLD = 29
 const SQR_KARATSUBA_THRESHOLD = 52
-# Karatsuba → two-prime fp NTT: after the SIMD-shift unpack, fp NTT wins
-# from ~256 balanced limbs (the 224-336 band zigzags ±7% with transform-
-# length snapping; 256 is the net-positive cut for mul and sqr alike).
-# The two-prime engine also wins over single-prime at every size above
-# this line (its transforms are 2/2.5 the points since b ≈ 43 vs ≈ 17-24;
-# only linear overhead ever favored single-prime), so dispatch is
-# fp2-only.  For unbalanced operands the NTT needs the smaller one
-# substantial (the chunked Karatsuba path is ~max·min^0.585 while the NTT
-# pays for the combined length); at min = 96 the NTT wins for every max
-# except a ~4% tie at max ≈ 512, and by min = 120 it wins ~2x at large max.
+# Karatsuba → two-prime fp NTT: balanced, the NTT ties Karatsuba at ~224
+# limbs and wins at every size above (worst post-transform-step band ~0.90,
+# 10-30% wins through 240-256 that a higher cut would forfeit).  The
+# two-prime engine also wins over single-prime at every size above this
+# line (its transforms are 2/2.5 the points since b ≈ 43 vs ≈ 17-24; only
+# linear overhead ever favored single-prime), so dispatch is fp2-only.
+# For unbalanced operands the NTT needs the smaller one substantial (the
+# chunked Karatsuba path is ~max·min^0.585 while the NTT pays for the
+# combined length); at min = 96 the admitted region wins throughout
+# (worst ~0.92 just past a transform-length step).
 const MUL_FPNTT_MIN = 96         # smaller operand at least this many limbs
-const MUL_FPNTT_THRESHOLD = 256  # average operand at least this many limbs
-const SQR_FPNTT_THRESHOLD = 256  # operand at least this many limbs
+const MUL_FPNTT_THRESHOLD = 224  # average operand at least this many limbs
+const SQR_FPNTT_THRESHOLD = 224  # operand at least this many limbs
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.

@@ -1,5 +1,5 @@
 # Local-only: mul! vs __gmpn_mul. Run: julia --startup-file=no --project=. bench/bench_mul.jl
-# Above the NTT threshold mul! dispatches to mul_fpntt!; the kara column
+# Above the NTT threshold mul! dispatches to mul_fpntt2!; the kara column
 # calls mul_kar! directly to time the path the NTT replaced, for tuning
 # MUL_FPNTT_MIN/MUL_FPNTT_THRESHOLD.
 using NativeBigInt, BenchmarkTools, Random

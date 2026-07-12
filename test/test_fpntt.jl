@@ -1,11 +1,12 @@
-# fp NTT multiplication: Float64 field arithmetic, transform, mul_fpntt!/
-# sqr_fpntt!.  The engine's correctness rests on rounding-error analysis, so
-# beyond the differential net these tests hammer the documented lazy-range
-# bounds (mulmod |x| <= 4p, reduce |x| <= 8p) where random in-range inputs
-# would never stress the magic-constant round.
+# fp NTT multiplication: Float64 field arithmetic, transform, and the
+# two-prime CRT engine mul_fpntt2!/sqr_fpntt2!.  The engine's correctness
+# rests on rounding-error analysis, so beyond the differential net these
+# tests hammer the documented lazy-range bounds (mulmod |x| <= 4p, reduce
+# |x| <= 8p) where random in-range inputs would never stress the
+# magic-constant round.
 using NativeBigInt: FP_CTX1, FpCtx, fp_mulmod, fp_mulmod2,
                     fp_reduce, fp_round, fpi_pow, fpi_inv, fp_ntt_plan,
-                    fp_ntt_fwd!, fp_ntt_inv!, mul_fpntt!, sqr_fpntt!, VF8,
+                    fp_ntt_fwd!, fp_ntt_inv!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
 
@@ -14,22 +15,6 @@ const FP_P = FP_CTX1.p
 
 # canonical residue in [0, p) of a balanced-representation value
 fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(v))
-
-function fpntt_mul(a::NBig, b::NBig)
-    (iszero(a) || iszero(b)) && return NBig(0)
-    la, lb = nlimbs(a), nlimbs(b)
-    r = Memory{Limb}(undef, la + lb)
-    mul_fpntt!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
-    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
-end
-
-function fpntt_square(a::NBig)
-    iszero(a) && return NBig(0)
-    la = nlimbs(a)
-    r = Memory{Limb}(undef, 2la)
-    sqr_fpntt!(r, 0, a.limbs, 0, la)
-    return nbig_from_limbs(1, r, 2la)
-end
 
 @testset "fp field arithmetic" begin
     P = big(FP_PI)
@@ -125,38 +110,16 @@ function fpntt_randbig(rng, n::Int)
     return rand(rng, Bool) ? -mag : mag
 end
 
-@testset "differential fpntt_mul" begin
-    rng = MersenneTwister(0x9f57)
-    @test iszero(fpntt_mul(NBig(0), NBig(12345)))
-    @test iszero(fpntt_mul(NBig(-7), NBig(0)))
-    @test BigInt(fpntt_mul(NBig(-3), NBig(5))) == -15
-
-    for (na, nb) in ((1, 1), (3, 2), (15, 15), (16, 16), (17, 40), (100, 100),
-                     (255, 257), (1024, 1024), (2000, 100), (5000, 5000),
-                     (190, 190), (600, 600), (1100, 1050), (2500, 2500))
-        for trial in 1:(na * nb > 10^5 ? 2 : 8)
-            a = fpntt_randbig(rng, na)
-            b = fpntt_randbig(rng, nb)
-            @test BigInt(fpntt_mul(NBig(a), NBig(b))) == a * b
-        end
-    end
-end
-
-@testset "fpntt_square and * integration" begin
+@testset "fpntt * integration" begin
     rng = MersenneTwister(0x5f2e)
-    @test iszero(fpntt_square(NBig(0)))
-    for n in (1, 5, 16, 100, 700, 1024, 2500)
-        a = fpntt_randbig(rng, n)
-        @test BigInt(fpntt_square(NBig(a))) == a^2
-    end
-    # `*` dispatches to the fp NTT above the (new, lower) thresholds; sizes
-    # straddle MUL_FPNTT_THRESHOLD = 352 and SQR_FPNTT_THRESHOLD = 448
-    for (na, nb) in ((340, 340), (352, 352), (500, 300), (1200, 800), (5000, 4000))
+    # `*` dispatches to the fp NTT above the thresholds; sizes straddle
+    # MUL_FPNTT_THRESHOLD = SQR_FPNTT_THRESHOLD = 224
+    for (na, nb) in ((220, 220), (224, 224), (500, 300), (1200, 800), (5000, 4000))
         a = fpntt_randbig(rng, na)
         b = fpntt_randbig(rng, nb)
         @test BigInt(NBig(a) * NBig(b)) == a * b
     end
-    for n in (440, 448, 460, 1024, 3000)
+    for n in (220, 224, 230, 1024, 3000)
         a = fpntt_randbig(rng, n)
         x = NBig(a)
         @test BigInt(x * x) == a^2
@@ -174,7 +137,7 @@ end
 end
 
 # --------------------------------------------------------------------------
-# Two-prime CRT extension
+# Two-prime CRT engine
 
 using NativeBigInt: FP_CTX2, FP_P1INV2, mul_fpntt2!, sqr_fpntt2!,
                     fp_ntt_unpack2!, fp_ntt_params2

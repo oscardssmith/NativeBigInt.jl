@@ -2,9 +2,7 @@
 # coefficients live in Float64, products use the FMA error-free transform,
 # and quotients use the magic-constant round.  The operands are split into
 # b-bit chunks and the convolution is computed by CRT over two ~2^49 primes
-# (working modulus p1·p2 ≈ 2^98.97, so b ≈ 41-44); a single-prime pipeline
-# over p1 alone is kept at the bottom of the file as an unwired test
-# cross-check.
+# (working modulus p1·p2 ≈ 2^98.97, so b ≈ 41-44).
 #
 # Arithmetic model.  Values are exact integers in balanced representation,
 # |x| < a few p.  Every operation is exactly correct (not approximately):
@@ -146,10 +144,28 @@ struct FpOddStage
     tw::Vector{Vector{Float64}};  twp::Vector{Vector{Float64}}
 end
 
+# Winograd 5-point constants from a primitive 5th root c.  With
+# a = c + c^4, b = c^2 + c^3 (a + b = -1, the roots sum to zero):
+#   k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
+# all canonical residues mod p (see fp_dft5 for the combine they feed).
+function fp_dft5_consts(c::UInt64, F::FpCtx)
+    p = F.pi
+    mulm(x, y) = UInt64(UInt128(x) * y % p)
+    subm(x, y) = x >= y ? x - y : x + p - y
+    c2 = mulm(c, c); c3 = mulm(c2, c); c4 = mulm(c3, c)
+    inv2 = fpi_inv(UInt64(2), p)
+    inv4 = mulm(inv2, inv2)
+    a = (c + c4) % p
+    b = (c2 + c3) % p
+    return Float64[p - inv4, mulm(subm(a, b), inv4),
+                   mulm(subm(c, c4), inv2), mulm(subm(c2, c3), inv2)]
+end
+
 function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
     c = fpi_pow(root, Q, F.pi)
-    rot = [Float64(fpi_pow(c, r, F.pi)) for r in 1:m-1]
+    rot = m == 5 ? fp_dft5_consts(c, F) :
+          [Float64(fpi_pow(c, r, F.pi)) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
         ωr = fpi_pow(root, r, F.pi)
@@ -326,31 +342,41 @@ function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     return x
 end
 
-# order-5 DFT combine; y0 comes back unreduced (callers reduce before storing)
-@inline function fp_dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4, c1p, c2p, c3p, c4p, F::FpCtx)
-    s = (t1 + t2) + (t3 + t4)
-    y0 = t0 + s
-    y1 = t0 + ((fp_mulmod(t1, c1, c1p, F) + fp_mulmod(t2, c2, c2p, F)) +
-               (fp_mulmod(t3, c3, c3p, F) + fp_mulmod(t4, c4, c4p, F)))
-    y2 = t0 + ((fp_mulmod(t1, c2, c2p, F) + fp_mulmod(t2, c4, c4p, F)) +
-               (fp_mulmod(t3, c1, c1p, F) + fp_mulmod(t4, c3, c3p, F)))
-    y3 = t0 + ((fp_mulmod(t1, c3, c3p, F) + fp_mulmod(t2, c1, c1p, F)) +
-               (fp_mulmod(t3, c4, c4p, F) + fp_mulmod(t4, c2, c2p, F)))
-    y4 = t0 + ((fp_mulmod(t1, c4, c4p, F) + fp_mulmod(t2, c3, c3p, F)) +
-               (fp_mulmod(t3, c2, c2p, F) + fp_mulmod(t4, c1, c1p, F)))
-    return y0, y1, y2, y3, y4
+# Winograd order-5 DFT combine, 6 mulmods (the DFT matrix needs 16).
+# With ω the stage's 5th root, S = (x1+x4) + (x2+x3), D = (x1+x4) - (x2+x3):
+#   y1 + y4 = 2·x0 - S/2 + ((a-b)/2)·D          a = ω + ω^4, b = ω^2 + ω^3
+#   y1 - y4 = (ω - ω^4)·t3 + (ω^2 - ω^3)·t4     t3 = x1 - x4, t4 = x2 - x3
+#   y2 + y3 = 2·x0 - S/2 - ((a-b)/2)·D
+#   y2 - y3 = (ω^2 - ω^3)·t3 - (ω - ω^4)·t4
+# halved into k1..k4 (fp_dft5_consts) so each yi is a direct sum.  Bounds:
+# for inputs |xi| <= p (worst case: a reduced radix-3 output column), S and D
+# stay < 4p (mulmod-legal); reducing x0 + k1·S closes the chain, leaving
+# every output <= ~3.5p — legal as the following twiddle-mulmod argument
+# (forward) and under fp_reduce's 8p on the unpack/next-stage load (inverse).
+# y0 comes back unreduced (callers reduce before storing).
+@inline function fp_dft5(x0, x1, x2, x3, x4, k1, k2, k3, k4, k1p, k2p, k3p, k4p, F::FpCtx)
+    t1 = x1 + x4; t3 = x1 - x4
+    t2 = x2 + x3; t4 = x2 - x3
+    S = t1 + t2;  D = t1 - t2
+    y0 = x0 + S
+    r = fp_reduce(x0 + fp_mulmod(S, k1, k1p, F), F)
+    q = fp_mulmod(D, k2, k2p, F)
+    g1 = fp_mulmod(t3, k3, k3p, F) + fp_mulmod(t4, k4, k4p, F)
+    g2 = fp_mulmod(t3, k4, k4p, F) - fp_mulmod(t4, k3, k3p, F)
+    u = r + q; v = r - q
+    return y0, u + g1, v + g2, v - g2, u - g1
 end
 
 function fp_radix5_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
-    c1, c2, c3, c4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
-    c1p, c2p, c3p, c4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
+    k1, k2, k3, k4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
+    k1p, k2p, k3p, k4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
     w = st.tw
     wp = st.twp
     j = 0
     if Q >= 8
-        v1, v2, v3, v4 = VF8(c1), VF8(c2), VF8(c3), VF8(c4)
-        v1p, v2p, v3p, v4p = VF8(c1p), VF8(c2p), VF8(c3p), VF8(c4p)
+        v1, v2, v3, v4 = VF8(k1), VF8(k2), VF8(k3), VF8(k4)
+        v1p, v2p, v3p, v4p = VF8(k1p), VF8(k2p), VF8(k3p), VF8(k4p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
             a = SIMD.vload(VF8, x, i0)
@@ -375,7 +401,7 @@ function fp_radix5_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     @inbounds while j < Q
         i0 = o + j + 1
         y0, y1, y2, y3, y4 = fp_dft5(x[i0], x[i0+Q], x[i0+2Q], x[i0+3Q], x[i0+4Q],
-                                     c1, c2, c3, c4, c1p, c2p, c3p, c4p, F)
+                                     k1, k2, k3, k4, k1p, k2p, k3p, k4p, F)
         x[i0] = fp_reduce(y0, F)
         x[i0+Q] = fp_mulmod(y1, w[1][j+1], wp[1][j+1], F)
         x[i0+2Q] = fp_mulmod(y2, w[2][j+1], wp[2][j+1], F)
@@ -388,14 +414,14 @@ end
 
 function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
-    c1, c2, c3, c4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
-    c1p, c2p, c3p, c4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
+    k1, k2, k3, k4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
+    k1p, k2p, k3p, k4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
     w = st.tw
     wp = st.twp
     j = 0
     if Q >= 8
-        v1, v2, v3, v4 = VF8(c1), VF8(c2), VF8(c3), VF8(c4)
-        v1p, v2p, v3p, v4p = VF8(c1p), VF8(c2p), VF8(c3p), VF8(c4p)
+        v1, v2, v3, v4 = VF8(k1), VF8(k2), VF8(k3), VF8(k4)
+        v1p, v2p, v3p, v4p = VF8(k1p), VF8(k2p), VF8(k3p), VF8(k4p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
             t0 = fp_reduce(SIMD.vload(VF8, x, i0), F)
@@ -424,8 +450,8 @@ function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
         t2 = fp_mulmod(x[i0+2Q], w[2][j+1], wp[2][j+1], F)
         t3 = fp_mulmod(x[i0+3Q], w[3][j+1], wp[3][j+1], F)
         t4 = fp_mulmod(x[i0+4Q], w[4][j+1], wp[4][j+1], F)
-        y0, y1, y2, y3, y4 = fp_dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4,
-                                     c1p, c2p, c3p, c4p, F)
+        y0, y1, y2, y3, y4 = fp_dft5(t0, t1, t2, t3, t4, k1, k2, k3, k4,
+                                     k1p, k2p, k3p, k4p, F)
         x[i0] = fp_reduce(y0, F)
         x[i0+Q] = y1
         x[i0+2Q] = y2
@@ -722,13 +748,21 @@ end
 # (ntt_len), split limbs into chunk coefficients (fp_ntt_pack), and multiply
 # lanewise between the transforms (fp_ntt_pointwise!).
 
-# smallest supported transform length >= T: m·2^k, m in (1, 3, 5, 15), k >= 2
+# smallest selected transform length >= T: m·2^k, m in (1, 3, 5), plus
+# m = 15 at large sizes only.  A 15·2^k transform pays two separate strided
+# odd passes: below ~2^14 points that overhead loses outright to the
+# 2^(k+4) pow2 transform (fwd 480: 609ns vs 512: 382ns), but once the pow2
+# transform spills cache the fifteen independent 2^k-point blocks win big
+# (fwd+inv 1.26x at 15·2^18 vs 2^22, 1.74x at 15·2^20 vs 2^24), so the 15
+# family is admitted from its measured tie point (15·2^10 = 15360).
 function ntt_len(T::Int)
     best = nextpow(2, max(T, 4))
-    for m in (3, 5, 15)
+    for m in (3, 5)
         c = m * nextpow(2, max(cld(T, m), 4))
         c < best && (best = c)
     end
+    c = 15 * nextpow(2, max(cld(T, 15), 4))
+    c >= 15360 && c < best && (best = c)
     return best
 end
 
@@ -962,88 +996,5 @@ function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     fp_ntt_pointwise!(xa2, xa2, FP_CTX2)
     fp_ntt_inv!(xa2, plan2)
     fp_ntt_unpack2!(r, ro, 2n, xa1, xa2, 2nca - 1, bch)
-    return nothing
-end
-
-# ---------------------------------------------------------------------------
-# Single-prime pipeline over p1 alone (b <= 24).  UNWIRED from dispatch —
-# the two-prime engine measures faster at every size above the Karatsuba
-# band — but kept as an independent pipeline through the shared transform
-# machinery for the differential tests.  Same entry-point contracts as the
-# two-prime pipeline above.
-
-# chunk width and transform length: exactness needs every convolution
-# coefficient (a sum of min(nca, ncb) chunk products) below p, so the
-# search starts at the largest b with (2^b-1)^2 < p (24 here)
-function fp_ntt_params(bits_a::Int, bits_b::Int, F::FpCtx)
-    for b in (Base.top_set_bit(F.pi) - 1) >> 1:-1:1
-        nca = cld(bits_a, b)
-        ncb = cld(bits_b, b)
-        if UInt128(min(nca, ncb)) * (UInt128(2)^b - 1)^2 < F.pi
-            return b, ntt_len(nca + ncb - 1)
-        end
-    end
-    error("unreachable: b == 1 always satisfies the bound for supported sizes")
-end
-
-# canonicalize each coefficient to [0, p) and stream limbs out.
-# Coefficients < 2^49 at b <= 24 spacing never hold more than 64 + 49 live
-# bits, so a single-UInt128 accumulator with one flushed limb per 64 output
-# bits never overflows, and (contributions being nonnegative, starting at
-# bit i·b >= outbit + 64 after each flush) every flushed limb is final.
-function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
-                        nconv::Int, b::Int, F::FpCtx)
-    acc = UInt128(0)
-    outw = 1
-    outbit = 0
-    @inbounds for i in 0:nconv-1
-        v = fp_reduce(x[i+1], F)
-        v < 0.0 && (v += F.p)
-        c = unsafe_trunc(UInt64, v)
-        s = i * b - outbit
-        if s >= 64
-            r[ro+outw] = acc % UInt64
-            acc >>= 64
-            outw += 1
-            outbit += 64
-            s -= 64
-        end
-        acc += UInt128(c) << s
-    end
-    @inbounds while outw <= rn
-        r[ro+outw] = acc % UInt64
-        acc >>= 64
-        outw += 1
-    end
-    return r
-end
-
-function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
-                    b::Memory{Limb}, bo::Int, n::Int)
-    bits_a = magnitude_bits(a, ao, m)
-    bits_b = magnitude_bits(b, bo, n)
-    bch, N = fp_ntt_params(bits_a, bits_b, FP_CTX1)
-    plan = fp_ntt_plan(N, FP_CTX1)
-    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
-    xa = fp_ntt_pack(a, ao, m, bch, nca, N)
-    xb = fp_ntt_pack(b, bo, n, bch, ncb, N)
-    fp_ntt_fwd!(xa, plan)
-    fp_ntt_fwd!(xb, plan)
-    fp_ntt_pointwise!(xa, xb, FP_CTX1)
-    fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch, FP_CTX1)
-    return nothing
-end
-
-function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
-    bits = magnitude_bits(a, ao, n)
-    bch, N = fp_ntt_params(bits, bits, FP_CTX1)
-    plan = fp_ntt_plan(N, FP_CTX1)
-    nca = cld(bits, bch)
-    xa = fp_ntt_pack(a, ao, n, bch, nca, N)
-    fp_ntt_fwd!(xa, plan)
-    fp_ntt_pointwise!(xa, xa, FP_CTX1)
-    fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch, FP_CTX1)
     return nothing
 end

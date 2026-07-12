@@ -2,7 +2,7 @@
 # SQR_KARATSUBA_THRESHOLD (basecase vs Karatsuba) and SQR_FPNTT_THRESHOLD
 # (Karatsuba vs NTT) tuning.
 using NativeBigInt, BenchmarkTools
-using NativeBigInt: Limb, sqr!, sqr_basecase!, sqr_kar!, sqr_fpntt!,
+using NativeBigInt: Limb, sqr!, sqr_basecase!, sqr_kar!, sqr_fpntt2!,
                     kar_scratch_len, sqr_scratch_len, mul!
 
 g_sqr!(r, a, n) = ccall((:__gmpn_sqr, :libgmp), Cvoid,
@@ -40,7 +40,7 @@ for n in (256, 320, 384, 448, 512, 640, 768, 1024)
     r = Memory{Limb}(undef, 2n)
     s = Memory{Limb}(undef, sqr_scratch_len(n))
     tk = @belapsed sqr_kar!($r, 0, $a, 0, $n, $s, 0)
-    tn = @belapsed sqr_fpntt!($r, 0, $a, 0, $n)
+    tn = @belapsed sqr_fpntt2!($r, 0, $a, 0, $n)
     println(rpad(n, 6), lpad(round(tk*1e6, digits=1), 8), " us kar",
             lpad(round(tn*1e6, digits=1), 8), " us ntt",
             lpad(round(tn/tk, digits=2), 7))
