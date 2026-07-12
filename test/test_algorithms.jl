@@ -1,5 +1,6 @@
 # Algorithm tests
-using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, MUL_KARATSUBA_THRESHOLD, divrem!
+using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, MUL_KARATSUBA_THRESHOLD, divrem!,
+    divrem_dc!, invert_pi1, DC_DIV_THRESHOLD
 using Random: MersenneTwister
 
 amem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -190,5 +191,104 @@ end
         aref < big(1) << (64n) || continue
         checkdiv(afrombig(aref, n), n, afrombig(dref, m), m)
         checkdiv(afrombig(dref - 1, m), m, afrombig(dref, m), m)   # a < d ⟹ q = 0
+    end
+end
+
+@testset "divrem_dc!" begin
+    rng = MersenneTwister(37)
+
+    # Direct divrem_dc! check with a forced-low threshold to exercise deep
+    # recursion. dref must be normalized (top bit of limb m set); numerator is
+    # nn limbs with the top limb possibly nonzero (qh convention as divrem_bc!).
+    function checkdc(aref::BigInt, dref::BigInt, nn::Int, m::Int, thr::Int)
+        u = afrombig(aref, nn)
+        d = afrombig(dref, m)
+        v = invert_pi1(d[m], d[m-1])
+        qn = nn - m
+        q = Memory{UInt64}(undef, qn)
+        qh = divrem_dc!(q, 0, u, 0, nn, d, 0, m, v, thr)
+        qref, rref = divrem(aref, dref)
+        @test (big(qh) << (64qn)) + atoref(q, 0, qn) == qref
+        @test atoref(u, 0, m) == rref
+    end
+
+    randnorm(m) = atoref(amem(rand(rng, UInt64, m)), 0, m) | (big(1) << (64m - 1))
+
+    # balanced (qn == m): random sweep, deep recursion via thr = 4
+    for trial in 1:100
+        m = rand(rng, 4:40)
+        dref = randnorm(m)
+        aref = rand(rng, big(0):(big(1) << (64 * 2m)) - 1)
+        checkdc(aref, dref, 2m, m, 4)
+    end
+
+    # qn < m: truncate-and-correct path (needs qn >= thr to take the dc branch)
+    for trial in 1:100
+        m = rand(rng, 9:40)
+        qn = rand(rng, 4:m-1)
+        dref = randnorm(m)
+        aref = rand(rng, big(0):(big(1) << (64 * (m + qn))) - 1)
+        checkdc(aref, dref, m + qn, m, 4)
+    end
+
+    # qn > m: outer block loop, all leading-block sizes s = 1..m
+    for trial in 1:100
+        m = rand(rng, 4:16)
+        qn = m + rand(rng, 1:3m)
+        dref = randnorm(m)
+        aref = rand(rng, big(0):(big(1) << (64 * (m + qn))) - 1)
+        checkdc(aref, dref, m + qn, m, 4)
+    end
+
+    # qh = 1: numerator's top m limbs >= d
+    for trial in 1:50
+        m = rand(rng, 4:20)
+        qn = rand(rng, 4:2m)
+        dref = randnorm(m)
+        aref = (dref << (64qn)) + rand(rng, big(0):(big(1) << (64qn)) - 1)
+        checkdc(aref, dref, m + qn, m, 4)
+    end
+
+    # add-back stress: all-ones divisor tails and numerators drive the
+    # block-correction (q -= 1, r += d) loops as hard as possible
+    for trial in 1:200
+        m = rand(rng, 4:24)
+        qn = rand(rng, 4:2m)
+        dv = fill(typemax(UInt64), m); dv[m] = UInt64(1) << 63
+        rand(rng) < 0.5 && (dv[m] = typemax(UInt64))
+        av = fill(typemax(UInt64), m + qn)
+        for i in 1:m+qn
+            rand(rng) < 0.25 && (av[i] = rand(rng, UInt64))
+        end
+        checkdc(atoref(amem(av), 0, m + qn), atoref(amem(dv), 0, m), m + qn, m, 4)
+    end
+
+    # exact multiples and tiny remainders
+    for trial in 1:50
+        m = rand(rng, 4:16)
+        qn = rand(rng, 4:2m)
+        dref = randnorm(m)
+        qref = rand(rng, big(0):(big(1) << (64qn)) - 1)
+        checkdc(qref * dref + rand(rng, big(0):big(1)), dref, m + qn, m, 4)
+    end
+
+    # production threshold: divrem! dispatches to dc above DC_DIV_THRESHOLD;
+    # cross-check against BigInt at sizes straddling and well above it
+    function checkdiv(a::Memory{UInt64}, n, d::Memory{UInt64}, m)
+        aref = atoref(a, 0, n); dref = atoref(d, 0, m)
+        q = Memory{UInt64}(undef, n - m + 1)
+        r = Memory{UInt64}(undef, m)
+        divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+        @test atoref(q, 0, n - m + 1) == aref ÷ dref
+        @test atoref(r, 0, m) == aref % dref
+    end
+    thr = DC_DIV_THRESHOLD
+    for (n, m) in ((2thr, thr), (2thr + 1, thr + 1), (4thr, 2thr), (6thr, thr + 3),
+                   (3thr, 2thr), (8thr, 3thr))
+        a = amem(rand(rng, UInt64, n))
+        d = amem(rand(rng, UInt64, m))
+        d[m] == 0 && (d[m] = UInt64(1))
+        rand(rng) < 0.5 && (d[m] |= UInt64(1) << 63)   # unnormalized divisor path too
+        checkdiv(a, n, d, m)
     end
 end

@@ -112,6 +112,12 @@ end
         if trial % 25 == 0
             la, lb = rand(rng, 30:100), rand(rng, 1:100)
         end
+        # and the divide-and-conquer division threshold (divisor and quotient
+        # both need to clear DC_DIV_THRESHOLD, so keep lb and la - lb large)
+        if trial % 50 == 0
+            lb = rand(rng, 60:400)
+            la = lb + rand(rng, 60:1600)
+        end
         a, b = diff_randbig(rng, la), diff_randbig(rng, lb)
         na, nb = NBig(a), NBig(b)
         @test BigInt(na + nb) == a + b
