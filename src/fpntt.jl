@@ -924,9 +924,12 @@ end
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64},
                          nconv::Int, b::Int)
-    lob1 = Vector{UInt64}(undef, 8); hib1 = Vector{UInt64}(undef, 8)
-    lob2 = Vector{UInt64}(undef, 8); hib2 = Vector{UInt64}(undef, 8)
     s2 = Memory{Limb}(undef, rn)
+    # SIMD→scalar staging: the scan reads lanes at a runtime index, and Vec
+    # lane extraction with a non-constant index compiles to a stack spill
+    # per access (measured ~30% slower than this explicit round-trip).
+    # One buffer, quarters: lo1 | hi1 | lo2 | hi2.
+    stage = Vector{UInt64}(undef, 32)
     vg, vgp = VF8(FP_G2), VF8(FP_G2P)
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
@@ -938,36 +941,21 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     outw = 1
     s = 0             # bit offset of coefficient i within the window
     i = 0
-    @inbounds while i < nconv
-        blk = min(8, nconv - i)
-        if blk == 8
-            v1 = fp_reduce(SIMD.vload(VF8, x1, i + 1), FP_CTX1)
-            v1 = SIMD.vifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
-            v2 = fp_reduce(SIMD.vload(VF8, x2, i + 1), FP_CTX2)
-            u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
-            u = SIMD.vifelse(u < 0.0, u + FP_CTX2.p, u)
-            c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
-            uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
-            sv = (UInt64(i) * ub + vlane) & UInt64(63)
-            svc = UInt64(63) - sv
-            SIMD.vstore(c1v << sv, lob1, 1)
-            SIMD.vstore((c1v >> 1) >> svc, hib1, 1)
-            SIMD.vstore(uv << sv, lob2, 1)
-            SIMD.vstore((uv >> 1) >> svc, hib2, 1)
-        else
-            for j in 1:blk
-                v1 = fp_reduce(x1[i+j], FP_CTX1)
-                v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
-                v2 = fp_reduce(x2[i+j], FP_CTX2)
-                u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), FP_G2, FP_G2P, FP_CTX2)
-                c1 = unsafe_trunc(UInt64, v1)
-                uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
-                sj = (UInt64(i + j - 1) * ub) & 63
-                lob1[j] = c1 << sj; hib1[j] = (c1 >> 1) >> (63 - sj)
-                lob2[j] = uu << sj; hib2[j] = (uu >> 1) >> (63 - sj)
-            end
-        end
-        for j in 1:blk
+    @inbounds while i + 8 <= nconv
+        v1 = fp_reduce(SIMD.vload(VF8, x1, i + 1), FP_CTX1)
+        v1 = SIMD.vifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+        v2 = fp_reduce(SIMD.vload(VF8, x2, i + 1), FP_CTX2)
+        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
+        u = SIMD.vifelse(u < 0.0, u + FP_CTX2.p, u)
+        c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
+        uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
+        sv = (UInt64(i) * ub + vlane) & UInt64(63)
+        svc = UInt64(63) - sv
+        SIMD.vstore(c1v << sv, stage, 1)
+        SIMD.vstore((c1v >> 1) >> svc, stage, 9)
+        SIMD.vstore(uv << sv, stage, 17)
+        SIMD.vstore((uv >> 1) >> svc, stage, 25)
+        for j in 1:8
             if s >= 64
                 r[ro+outw] = a01
                 s2[outw] = a02
@@ -976,15 +964,39 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                 outw += 1
                 s -= 64
             end
-            t1 = a01 + lob1[j]
-            a11 += hib1[j] + (t1 < a01)
+            t1 = a01 + stage[j]
+            a11 += stage[j+8] + (t1 < a01)
             a01 = t1
-            t2 = a02 + lob2[j]
-            a12 += hib2[j] + (t2 < a02)
+            t2 = a02 + stage[j+16]
+            a12 += stage[j+24] + (t2 < a02)
             a02 = t2
             s += b
         end
-        i += blk
+        i += 8
+    end
+    @inbounds while i < nconv
+        v1 = fp_reduce(x1[i+1], FP_CTX1)
+        v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+        v2 = fp_reduce(x2[i+1], FP_CTX2)
+        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), FP_G2, FP_G2P, FP_CTX2)
+        c1 = unsafe_trunc(UInt64, v1)
+        uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
+        if s >= 64
+            r[ro+outw] = a01
+            s2[outw] = a02
+            a01 = a11; a11 = UInt64(0)
+            a02 = a12; a12 = UInt64(0)
+            outw += 1
+            s -= 64
+        end
+        t1 = a01 + (c1 << s)
+        a11 += ((c1 >> 1) >> (63 - s)) + (t1 < a01)
+        a01 = t1
+        t2 = a02 + (uu << s)
+        a12 += ((uu >> 1) >> (63 - s)) + (t2 < a02)
+        a02 = t2
+        s += b
+        i += 1
     end
     @inbounds while outw <= rn
         r[ro+outw] = a01
