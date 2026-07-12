@@ -891,30 +891,39 @@ end
 # scalar loop is latency-bound on it (measured ~7 ns/coeff, ~30% of the whole
 # multiply); batching leaves only the integer accumulate on the critical path.
 #
-# Accumulator proof.  (hi, acc) is a 192-bit window holding the pending sum of
-# contributions to bits [outbit, outbit+192); coefficient i contributes
-# c·2^(i·b - outbit) with c < 2^99 and shift s < 64 (the flush keeps s in
-# [0, 64) since b < 64), i.e. each add is < 2^163.  Between two flushes s
-# advances by b >= 1, so there are at most 64 adds; with P' = P >> 64 at each
-# flush the pending value satisfies P < (P >> 64) + 64·2^163 at the fixed
-# point, giving P < 2^170 < 2^192 — the window never overflows, and hi gains
-# < 2^35 + 1 per add, never overflowing 64 bits within a window.  A flushed
-# limb is final: after the flush every remaining coefficient starts at bit
-# i·b >= outbit + 64, and all contributions are nonnegative, so nothing can
-# carry below its own position.
+# The 99-bit coefficients are never materialized: by linearity the product is
+#   Σ cᵢ·2^(b·i) = Σ c1ᵢ·2^(b·i) + p1 · Σ uᵢ·2^(b·i) = S1 + p1·S2,
+# so the loop streams S1 (into r) and S2 (into scratch) as two independent
+# 49-bit-coefficient sums, folded at the end by one addmul_1! pass at
+# kernel speed.  That replaces a per-coefficient 128-bit multiply and a
+# 192-bit accumulator window with two 128-bit accumulators (and gives the
+# core two independent carry chains instead of one).
+#
+# Accumulator proof (each stream).  acc is a 128-bit window holding the
+# pending sum of contributions to bits [outbit, outbit+128); coefficient i
+# contributes v·2^(i·b - outbit) with v < 2^49 and shift s < 64 (the flush
+# keeps s in [0, 64) since b < 64), i.e. each add is < 2^113.  Between two
+# flushes s advances by b >= 1, so there are at most 64 adds; with
+# P' = P >> 64 at each flush the pending value satisfies
+# P < (P >> 64) + 64·2^113 < 2^120 < 2^128 at the fixed point — the window
+# never overflows.  A flushed limb is final: after the flush every remaining
+# coefficient starts at bit i·b >= outbit + 64, and all contributions are
+# nonnegative, so nothing can carry below its own position.  The final fold
+# S1 + p1·S2 equals the true product < 2^(64·rn), so addmul_1! carries out 0.
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64},
                          nconv::Int, b::Int)
     c1buf = Vector{UInt64}(undef, 8)
     ubuf = Vector{UInt64}(undef, 8)
+    s2 = Memory{Limb}(undef, rn)
     vg, vgp = VF8(FP_G2), VF8(FP_G2P)
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
     vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
-    acc = UInt128(0)
-    hi = UInt64(0)
+    acc1 = UInt128(0)
+    acc2 = UInt128(0)
     outw = 1
-    outbit = 0
+    s = 0             # bit offset of coefficient i within the window
     i = 0
     @inbounds while i < nconv
         blk = min(8, nconv - i)
@@ -939,29 +948,28 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
             end
         end
         for j in 1:blk
-            c = UInt128(c1buf[j]) + UInt128(ubuf[j]) * FP_PI
-            s = (i + j - 1) * b - outbit
             if s >= 64
-                r[ro+outw] = acc % UInt64
-                acc = (acc >> 64) | (UInt128(hi) << 64)
-                hi = 0
+                r[ro+outw] = acc1 % UInt64
+                s2[outw] = acc2 % UInt64
+                acc1 >>= 64
+                acc2 >>= 64
                 outw += 1
-                outbit += 64
                 s -= 64
             end
-            lo = c << s
-            t = acc + lo
-            hi += ((c >> 1) >> (127 - s)) % UInt64 + (t < acc)
-            acc = t
+            acc1 += UInt128(c1buf[j]) << s
+            acc2 += UInt128(ubuf[j]) << s
+            s += b
         end
         i += blk
     end
     @inbounds while outw <= rn
-        r[ro+outw] = acc % UInt64
-        acc = (acc >> 64) | (UInt128(hi) << 64)
-        hi = 0
+        r[ro+outw] = acc1 % UInt64
+        s2[outw] = acc2 % UInt64
+        acc1 >>= 64
+        acc2 >>= 64
         outw += 1
     end
+    addmul_1!(r, ro, s2, 0, rn, FP_PI)
     return r
 end
 
