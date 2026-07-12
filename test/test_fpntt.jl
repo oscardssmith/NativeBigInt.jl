@@ -3,11 +3,14 @@
 # beyond the differential net these tests hammer the documented lazy-range
 # bounds (mulmod |x| <= 4p, reduce |x| <= 8p) where random in-range inputs
 # would never stress the magic-constant round.
-using NativeBigInt: FP_PI, FP_P, FP_CTX1, FpCtx, fp_mulmod, fp_mulmod2,
+using NativeBigInt: FP_CTX1, FpCtx, fp_mulmod, fp_mulmod2,
                     fp_reduce, fp_round, fpi_pow, fpi_inv, fp_ntt_plan,
                     fp_ntt_fwd!, fp_ntt_inv!, mul_fpntt!, sqr_fpntt!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
+
+const FP_PI = FP_CTX1.pi
+const FP_P = FP_CTX1.p
 
 # canonical residue in [0, p) of a balanced-representation value
 fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(v))
@@ -173,8 +176,10 @@ end
 # --------------------------------------------------------------------------
 # Two-prime CRT extension
 
-using NativeBigInt: FP_CTX2, FP_PI2, FP_PI12, mul_fpntt2!, sqr_fpntt2!,
+using NativeBigInt: FP_CTX2, FP_P1INV2, mul_fpntt2!, sqr_fpntt2!,
                     fp_ntt_unpack2!, fp_ntt_params2
+
+const FP_PI2 = FP_CTX2.pi
 
 fp_canonc(x::Float64, F) = (v = fp_reduce(x, F); v < 0 && (v += F.p); UInt64(v))
 
@@ -199,7 +204,7 @@ end
     @test Float64(FP_PI2) == FP_CTX2.p               # exactly representable
     @test FP_PI2 - 1 == UInt64(255) << 41
     @test (FP_PI2 - 1) % (UInt64(15) << 41) == 0     # 15·2^41 length family
-    @test FP_PI12 == UInt128(FP_PI) * FP_PI2
+    @test UInt128(FP_P1INV2) * (FP_PI % FP_PI2) % FP_PI2 == 1   # Garner inverse
 
     rng = MersenneTwister(0x2b1)
     for N in (4, 8, 64, 512, 12, 20, 48, 240, 1536)

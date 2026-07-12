@@ -32,8 +32,6 @@
 # Hardware FMA and round-to-nearest are assumed.  No @fastmath anywhere near
 # this file: contraction would break the fma(x, w, -h) cancellation.
 
-const FP_PI   = 0x0001_FFFE_0000_0001          # 562941363486721 = 2^49 - 2^33 + 1
-const FP_P    = 562941363486721.0
 const FP_MAGIC = 6755399441055744.0            # 1.5·2^52
 const VF8 = SIMD.Vec{8,Float64}
 
@@ -52,7 +50,12 @@ FpCtx(pi::UInt64, facs::Tuple) = FpCtx{pi,facs}()
     s === :facs && return FACS
     error("FpCtx has no property $s")
 end
-const FP_CTX1 = FpCtx(FP_PI, (2, 3, 5, 17, 257))
+
+# The primes.  Both < 2^49 (rounding bounds above), 2-adicity >= 33 with
+# 15 | p - 1 (the {1,3,5,15}·2^k length family), product ~2^98.97 (the
+# two-prime working modulus). FP_CTX1.pi etc. are the canonical accessors.
+const FP_CTX1 = FpCtx(UInt(2^49 - 2^33 + 1), (2, 3, 5, 17, 257)) # p1 - 1 = 2^33·3·5·17·257
+const FP_CTX2 = FpCtx(UInt(255·2^41 + 1), (2, 3, 5, 17))         # p2 - 1 = 2^41·3·5·17
 
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
@@ -109,10 +112,12 @@ function fp_generator(F::FpCtx)
     error("unreachable: GF(p) has a small generator")
 end
 
+const FP_P1INV2 =                                  # p1^-1 mod p2 (Garner)
+    fpi_inv(FP_CTX1.pi % FP_CTX2.pi, FP_CTX2.pi)
+
 # ---------------------------------------------------------------------------
-# Transform plan: N = m·2^k, m in (1, 3, 5, 15),
-# 2^k | p - 1.  Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient
-# estimate is a table load.
+# Transform plan: N = m·2^k, m in (1, 3, 5, 15), 2^k | p - 1.  Twiddles are
+# stored as (w, w/p) pairs so fp_mulmod's quotient estimate is a table load.
 
 struct FpNttStage
     q::Int
@@ -710,10 +715,9 @@ function fp_ntt_inv!(x::Vector{Float64}, plan::FpNttPlan)
 end
 
 # ---------------------------------------------------------------------------
-# Coefficient-domain layer, in pipeline order: size the transform (ntt_len,
-# fp_ntt_params), split limbs into chunk coefficients (fp_ntt_pack), multiply
-# lanewise between the transforms (fp_ntt_pointwise!), and reassemble the
-# product limbs (fp_ntt_unpack!).
+# Coefficient-domain layer, shared by both pipelines: size the transform
+# (ntt_len), split limbs into chunk coefficients (fp_ntt_pack), and multiply
+# lanewise between the transforms (fp_ntt_pointwise!).
 
 # smallest supported transform length >= T: m·2^k, m in (1, 3, 5, 15), k >= 2
 function ntt_len(T::Int)
@@ -723,19 +727,6 @@ function ntt_len(T::Int)
         c < best && (best = c)
     end
     return best
-end
-
-# chunk width and transform length: exactness needs every convolution
-# coefficient (a sum of min(nca, ncb) chunk products) below p, so b <= 24
-function fp_ntt_params(bits_a::Int, bits_b::Int)
-    for b in 24:-1:1
-        nca = cld(bits_a, b)
-        ncb = cld(bits_b, b)
-        if UInt128(min(nca, ncb)) * (UInt128(2)^b - 1)^2 < FP_PI
-            return b, ntt_len(nca + ncb - 1)
-        end
-    end
-    error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
 # b-bit chunk extraction into Float64 points; chunks < 2^b <= 2^52 are exact
@@ -783,88 +774,13 @@ function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
 end
 
 # canonicalize each coefficient to [0, p) and stream limbs out.
-# Coefficients < 2^49 at b <= 24 spacing never hold more than 64 + 49 live
-# bits, so a single-UInt128 accumulator with one flushed limb per 64 output
-# bits never overflows, and (contributions being nonnegative, starting at
-# bit i·b >= outbit + 64 after each flush) every flushed limb is final.
-function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
-                        nconv::Int, b::Int, F::FpCtx)
-    acc = UInt128(0)
-    outw = 1
-    outbit = 0
-    @inbounds for i in 0:nconv-1
-        v = fp_reduce(x[i+1], F)
-        v < 0.0 && (v += F.p)
-        c = unsafe_trunc(UInt64, v)
-        s = i * b - outbit
-        if s >= 64
-            r[ro+outw] = acc % UInt64
-            acc >>= 64
-            outw += 1
-            outbit += 64
-            s -= 64
-        end
-        acc += UInt128(c) << s
-    end
-    @inbounds while outw <= rn
-        r[ro+outw] = acc % UInt64
-        acc >>= 64
-        outw += 1
-    end
-    return r
-end
-
 # ---------------------------------------------------------------------------
-# Single-prime mpn-layer entry points: r[1..m+n] = a·b (r must not alias the
-# inputs).  UNWIRED from dispatch — the two-prime engine measured faster at
-# every size above the Karatsuba band once the two-stream unpack landed —
-# but kept (with fp_ntt_params/fp_ntt_unpack!) as an independent pipeline
-# through the shared transform machinery for the differential tests.
-
-function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
-                    b::Memory{Limb}, bo::Int, n::Int)
-    bits_a = magnitude_bits(a, ao, m)
-    bits_b = magnitude_bits(b, bo, n)
-    bch, N = fp_ntt_params(bits_a, bits_b)
-    plan = fp_ntt_plan(N, FP_CTX1)
-    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
-    xa = fp_ntt_pack(a, ao, m, bch, nca, N)
-    xb = fp_ntt_pack(b, bo, n, bch, ncb, N)
-    fp_ntt_fwd!(xa, plan)
-    fp_ntt_fwd!(xb, plan)
-    fp_ntt_pointwise!(xa, xb, FP_CTX1)
-    fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch, FP_CTX1)
-    return nothing
-end
-
-function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
-    bits = magnitude_bits(a, ao, n)
-    bch, N = fp_ntt_params(bits, bits)
-    plan = fp_ntt_plan(N, FP_CTX1)
-    nca = cld(bits, bch)
-    xa = fp_ntt_pack(a, ao, n, bch, nca, N)
-    fp_ntt_fwd!(xa, plan)
-    fp_ntt_pointwise!(xa, xa, FP_CTX1)
-    fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch, FP_CTX1)
-    return nothing
-end
-
-# ---------------------------------------------------------------------------
-# Two-prime CRT extension.  At large sizes the single-prime chunk width b
-# shrinks (b ≈ (49 - log2 nc)/2); a second prime raises the working modulus
-# to p1·p2 ≈ 2^98.97, so b ≈ 41-44: transforms shrink ~2.4x and run twice.
-# All transform code is reused verbatim with the p2 context — every bound in
-# the header holds for any prime < 2^49.  See
+# Two-prime CRT pipeline — what dispatch uses.  Both residue transforms run
+# through the shared machinery above (every bound in the header holds for
+# any prime < 2^49); the working modulus p1·p2 ≈ 2^98.97 holds the chunk
+# width at b ≈ 41-44 where a single prime's density decays with size
+# (b ≈ (49 - log2 nc)/2).  See
 # docs/superpowers/specs/2026-07-12-fpntt2-design.md.
-
-const FP_PI2 = 0x0001_FE00_0000_0001           # 560750930165761 = 255·2^41 + 1
-const FP_CTX2 = FpCtx(FP_PI2, (2, 3, 5, 17))   # p2 - 1 = 2^41 · 3 · 5 · 17
-const FP_PI12 = UInt128(FP_PI) * FP_PI2
-const FP_P1INV2 = fpi_inv(FP_PI % FP_PI2, FP_PI2)  # p1^-1 mod p2 (Garner)
-const FP_G2  = Float64(FP_P1INV2)                  # ... as an fp_mulmod twiddle
-const FP_G2P = FP_G2 / Float64(FP_PI2)
 
 # chunk width and transform length against the CRT modulus p1·p2.  The bound
 # min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
@@ -875,7 +791,8 @@ function fp_ntt_params2(bits_a::Int, bits_b::Int)
     for b in 48:-1:1
         nca = cld(bits_a, b)
         ncb = cld(bits_b, b)
-        if UInt128(min(nca, ncb)) <= (FP_PI12 - 1) ÷ (UInt128(2)^b - 1)^2
+        if UInt128(min(nca, ncb)) <=
+           (UInt128(FP_CTX1.pi) * FP_CTX2.pi - 1) ÷ (UInt128(2)^b - 1)^2
             return b, ntt_len(nca + ncb - 1)
         end
     end
@@ -930,7 +847,9 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     # per access (measured ~30% slower than this explicit round-trip).
     # One buffer, quarters: lo1 | hi1 | lo2 | hi2.
     stage = Vector{UInt64}(undef, 32)
-    vg, vgp = VF8(FP_G2), VF8(FP_G2P)
+    g = Float64(FP_P1INV2)          # the Garner inverse as an fp_mulmod
+    gp = g / FP_CTX2.p              # twiddle; const-folds to literals
+    vg, vgp = VF8(g), VF8(gp)
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
     vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
@@ -978,7 +897,7 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
         v1 = fp_reduce(x1[i+1], FP_CTX1)
         v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
         v2 = fp_reduce(x2[i+1], FP_CTX2)
-        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), FP_G2, FP_G2P, FP_CTX2)
+        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
         c1 = unsafe_trunc(UInt64, v1)
         uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
         if s >= 64
@@ -1005,7 +924,7 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
         a02 = a12; a12 = UInt64(0)
         outw += 1
     end
-    addmul_1!(r, ro, s2, 0, rn, FP_PI)
+    addmul_1!(r, ro, s2, 0, rn, FP_CTX1.pi)
     return r
 end
 
@@ -1050,5 +969,87 @@ function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     fp_ntt_pointwise!(xa2, xa2, FP_CTX2)
     fp_ntt_inv!(xa2, plan2)
     fp_ntt_unpack2!(r, ro, 2n, xa1, xa2, 2nca - 1, bch)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Single-prime pipeline: r[1..m+n] = a·b (r must not alias the inputs).
+# UNWIRED from dispatch — the two-prime engine measured faster at every size
+# above the Karatsuba band once the two-stream unpack landed — but kept
+# (~20 lines) as an independent pipeline through the shared transform
+# machinery for the differential tests.
+
+# chunk width and transform length: exactness needs every convolution
+# coefficient (a sum of min(nca, ncb) chunk products) below p, so b <= 24
+function fp_ntt_params(bits_a::Int, bits_b::Int)
+    for b in 24:-1:1
+        nca = cld(bits_a, b)
+        ncb = cld(bits_b, b)
+        if UInt128(min(nca, ncb)) * (UInt128(2)^b - 1)^2 < FP_CTX1.pi
+            return b, ntt_len(nca + ncb - 1)
+        end
+    end
+    error("unreachable: b == 1 always satisfies the bound for supported sizes")
+end
+
+# canonicalize each coefficient to [0, p) and stream limbs out.
+# Coefficients < 2^49 at b <= 24 spacing never hold more than 64 + 49 live
+# bits, so a single-UInt128 accumulator with one flushed limb per 64 output
+# bits never overflows, and (contributions being nonnegative, starting at
+# bit i·b >= outbit + 64 after each flush) every flushed limb is final.
+function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
+                        nconv::Int, b::Int, F::FpCtx)
+    acc = UInt128(0)
+    outw = 1
+    outbit = 0
+    @inbounds for i in 0:nconv-1
+        v = fp_reduce(x[i+1], F)
+        v < 0.0 && (v += F.p)
+        c = unsafe_trunc(UInt64, v)
+        s = i * b - outbit
+        if s >= 64
+            r[ro+outw] = acc % UInt64
+            acc >>= 64
+            outw += 1
+            outbit += 64
+            s -= 64
+        end
+        acc += UInt128(c) << s
+    end
+    @inbounds while outw <= rn
+        r[ro+outw] = acc % UInt64
+        acc >>= 64
+        outw += 1
+    end
+    return r
+end
+
+function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
+                    b::Memory{Limb}, bo::Int, n::Int)
+    bits_a = magnitude_bits(a, ao, m)
+    bits_b = magnitude_bits(b, bo, n)
+    bch, N = fp_ntt_params(bits_a, bits_b)
+    plan = fp_ntt_plan(N, FP_CTX1)
+    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
+    xa = fp_ntt_pack(a, ao, m, bch, nca, N)
+    xb = fp_ntt_pack(b, bo, n, bch, ncb, N)
+    fp_ntt_fwd!(xa, plan)
+    fp_ntt_fwd!(xb, plan)
+    fp_ntt_pointwise!(xa, xb, FP_CTX1)
+    fp_ntt_inv!(xa, plan)
+    fp_ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch, FP_CTX1)
+    return nothing
+end
+
+function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    bits = magnitude_bits(a, ao, n)
+    bch, N = fp_ntt_params(bits, bits)
+    plan = fp_ntt_plan(N, FP_CTX1)
+    nca = cld(bits, bch)
+    xa = fp_ntt_pack(a, ao, n, bch, nca, N)
+    fp_ntt_fwd!(xa, plan)
+    fp_ntt_pointwise!(xa, xa, FP_CTX1)
+    fp_ntt_inv!(xa, plan)
+    fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch, FP_CTX1)
     return nothing
 end
