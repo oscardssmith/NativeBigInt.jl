@@ -117,9 +117,16 @@ function Base.:*(a::NBig, b::NBig)
     la, lb = nlimbs(a), nlimbs(b)
     if a.limbs === b.limbs
         # same magnitude (covers x*x and x^2 via power_by_squaring): square it
+        if 2la >= NTT_MUL_SUM
+            sq = ntt_square(a)
+            return sign(a) * sign(b) < 0 ? -sq : sq
+        end
         r = Memory{Limb}(undef, 2la)
         sqr!(r, 0, a.limbs, 0, la)
         return nbig_from_limbs(sign(a) * sign(b), r, 2la)
+    end
+    if min(la, lb) >= NTT_MUL_MIN && la + lb >= NTT_MUL_SUM
+        return ntt_mul(a, b)
     end
     if la < lb
         a, b = b, a

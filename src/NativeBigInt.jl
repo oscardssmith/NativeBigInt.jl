@@ -16,5 +16,6 @@ include("montgomery.jl")
 include("algorithms.jl")
 include("gcd.jl")
 include("nbig.jl")
+include("ntt.jl")
 
 end
