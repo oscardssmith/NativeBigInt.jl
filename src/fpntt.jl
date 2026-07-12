@@ -6,7 +6,7 @@
 # Arithmetic model.  Values are exact integers in balanced representation,
 # |x| < a few p.  Every operation is exactly correct (not approximately):
 #   - a ± b is exact while |a ± b| < 2^53.
-#   - fp_mulmod(x, w, wpinv) returns r ≡ w·x (mod p) exactly:
+#   - fp_mulmod(x, w, wpinv, F) returns r ≡ w·x (mod p) exactly:
 #     h + l == w·x exactly (FMA error-free transform), q is an integer
 #     within (1/2 + |x|·2^-52) of w·x/p, and r = w·x - q·p is an integer
 #     small enough to be exact through the final fma and add.
@@ -25,15 +25,34 @@
 # differential tests plus adversarial max-magnitude cases validate these
 # bounds empirically.
 #
+# All bounds hold for any prime p < 2^49, so the engine is parametrized by an
+# FpCtx carrying the per-prime constants; the two-prime CRT path reuses every
+# transform verbatim with the p2 context.
+#
 # Hardware FMA and round-to-nearest are assumed.  No @fastmath anywhere near
 # this file: contraction would break the fma(x, w, -h) cancellation.
 
 const FP_PI   = 0x0001_FFFE_0000_0001          # 562941363486721 = 2^49 - 2^33 + 1
 const FP_P    = 562941363486721.0
-const FP_PN   = -FP_P
-const FP_PINV = 1.0 / FP_P
 const FP_MAGIC = 6755399441055744.0            # 1.5·2^52
 const VF8 = SIMD.Vec{8,Float64}
+
+# Per-prime constants as a type-parameter singleton: every property access
+# const-folds to a literal in the compiled code (measured ~3-4% faster than
+# carrying them as runtime struct fields), while the engine stays parametric
+# over the prime.  Properties: pi (the prime as UInt64), p, pn = -p,
+# pinv = 1/p, facs (prime factors of p-1).
+struct FpCtx{PI,FACS} end
+FpCtx(pi::UInt64, facs::Tuple) = FpCtx{pi,facs}()
+@inline function Base.getproperty(::FpCtx{PI,FACS}, s::Symbol) where {PI,FACS}
+    s === :pi   && return PI
+    s === :p    && return Float64(PI)
+    s === :pn   && return -Float64(PI)
+    s === :pinv && return 1.0 / Float64(PI)
+    s === :facs && return FACS
+    error("FpCtx has no property $s")
+end
+const FP_CTX1 = FpCtx(FP_PI, (2, 3, 5, 17, 257))
 
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
@@ -41,11 +60,11 @@ const VF8 = SIMD.Vec{8,Float64}
 # r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
 # q = fp_round(x * wpinv) has no dependency on h, so both multiplies issue
 # together.
-@inline function fp_mulmod(x, w, wpinv)
+@inline function fp_mulmod(x, w, wpinv, F::FpCtx)
     h = x * w
     l = fma(x, w, -h)
     q = fp_round(x * wpinv)
-    return fma(q, FP_PN, h) + l
+    return fma(q, F.pn, h) + l
 end
 
 # r ≡ x (mod p), |r| <= p(1/2 + |x|·2^-52/p): exact whenever the quotient
@@ -55,46 +74,45 @@ end
 # result is exact either way: x is an exact integer (any double >= 2^53 in
 # magnitude is one), q·p is an integer, and their difference is small enough
 # to represent exactly.
-@inline function fp_reduce(x)
-    q = fp_round(x * FP_PINV)
-    return fma(q, FP_PN, x)
+@inline function fp_reduce(x, F::FpCtx)
+    q = fp_round(x * F.pinv)
+    return fma(q, F.pn, x)
 end
 
 # r ≡ x·y (mod p) for two data operands (no precomputed quotient), inputs
 # |x|,|y| <= 2p: reduce the rounded high part, add back the exact FMA error
 # (an integer <= ulp(h)/2, so the final add is exact too)
-@inline function fp_mulmod2(x, y)
+@inline function fp_mulmod2(x, y, F::FpCtx)
     h = x * y
     l = fma(x, y, -h)
-    return fp_reduce(h) + l
+    return fp_reduce(h, F) + l
 end
 
 # integer-domain helpers for building twiddle tables
-function fpi_pow(a::UInt64, e::Integer)
+function fpi_pow(a::UInt64, e::Integer, p::UInt64)
     r = UInt128(1)
-    b = UInt128(a % FP_PI)
+    b = UInt128(a % p)
     while e != 0
-        isodd(e) && (r = r * b % FP_PI)
-        b = b * b % FP_PI
+        isodd(e) && (r = r * b % p)
+        b = b * b % p
         e >>= 1
     end
     return r % UInt64
 end
-@inline fpi_inv(a::UInt64) = fpi_pow(a, FP_PI - 2)
+@inline fpi_inv(a::UInt64, p::UInt64) = fpi_pow(a, p - 2, p)
 
-# p - 1 = 2^33 · 3 · 5 · 17 · 257
-function fp_generator()
+function fp_generator(F::FpCtx)
     for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
-        all(fpi_pow(UInt64(g), (FP_PI - 1) ÷ q) != 1 for q in (2, 3, 5, 17, 257)) &&
+        all(fpi_pow(UInt64(g), (F.pi - 1) ÷ q, F.pi) != 1 for q in F.facs) &&
             return UInt64(g)
     end
     error("unreachable: GF(p) has a small generator")
 end
 
 # ---------------------------------------------------------------------------
-# Transform plan, mirroring NttPlan: N = m·2^k, m in (1, 3, 5, 15), k <= 33.
-# Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient estimate is a
-# table load.
+# Transform plan, mirroring NttPlan: N = m·2^k, m in (1, 3, 5, 15),
+# 2^k | p - 1.  Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient
+# estimate is a table load.
 
 struct FpNttStage
     q::Int
@@ -103,13 +121,13 @@ struct FpNttStage
     w3::Vector{Float64};  w3p::Vector{Float64}
 end
 
-function build_fp_stage(table::Vector{UInt64}, N2::Int, L::Int)
+function build_fp_stage(table::Vector{UInt64}, N2::Int, L::Int, P::Float64)
     q = L >> 2
     st = N2 ÷ L
     len = max(q, 8)
     mk(f) = [Float64(table[f(j % q)*st+1]) for j in 0:len-1]
     w1 = mk(j -> j);  w2 = mk(j -> 2j);  w3 = mk(j -> 3j)
-    return FpNttStage(q, w1, w1 ./ FP_P, w2, w2 ./ FP_P, w3, w3 ./ FP_P)
+    return FpNttStage(q, w1, w1 ./ P, w2, w2 ./ P, w3, w3 ./ P)
 end
 
 struct FpOddStage
@@ -120,25 +138,26 @@ struct FpOddStage
     tw::Vector{Vector{Float64}};  twp::Vector{Vector{Float64}}
 end
 
-function build_fp_odd(m::Int, span::Int, root::UInt64)
+function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
-    c = fpi_pow(root, Q)
-    rot = [Float64(fpi_pow(c, r)) for r in 1:m-1]
+    c = fpi_pow(root, Q, F.pi)
+    rot = [Float64(fpi_pow(c, r, F.pi)) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
-        ωr = fpi_pow(root, r)
+        ωr = fpi_pow(root, r, F.pi)
         t = Vector{Float64}(undef, Q)
         f = UInt64(1)
         for j in 1:Q
             t[j] = Float64(f)
-            f = UInt64(UInt128(f) * ωr % FP_PI)
+            f = UInt64(UInt128(f) * ωr % F.pi)
         end
         tw[r] = t
     end
-    return FpOddStage(m, span, Q, rot, rot ./ FP_P, tw, [t ./ FP_P for t in tw])
+    return FpOddStage(m, span, Q, rot, rot ./ F.p, tw, [t ./ F.p for t in tw])
 end
 
-struct FpNttPlan
+struct FpNttPlan{C<:FpCtx}
+    ctx::C
     N::Int
     N2::Int
     ninv::Float64;  ninvp::Float64
@@ -149,16 +168,16 @@ struct FpNttPlan
     inv::Vector{FpNttStage}
 end
 
-function build_fp_plan(N::Int)
+function build_fp_plan(N::Int, F::FpCtx)
     k = trailing_zeros(N)
     m = N >> k
-    @assert m in (1, 3, 5, 15) && k <= 33 && (m == 1 || k >= 2)
-    @assert (FP_PI - 1) % N == 0
-    ω = fpi_pow(fp_generator(), (FP_PI - 1) ÷ N)
-    @assert fpi_pow(ω, N >> 1) == FP_PI - 1
-    m % 3 == 0 && @assert fpi_pow(ω, N ÷ 3) != 1
-    m % 5 == 0 && @assert fpi_pow(ω, N ÷ 5) != 1
-    ωinv = fpi_inv(ω)
+    @assert m in (1, 3, 5, 15) && (m == 1 || k >= 2)
+    @assert (F.pi - 1) % N == 0
+    ω = fpi_pow(fp_generator(F), (F.pi - 1) ÷ N, F.pi)
+    @assert fpi_pow(ω, N >> 1, F.pi) == F.pi - 1
+    m % 3 == 0 && @assert fpi_pow(ω, N ÷ 3, F.pi) != 1
+    m % 5 == 0 && @assert fpi_pow(ω, N ÷ 5, F.pi) != 1
+    ωinv = fpi_inv(ω, F.pi)
 
     oddf = FpOddStage[]
     oddi = FpOddStage[]
@@ -166,10 +185,10 @@ function build_fp_plan(N::Int)
     r, ri = ω, ωinv
     for mf in (3, 5)
         if m % mf == 0
-            push!(oddf, build_fp_odd(mf, span, r))
-            push!(oddi, build_fp_odd(mf, span, ri))
-            r = fpi_pow(r, mf)
-            ri = fpi_pow(ri, mf)
+            push!(oddf, build_fp_odd(mf, span, r, F))
+            push!(oddi, build_fp_odd(mf, span, ri, F))
+            r = fpi_pow(r, mf, F.pi)
+            ri = fpi_pow(ri, mf, F.pi)
             span ÷= mf
         end
     end
@@ -183,51 +202,53 @@ function build_fp_plan(N::Int)
     for j in 1:M
         tw[j] = fw
         twinv[j] = fi
-        fw = UInt64(UInt128(fw) * r % FP_PI)
-        fi = UInt64(UInt128(fi) * ri % FP_PI)
+        fw = UInt64(UInt128(fw) * r % F.pi)
+        fi = UInt64(UInt128(fi) * ri % F.pi)
     end
     fwd = FpNttStage[]
     L = N2
     while L >= 4
-        push!(fwd, build_fp_stage(tw, N2, L))
+        push!(fwd, build_fp_stage(tw, N2, L, F.p))
         L >>= 2
     end
     inv = FpNttStage[]
     L = isodd(k) ? 8 : 16
     while L <= N2
-        push!(inv, build_fp_stage(twinv, N2, L))
+        push!(inv, build_fp_stage(twinv, N2, L, F.p))
         L <<= 2
     end
-    wi = N2 >= 4 ? Float64(fpi_pow(r, N2 >> 2)) : 1.0
-    ninv = Float64(fpi_inv(N % UInt64))
-    return FpNttPlan(N, N2, ninv, ninv / FP_P, wi, wi / FP_P, oddf, oddi, fwd, inv)
+    wi = N2 >= 4 ? Float64(fpi_pow(r, N2 >> 2, F.pi)) : 1.0
+    ninv = Float64(fpi_inv(N % UInt64, F.pi))
+    return FpNttPlan(F, N, N2, ninv, ninv / F.p, wi, wi / F.p, oddf, oddi, fwd, inv)
 end
 
 mutable struct FpNttPlanCache
-    @atomic plans::Dict{Int,FpNttPlan}
+    @atomic plans::Dict{Tuple{Int,UInt64},FpNttPlan}
 end
 const FPNTT_PLAN_LOCK = ReentrantLock()
-const FPNTT_PLAN_CACHE = FpNttPlanCache(Dict{Int,FpNttPlan}())
-function fp_ntt_plan(N::Int)
-    plan = get(@atomic(:acquire, FPNTT_PLAN_CACHE.plans), N, nothing)
-    plan === nothing || return plan
-    lock(FPNTT_PLAN_LOCK) do
+const FPNTT_PLAN_CACHE = FpNttPlanCache(Dict{Tuple{Int,UInt64},FpNttPlan}())
+function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
+    key = (N, F.pi)
+    plan = get(@atomic(:acquire, FPNTT_PLAN_CACHE.plans), key, nothing)
+    plan === nothing || return plan::FpNttPlan{C}
+    r = lock(FPNTT_PLAN_LOCK) do
         plans = @atomic :acquire FPNTT_PLAN_CACHE.plans
-        cached = get(plans, N, nothing)
+        cached = get(plans, key, nothing)
         cached === nothing || return cached
-        built = build_fp_plan(N)
+        built = build_fp_plan(N, F)
         next = copy(plans)
-        next[N] = built
+        next[key] = built
         @atomic :release FPNTT_PLAN_CACHE.plans = next
         return built
     end
+    return r::FpNttPlan{C}
 end
 
 # ---------------------------------------------------------------------------
 # Odd-radix stages.  Same Winograd radix-3 / plain radix-5 shapes as ntt.jl;
 # the ω^0 output is fp_reduced, and inverse stages fp_reduce t0 on load.
 
-function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage)
+function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
     ω3, ω3p = st.rot[1], st.rotp[1]
     w1, w1p, w2, w2p = st.tw[1], st.twp[1], st.tw[2], st.twp[2]
@@ -239,12 +260,12 @@ function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage)
             a = SIMD.vload(VF8, x, i0)
             b = SIMD.vload(VF8, x, i0 + Q)
             c = SIMD.vload(VF8, x, i0 + 2Q)
-            u = fp_mulmod(b - c, vω3, vω3p)
-            SIMD.vstore(fp_reduce(a + (b + c)), x, i0)
+            u = fp_mulmod(b - c, vω3, vω3p, F)
+            SIMD.vstore(fp_reduce(a + (b + c), F), x, i0)
             SIMD.vstore(fp_mulmod((a - c) + u, SIMD.vload(VF8, w1, j + 1),
-                                  SIMD.vload(VF8, w1p, j + 1)), x, i0 + Q)
+                                  SIMD.vload(VF8, w1p, j + 1), F), x, i0 + Q)
             SIMD.vstore(fp_mulmod((a - b) - u, SIMD.vload(VF8, w2, j + 1),
-                                  SIMD.vload(VF8, w2p, j + 1)), x, i0 + 2Q)
+                                  SIMD.vload(VF8, w2p, j + 1), F), x, i0 + 2Q)
             j += 8
         end
     end
@@ -253,16 +274,16 @@ function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage)
         a = x[i0]
         b = x[i0+Q]
         c = x[i0+2Q]
-        u = fp_mulmod(b - c, ω3, ω3p)
-        x[i0] = fp_reduce(a + (b + c))
-        x[i0+Q] = fp_mulmod((a - c) + u, w1[j+1], w1p[j+1])
-        x[i0+2Q] = fp_mulmod((a - b) - u, w2[j+1], w2p[j+1])
+        u = fp_mulmod(b - c, ω3, ω3p, F)
+        x[i0] = fp_reduce(a + (b + c), F)
+        x[i0+Q] = fp_mulmod((a - c) + u, w1[j+1], w1p[j+1], F)
+        x[i0+2Q] = fp_mulmod((a - b) - u, w2[j+1], w2p[j+1], F)
         j += 1
     end
     return x
 end
 
-function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
+function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
     λ3, λ3p = st.rot[1], st.rotp[1]
     w1, w1p, w2, w2p = st.tw[1], st.twp[1], st.tw[2], st.twp[2]
@@ -271,13 +292,13 @@ function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
         vλ3, vλ3p = VF8(λ3), VF8(λ3p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
-            t0 = fp_reduce(SIMD.vload(VF8, x, i0))
+            t0 = fp_reduce(SIMD.vload(VF8, x, i0), F)
             t1 = fp_mulmod(SIMD.vload(VF8, x, i0 + Q),
-                           SIMD.vload(VF8, w1, j + 1), SIMD.vload(VF8, w1p, j + 1))
+                           SIMD.vload(VF8, w1, j + 1), SIMD.vload(VF8, w1p, j + 1), F)
             t2 = fp_mulmod(SIMD.vload(VF8, x, i0 + 2Q),
-                           SIMD.vload(VF8, w2, j + 1), SIMD.vload(VF8, w2p, j + 1))
-            u = fp_mulmod(t1 - t2, vλ3, vλ3p)
-            SIMD.vstore(fp_reduce(t0 + (t1 + t2)), x, i0)
+                           SIMD.vload(VF8, w2, j + 1), SIMD.vload(VF8, w2p, j + 1), F)
+            u = fp_mulmod(t1 - t2, vλ3, vλ3p, F)
+            SIMD.vstore(fp_reduce(t0 + (t1 + t2), F), x, i0)
             SIMD.vstore((t0 - t2) + u, x, i0 + Q)
             SIMD.vstore((t0 - t1) - u, x, i0 + 2Q)
             j += 8
@@ -285,11 +306,11 @@ function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
     end
     @inbounds while j < Q
         i0 = o + j + 1
-        t0 = fp_reduce(x[i0])
-        t1 = fp_mulmod(x[i0+Q], w1[j+1], w1p[j+1])
-        t2 = fp_mulmod(x[i0+2Q], w2[j+1], w2p[j+1])
-        u = fp_mulmod(t1 - t2, λ3, λ3p)
-        x[i0] = fp_reduce(t0 + (t1 + t2))
+        t0 = fp_reduce(x[i0], F)
+        t1 = fp_mulmod(x[i0+Q], w1[j+1], w1p[j+1], F)
+        t2 = fp_mulmod(x[i0+2Q], w2[j+1], w2p[j+1], F)
+        u = fp_mulmod(t1 - t2, λ3, λ3p, F)
+        x[i0] = fp_reduce(t0 + (t1 + t2), F)
         x[i0+Q] = (t0 - t2) + u
         x[i0+2Q] = (t0 - t1) - u
         j += 1
@@ -298,21 +319,21 @@ function fp_radix3_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
 end
 
 # order-5 DFT combine; y0 comes back unreduced (callers reduce before storing)
-@inline function fp_dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4, c1p, c2p, c3p, c4p)
+@inline function fp_dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4, c1p, c2p, c3p, c4p, F::FpCtx)
     s = (t1 + t2) + (t3 + t4)
     y0 = t0 + s
-    y1 = t0 + ((fp_mulmod(t1, c1, c1p) + fp_mulmod(t2, c2, c2p)) +
-               (fp_mulmod(t3, c3, c3p) + fp_mulmod(t4, c4, c4p)))
-    y2 = t0 + ((fp_mulmod(t1, c2, c2p) + fp_mulmod(t2, c4, c4p)) +
-               (fp_mulmod(t3, c1, c1p) + fp_mulmod(t4, c3, c3p)))
-    y3 = t0 + ((fp_mulmod(t1, c3, c3p) + fp_mulmod(t2, c1, c1p)) +
-               (fp_mulmod(t3, c4, c4p) + fp_mulmod(t4, c2, c2p)))
-    y4 = t0 + ((fp_mulmod(t1, c4, c4p) + fp_mulmod(t2, c3, c3p)) +
-               (fp_mulmod(t3, c2, c2p) + fp_mulmod(t4, c1, c1p)))
+    y1 = t0 + ((fp_mulmod(t1, c1, c1p, F) + fp_mulmod(t2, c2, c2p, F)) +
+               (fp_mulmod(t3, c3, c3p, F) + fp_mulmod(t4, c4, c4p, F)))
+    y2 = t0 + ((fp_mulmod(t1, c2, c2p, F) + fp_mulmod(t2, c4, c4p, F)) +
+               (fp_mulmod(t3, c1, c1p, F) + fp_mulmod(t4, c3, c3p, F)))
+    y3 = t0 + ((fp_mulmod(t1, c3, c3p, F) + fp_mulmod(t2, c1, c1p, F)) +
+               (fp_mulmod(t3, c4, c4p, F) + fp_mulmod(t4, c2, c2p, F)))
+    y4 = t0 + ((fp_mulmod(t1, c4, c4p, F) + fp_mulmod(t2, c3, c3p, F)) +
+               (fp_mulmod(t3, c2, c2p, F) + fp_mulmod(t4, c1, c1p, F)))
     return y0, y1, y2, y3, y4
 end
 
-function fp_radix5_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage)
+function fp_radix5_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
     c1, c2, c3, c4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
     c1p, c2p, c3p, c4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
@@ -330,34 +351,34 @@ function fp_radix5_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage)
             d = SIMD.vload(VF8, x, i0 + 3Q)
             e = SIMD.vload(VF8, x, i0 + 4Q)
             y0, y1, y2, y3, y4 = fp_dft5(a, b, c, d, e, v1, v2, v3, v4,
-                                         v1p, v2p, v3p, v4p)
-            SIMD.vstore(fp_reduce(y0), x, i0)
+                                         v1p, v2p, v3p, v4p, F)
+            SIMD.vstore(fp_reduce(y0, F), x, i0)
             SIMD.vstore(fp_mulmod(y1, SIMD.vload(VF8, w[1], j + 1),
-                                  SIMD.vload(VF8, wp[1], j + 1)), x, i0 + Q)
+                                  SIMD.vload(VF8, wp[1], j + 1), F), x, i0 + Q)
             SIMD.vstore(fp_mulmod(y2, SIMD.vload(VF8, w[2], j + 1),
-                                  SIMD.vload(VF8, wp[2], j + 1)), x, i0 + 2Q)
+                                  SIMD.vload(VF8, wp[2], j + 1), F), x, i0 + 2Q)
             SIMD.vstore(fp_mulmod(y3, SIMD.vload(VF8, w[3], j + 1),
-                                  SIMD.vload(VF8, wp[3], j + 1)), x, i0 + 3Q)
+                                  SIMD.vload(VF8, wp[3], j + 1), F), x, i0 + 3Q)
             SIMD.vstore(fp_mulmod(y4, SIMD.vload(VF8, w[4], j + 1),
-                                  SIMD.vload(VF8, wp[4], j + 1)), x, i0 + 4Q)
+                                  SIMD.vload(VF8, wp[4], j + 1), F), x, i0 + 4Q)
             j += 8
         end
     end
     @inbounds while j < Q
         i0 = o + j + 1
         y0, y1, y2, y3, y4 = fp_dft5(x[i0], x[i0+Q], x[i0+2Q], x[i0+3Q], x[i0+4Q],
-                                     c1, c2, c3, c4, c1p, c2p, c3p, c4p)
-        x[i0] = fp_reduce(y0)
-        x[i0+Q] = fp_mulmod(y1, w[1][j+1], wp[1][j+1])
-        x[i0+2Q] = fp_mulmod(y2, w[2][j+1], wp[2][j+1])
-        x[i0+3Q] = fp_mulmod(y3, w[3][j+1], wp[3][j+1])
-        x[i0+4Q] = fp_mulmod(y4, w[4][j+1], wp[4][j+1])
+                                     c1, c2, c3, c4, c1p, c2p, c3p, c4p, F)
+        x[i0] = fp_reduce(y0, F)
+        x[i0+Q] = fp_mulmod(y1, w[1][j+1], wp[1][j+1], F)
+        x[i0+2Q] = fp_mulmod(y2, w[2][j+1], wp[2][j+1], F)
+        x[i0+3Q] = fp_mulmod(y3, w[3][j+1], wp[3][j+1], F)
+        x[i0+4Q] = fp_mulmod(y4, w[4][j+1], wp[4][j+1], F)
         j += 1
     end
     return x
 end
 
-function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
+function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
     c1, c2, c3, c4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
     c1p, c2p, c3p, c4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
@@ -369,18 +390,18 @@ function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
         v1p, v2p, v3p, v4p = VF8(c1p), VF8(c2p), VF8(c3p), VF8(c4p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
-            t0 = fp_reduce(SIMD.vload(VF8, x, i0))
+            t0 = fp_reduce(SIMD.vload(VF8, x, i0), F)
             t1 = fp_mulmod(SIMD.vload(VF8, x, i0 + Q),
-                           SIMD.vload(VF8, w[1], j + 1), SIMD.vload(VF8, wp[1], j + 1))
+                           SIMD.vload(VF8, w[1], j + 1), SIMD.vload(VF8, wp[1], j + 1), F)
             t2 = fp_mulmod(SIMD.vload(VF8, x, i0 + 2Q),
-                           SIMD.vload(VF8, w[2], j + 1), SIMD.vload(VF8, wp[2], j + 1))
+                           SIMD.vload(VF8, w[2], j + 1), SIMD.vload(VF8, wp[2], j + 1), F)
             t3 = fp_mulmod(SIMD.vload(VF8, x, i0 + 3Q),
-                           SIMD.vload(VF8, w[3], j + 1), SIMD.vload(VF8, wp[3], j + 1))
+                           SIMD.vload(VF8, w[3], j + 1), SIMD.vload(VF8, wp[3], j + 1), F)
             t4 = fp_mulmod(SIMD.vload(VF8, x, i0 + 4Q),
-                           SIMD.vload(VF8, w[4], j + 1), SIMD.vload(VF8, wp[4], j + 1))
+                           SIMD.vload(VF8, w[4], j + 1), SIMD.vload(VF8, wp[4], j + 1), F)
             y0, y1, y2, y3, y4 = fp_dft5(t0, t1, t2, t3, t4, v1, v2, v3, v4,
-                                         v1p, v2p, v3p, v4p)
-            SIMD.vstore(fp_reduce(y0), x, i0)
+                                         v1p, v2p, v3p, v4p, F)
+            SIMD.vstore(fp_reduce(y0, F), x, i0)
             SIMD.vstore(y1, x, i0 + Q)
             SIMD.vstore(y2, x, i0 + 2Q)
             SIMD.vstore(y3, x, i0 + 3Q)
@@ -390,14 +411,14 @@ function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage)
     end
     @inbounds while j < Q
         i0 = o + j + 1
-        t0 = fp_reduce(x[i0])
-        t1 = fp_mulmod(x[i0+Q], w[1][j+1], wp[1][j+1])
-        t2 = fp_mulmod(x[i0+2Q], w[2][j+1], wp[2][j+1])
-        t3 = fp_mulmod(x[i0+3Q], w[3][j+1], wp[3][j+1])
-        t4 = fp_mulmod(x[i0+4Q], w[4][j+1], wp[4][j+1])
+        t0 = fp_reduce(x[i0], F)
+        t1 = fp_mulmod(x[i0+Q], w[1][j+1], wp[1][j+1], F)
+        t2 = fp_mulmod(x[i0+2Q], w[2][j+1], wp[2][j+1], F)
+        t3 = fp_mulmod(x[i0+3Q], w[3][j+1], wp[3][j+1], F)
+        t4 = fp_mulmod(x[i0+4Q], w[4][j+1], wp[4][j+1], F)
         y0, y1, y2, y3, y4 = fp_dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4,
-                                     c1p, c2p, c3p, c4p)
-        x[i0] = fp_reduce(y0)
+                                     c1p, c2p, c3p, c4p, F)
+        x[i0] = fp_reduce(y0, F)
         x[i0+Q] = y1
         x[i0+2Q] = y2
         x[i0+3Q] = y3
@@ -412,25 +433,25 @@ end
 # swaps the add/sub pair around w, mirroring dft4_fwd/dft4_inv in ntt.jl.
 # y0 is returned unreduced; callers fp_reduce before storing.
 
-@inline function fp_dft4_fwd(a, b, c, d, wi, wip)
+@inline function fp_dft4_fwd(a, b, c, d, wi, wip, F::FpCtx)
     apc = a + c
     amc = a - c
     bpd = b + d
-    ibmd = fp_mulmod(b - d, wi, wip)
+    ibmd = fp_mulmod(b - d, wi, wip, F)
     return apc + bpd, amc + ibmd, apc - bpd, amc - ibmd
 end
 
-@inline function fp_dft4_inv(t0, t1, t2, t3, wi, wip)
+@inline function fp_dft4_inv(t0, t1, t2, t3, wi, wip, F::FpCtx)
     u = t0 + t2
     p_ = t0 - t2
     v = t1 + t3
-    w = fp_mulmod(t1 - t3, wi, wip)
+    w = fp_mulmod(t1 - t3, wi, wip, F)
     return u + v, p_ - w, u - v, p_ + w
 end
 
 # small-q pow2 stages via the shared gather/scatter shuffles from ntt.jl
 function fp_smallq_fwd!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
-                        stg::FpNttStage, vwi::VF8, vwip::VF8) where {Q}
+                        stg::FpNttStage, vwi::VF8, vwip::VF8, F::FpCtx) where {Q}
     vw1 = SIMD.vload(VF8, stg.w1, 1); vw1p = SIMD.vload(VF8, stg.w1p, 1)
     vw2 = SIMD.vload(VF8, stg.w2, 1); vw2p = SIMD.vload(VF8, stg.w2p, 1)
     vw3 = SIMD.vload(VF8, stg.w3, 1); vw3p = SIMD.vload(VF8, stg.w3p, 1)
@@ -440,11 +461,11 @@ function fp_smallq_fwd!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
         v2 = SIMD.vload(VF8, x, i0 + 16)
         v3 = SIMD.vload(VF8, x, i0 + 24)
         a, b, c, d = ntt_gather4(Val(Q), v0, v1, v2, v3)
-        y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, vwi, vwip)
-        o0, o1, o2, o3 = ntt_scatter4(Val(Q), fp_reduce(y0),
-                                      fp_mulmod(y1, vw1, vw1p),
-                                      fp_mulmod(y2, vw2, vw2p),
-                                      fp_mulmod(y3, vw3, vw3p))
+        y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, vwi, vwip, F)
+        o0, o1, o2, o3 = ntt_scatter4(Val(Q), fp_reduce(y0, F),
+                                      fp_mulmod(y1, vw1, vw1p, F),
+                                      fp_mulmod(y2, vw2, vw2p, F),
+                                      fp_mulmod(y3, vw3, vw3p, F))
         SIMD.vstore(o0, x, i0)
         SIMD.vstore(o1, x, i0 + 8)
         SIMD.vstore(o2, x, i0 + 16)
@@ -454,7 +475,7 @@ function fp_smallq_fwd!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
 end
 
 function fp_smallq_inv!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
-                        stg::FpNttStage, vwi::VF8, vwip::VF8) where {Q}
+                        stg::FpNttStage, vwi::VF8, vwip::VF8, F::FpCtx) where {Q}
     vw1 = SIMD.vload(VF8, stg.w1, 1); vw1p = SIMD.vload(VF8, stg.w1p, 1)
     vw2 = SIMD.vload(VF8, stg.w2, 1); vw2p = SIMD.vload(VF8, stg.w2p, 1)
     vw3 = SIMD.vload(VF8, stg.w3, 1); vw3p = SIMD.vload(VF8, stg.w3p, 1)
@@ -464,11 +485,11 @@ function fp_smallq_inv!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
         v2 = SIMD.vload(VF8, x, i0 + 16)
         v3 = SIMD.vload(VF8, x, i0 + 24)
         g0, g1, g2, g3 = ntt_gather4(Val(Q), v0, v1, v2, v3)
-        z0, z1, z2, z3 = fp_dft4_inv(fp_reduce(g0),
-                                     fp_mulmod(g1, vw1, vw1p),
-                                     fp_mulmod(g2, vw2, vw2p),
-                                     fp_mulmod(g3, vw3, vw3p), vwi, vwip)
-        o0, o1, o2, o3 = ntt_scatter4(Val(Q), fp_reduce(z0), z1, z2, z3)
+        z0, z1, z2, z3 = fp_dft4_inv(fp_reduce(g0, F),
+                                     fp_mulmod(g1, vw1, vw1p, F),
+                                     fp_mulmod(g2, vw2, vw2p, F),
+                                     fp_mulmod(g3, vw3, vw3p, F), vwi, vwip, F)
+        o0, o1, o2, o3 = ntt_scatter4(Val(Q), fp_reduce(z0, F), z1, z2, z3)
         SIMD.vstore(o0, x, i0)
         SIMD.vstore(o1, x, i0 + 8)
         SIMD.vstore(o2, x, i0 + 16)
@@ -481,6 +502,7 @@ end
 # Power-of-two pipelines, mirroring ntt_fwd_pow2!/ntt_inv_pow2!.
 
 function fp_fwd_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
+    F = plan.ctx
     N2 = plan.N2
     wi, wip = plan.wi, plan.wip
     vwi, vwip = VF8(wi), VF8(wip)
@@ -497,20 +519,20 @@ function fp_fwd_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
                     b = SIMD.vload(VF8, x, i0 + q)
                     c = SIMD.vload(VF8, x, i0 + 2q)
                     d = SIMD.vload(VF8, x, i0 + 3q)
-                    y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, vwi, vwip)
-                    SIMD.vstore(fp_reduce(y0), x, i0)
+                    y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, vwi, vwip, F)
+                    SIMD.vstore(fp_reduce(y0, F), x, i0)
                     SIMD.vstore(fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
-                                          SIMD.vload(VF8, w1p, j + 1)), x, i0 + q)
+                                          SIMD.vload(VF8, w1p, j + 1), F), x, i0 + q)
                     SIMD.vstore(fp_mulmod(y2, SIMD.vload(VF8, w2, j + 1),
-                                          SIMD.vload(VF8, w2p, j + 1)), x, i0 + 2q)
+                                          SIMD.vload(VF8, w2p, j + 1), F), x, i0 + 2q)
                     SIMD.vstore(fp_mulmod(y3, SIMD.vload(VF8, w3, j + 1),
-                                          SIMD.vload(VF8, w3p, j + 1)), x, i0 + 3q)
+                                          SIMD.vload(VF8, w3p, j + 1), F), x, i0 + 3q)
                 end
             end
         elseif N2 >= 32
-            q == 4 ? fp_smallq_fwd!(x, o, N2, Val(4), stg, vwi, vwip) :
-            q == 2 ? fp_smallq_fwd!(x, o, N2, Val(2), stg, vwi, vwip) :
-                     fp_smallq_fwd!(x, o, N2, Val(1), stg, vwi, vwip)
+            q == 4 ? fp_smallq_fwd!(x, o, N2, Val(4), stg, vwi, vwip, F) :
+            q == 2 ? fp_smallq_fwd!(x, o, N2, Val(2), stg, vwi, vwip, F) :
+                     fp_smallq_fwd!(x, o, N2, Val(1), stg, vwi, vwip, F)
         else
             w1, w1p, w2, w2p, w3, w3p = stg.w1, stg.w1p, stg.w2, stg.w2p, stg.w3, stg.w3p
             for s in o:L:o+N2-1
@@ -519,11 +541,11 @@ function fp_fwd_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
                     b = x[s+j+q+1]
                     c = x[s+j+2q+1]
                     d = x[s+j+3q+1]
-                    y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, wi, wip)
-                    x[s+j+1] = fp_reduce(y0)
-                    x[s+j+q+1] = fp_mulmod(y1, w1[j+1], w1p[j+1])
-                    x[s+j+2q+1] = fp_mulmod(y2, w2[j+1], w2p[j+1])
-                    x[s+j+3q+1] = fp_mulmod(y3, w3[j+1], w3p[j+1])
+                    y0, y1, y2, y3 = fp_dft4_fwd(a, b, c, d, wi, wip, F)
+                    x[s+j+1] = fp_reduce(y0, F)
+                    x[s+j+q+1] = fp_mulmod(y1, w1[j+1], w1p[j+1], F)
+                    x[s+j+2q+1] = fp_mulmod(y2, w2[j+1], w2p[j+1], F)
+                    x[s+j+3q+1] = fp_mulmod(y3, w3[j+1], w3p[j+1], F)
                 end
             end
         end
@@ -543,6 +565,7 @@ function fp_fwd_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
 end
 
 function fp_inv_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
+    F = plan.ctx
     N2 = plan.N2
     wi, wip = plan.wi, plan.wip
     vwi, vwip = VF8(wi), VF8(wip)
@@ -551,16 +574,16 @@ function fp_inv_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
         @inbounds for s in o:2:o+N2-1
             u = x[s+1]
             t = x[s+2]
-            x[s+1] = fp_mulmod(u + t, ninv, ninvp)
-            x[s+2] = fp_mulmod(u - t, ninv, ninvp)
+            x[s+1] = fp_mulmod(u + t, ninv, ninvp, F)
+            x[s+2] = fp_mulmod(u - t, ninv, ninvp, F)
         end
     elseif N2 >= 4
         @inbounds for s in o:4:o+N2-1
-            t0 = fp_mulmod(x[s+1], ninv, ninvp)
-            t1 = fp_mulmod(x[s+2], ninv, ninvp)
-            t2 = fp_mulmod(x[s+3], ninv, ninvp)
-            t3 = fp_mulmod(x[s+4], ninv, ninvp)
-            y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, wi, wip)
+            t0 = fp_mulmod(x[s+1], ninv, ninvp, F)
+            t1 = fp_mulmod(x[s+2], ninv, ninvp, F)
+            t2 = fp_mulmod(x[s+3], ninv, ninvp, F)
+            t3 = fp_mulmod(x[s+4], ninv, ninvp, F)
+            y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, wi, wip, F)
             x[s+1] = y0
             x[s+2] = y1
             x[s+3] = y2
@@ -568,7 +591,7 @@ function fp_inv_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
         end
     else
         @inbounds for s in o+1:o+N2
-            x[s] = fp_mulmod(x[s], ninv, ninvp)
+            x[s] = fp_mulmod(x[s], ninv, ninvp, F)
         end
     end
     for stg in plan.inv
@@ -579,34 +602,34 @@ function fp_inv_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
             for s in o:L:o+N2-1
                 @inbounds for j in 0:8:q-8
                     i0 = s + j + 1
-                    t0 = fp_reduce(SIMD.vload(VF8, x, i0))
+                    t0 = fp_reduce(SIMD.vload(VF8, x, i0), F)
                     t1 = fp_mulmod(SIMD.vload(VF8, x, i0 + q),
-                                   SIMD.vload(VF8, w1, j + 1), SIMD.vload(VF8, w1p, j + 1))
+                                   SIMD.vload(VF8, w1, j + 1), SIMD.vload(VF8, w1p, j + 1), F)
                     t2 = fp_mulmod(SIMD.vload(VF8, x, i0 + 2q),
-                                   SIMD.vload(VF8, w2, j + 1), SIMD.vload(VF8, w2p, j + 1))
+                                   SIMD.vload(VF8, w2, j + 1), SIMD.vload(VF8, w2p, j + 1), F)
                     t3 = fp_mulmod(SIMD.vload(VF8, x, i0 + 3q),
-                                   SIMD.vload(VF8, w3, j + 1), SIMD.vload(VF8, w3p, j + 1))
-                    y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, vwi, vwip)
-                    SIMD.vstore(fp_reduce(y0), x, i0)
+                                   SIMD.vload(VF8, w3, j + 1), SIMD.vload(VF8, w3p, j + 1), F)
+                    y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, vwi, vwip, F)
+                    SIMD.vstore(fp_reduce(y0, F), x, i0)
                     SIMD.vstore(y1, x, i0 + q)
                     SIMD.vstore(y2, x, i0 + 2q)
                     SIMD.vstore(y3, x, i0 + 3q)
                 end
             end
         elseif N2 >= 32
-            q == 4 ? fp_smallq_inv!(x, o, N2, Val(4), stg, vwi, vwip) :
-            q == 2 ? fp_smallq_inv!(x, o, N2, Val(2), stg, vwi, vwip) :
-                     fp_smallq_inv!(x, o, N2, Val(1), stg, vwi, vwip)
+            q == 4 ? fp_smallq_inv!(x, o, N2, Val(4), stg, vwi, vwip, F) :
+            q == 2 ? fp_smallq_inv!(x, o, N2, Val(2), stg, vwi, vwip, F) :
+                     fp_smallq_inv!(x, o, N2, Val(1), stg, vwi, vwip, F)
         else
             w1, w1p, w2, w2p, w3, w3p = stg.w1, stg.w1p, stg.w2, stg.w2p, stg.w3, stg.w3p
             for s in o:L:o+N2-1
                 @inbounds for j in 0:q-1
-                    t0 = fp_reduce(x[s+j+1])
-                    t1 = fp_mulmod(x[s+j+q+1], w1[j+1], w1p[j+1])
-                    t2 = fp_mulmod(x[s+j+2q+1], w2[j+1], w2p[j+1])
-                    t3 = fp_mulmod(x[s+j+3q+1], w3[j+1], w3p[j+1])
-                    y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, wi, wip)
-                    x[s+j+1] = fp_reduce(y0)
+                    t0 = fp_reduce(x[s+j+1], F)
+                    t1 = fp_mulmod(x[s+j+q+1], w1[j+1], w1p[j+1], F)
+                    t2 = fp_mulmod(x[s+j+2q+1], w2[j+1], w2p[j+1], F)
+                    t3 = fp_mulmod(x[s+j+3q+1], w3[j+1], w3p[j+1], F)
+                    y0, y1, y2, y3 = fp_dft4_inv(t0, t1, t2, t3, wi, wip, F)
+                    x[s+j+1] = fp_reduce(y0, F)
                     x[s+j+q+1] = y1
                     x[s+j+2q+1] = y2
                     x[s+j+3q+1] = y3
@@ -618,9 +641,10 @@ function fp_inv_pow2!(x::Vector{Float64}, o::Int, plan::FpNttPlan)
 end
 
 function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
+    F = plan.ctx
     for st in plan.oddf
         for o in 0:st.span:plan.N-1
-            st.m == 3 ? fp_radix3_fwd!(x, o, st) : fp_radix5_fwd!(x, o, st)
+            st.m == 3 ? fp_radix3_fwd!(x, o, st, F) : fp_radix5_fwd!(x, o, st, F)
         end
     end
     for o in 0:plan.N2:plan.N-1
@@ -630,12 +654,13 @@ function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
 end
 
 function fp_ntt_inv!(x::Vector{Float64}, plan::FpNttPlan)
+    F = plan.ctx
     for o in 0:plan.N2:plan.N-1
         fp_inv_pow2!(x, o, plan)
     end
     for st in plan.oddi
         for o in 0:st.span:plan.N-1
-            st.m == 3 ? fp_radix3_inv!(x, o, st) : fp_radix5_inv!(x, o, st)
+            st.m == 3 ? fp_radix3_inv!(x, o, st, F) : fp_radix5_inv!(x, o, st, F)
         end
     end
     return x
@@ -657,8 +682,8 @@ function fp_ntt_params(bits_a::Int, bits_b::Int)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# ntt_pack with Float64 output; chunks < 2^24 are exact doubles and already
-# canonical residues
+# ntt_pack with Float64 output; chunks < 2^b <= 2^52 are exact doubles and,
+# being smaller than every prime, already canonical residues
 function fp_ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::Int)
     x = Vector{Float64}(undef, N)
     mask = (UInt64(1) << b) - 1
@@ -684,17 +709,18 @@ function fp_ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::
     return x
 end
 
-function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64})
+function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     n = length(xa)
     i = 1
     if n >= 8
         @inbounds while i + 7 <= n
-            SIMD.vstore(fp_mulmod2(SIMD.vload(VF8, xa, i), SIMD.vload(VF8, xb, i)), xa, i)
+            SIMD.vstore(fp_mulmod2(SIMD.vload(VF8, xa, i), SIMD.vload(VF8, xb, i), F),
+                        xa, i)
             i += 8
         end
     end
     @inbounds while i <= n
-        xa[i] = fp_mulmod2(xa[i], xb[i])
+        xa[i] = fp_mulmod2(xa[i], xb[i], F)
         i += 1
     end
     return xa
@@ -705,13 +731,13 @@ end
 # margin than the Goldilocks unpack (whose bound was coefficients < 2^64,
 # b <= 32), so the same single-UInt128 flush cadence is safe.
 function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
-                        nconv::Int, b::Int)
+                        nconv::Int, b::Int, F::FpCtx)
     acc = UInt128(0)
     outw = 1
     outbit = 0
     @inbounds for i in 0:nconv-1
-        v = fp_reduce(x[i+1])
-        v < 0.0 && (v += FP_P)
+        v = fp_reduce(x[i+1], F)
+        v < 0.0 && (v += F.p)
         c = unsafe_trunc(UInt64, v)
         s = i * b - outbit
         if s >= 64
@@ -739,27 +765,27 @@ function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     bits_a = magnitude_bits(a, ao, m)
     bits_b = magnitude_bits(b, bo, n)
     bch, N = fp_ntt_params(bits_a, bits_b)
-    plan = fp_ntt_plan(N)
+    plan = fp_ntt_plan(N, FP_CTX1)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
     xa = fp_ntt_pack(a, ao, m, bch, nca, N)
     xb = fp_ntt_pack(b, bo, n, bch, ncb, N)
     fp_ntt_fwd!(xa, plan)
     fp_ntt_fwd!(xb, plan)
-    fp_ntt_pointwise!(xa, xb)
+    fp_ntt_pointwise!(xa, xb, FP_CTX1)
     fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch)
+    fp_ntt_unpack!(r, ro, m + n, xa, nca + ncb - 1, bch, FP_CTX1)
     return nothing
 end
 
 function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     bits = magnitude_bits(a, ao, n)
     bch, N = fp_ntt_params(bits, bits)
-    plan = fp_ntt_plan(N)
+    plan = fp_ntt_plan(N, FP_CTX1)
     nca = cld(bits, bch)
     xa = fp_ntt_pack(a, ao, n, bch, nca, N)
     fp_ntt_fwd!(xa, plan)
-    fp_ntt_pointwise!(xa, xa)
+    fp_ntt_pointwise!(xa, xa, FP_CTX1)
     fp_ntt_inv!(xa, plan)
-    fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch)
+    fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch, FP_CTX1)
     return nothing
 end

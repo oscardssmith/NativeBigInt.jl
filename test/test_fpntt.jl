@@ -3,13 +3,14 @@
 # beyond the differential net these tests hammer the documented lazy-range
 # bounds (mulmod |x| <= 4p, reduce |x| <= 8p) where random in-range inputs
 # would never stress the magic-constant round.
-using NativeBigInt: FP_PI, FP_P, fp_mulmod, fp_mulmod2, fp_reduce, fp_round,
-                    fpi_pow, fpi_inv, fp_ntt_plan, fp_ntt_fwd!, fp_ntt_inv!,
-                    mul_fpntt!, sqr_fpntt!, VF8, Limb, nlimbs, nbig_from_limbs
+using NativeBigInt: FP_PI, FP_P, FP_CTX1, FpCtx, fp_mulmod, fp_mulmod2,
+                    fp_reduce, fp_round, fpi_pow, fpi_inv, fp_ntt_plan,
+                    fp_ntt_fwd!, fp_ntt_inv!, mul_fpntt!, sqr_fpntt!, VF8,
+                    Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
 
 # canonical residue in [0, p) of a balanced-representation value
-fp_canon(x::Float64) = (v = fp_reduce(x); v < 0 && (v += FP_P); UInt64(v))
+fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(v))
 
 function fpntt_mul(a::NBig, b::NBig)
     (iszero(a) || iszero(b)) && return NBig(0)
@@ -44,27 +45,27 @@ end
           [rand(rng, (-4.0, -2.0, -1.0, 1.0, 2.0, 4.0)) * rand(rng, UInt64(0):FP_PI-1)
            for _ in 1:200]]
     for w in ws, x in xs
-        r = fp_mulmod(x, Float64(w), Float64(w) / FP_P)
+        r = fp_mulmod(x, Float64(w), Float64(w) / FP_P, FP_CTX1)
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(big(w) * big(Int128(x)), P)
     end
     for x in xs, y in xs
         abs(x) <= 2FP_P && abs(y) <= 2FP_P || continue
-        r = fp_mulmod2(x, y)
+        r = fp_mulmod2(x, y, FP_CTX1)
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(big(Int128(x)) * big(Int128(y)), P)
     end
     for x in xs
-        r = fp_reduce(2 * x)                       # up to ±8p
+        r = fp_reduce(2 * x, FP_CTX1)              # up to ±8p
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(2 * big(Int128(x)), P)
     end
     # generator-derived roots of unity have exact order
     for logN in (1, 5, 20, 33)
         N = UInt64(2)^logN
-        ω = fpi_pow(NativeBigInt.fp_generator(), (FP_PI - 1) ÷ N)
-        @test fpi_pow(ω, N) == 1
-        @test fpi_pow(ω, N >> 1) == FP_PI - 1
+        ω = fpi_pow(NativeBigInt.fp_generator(FP_CTX1), (FP_PI - 1) ÷ N, FP_PI)
+        @test fpi_pow(ω, N, FP_PI) == 1
+        @test fpi_pow(ω, N >> 1, FP_PI) == FP_PI - 1
     end
 end
 
@@ -75,17 +76,17 @@ end
         w = rand(rng, UInt64(0):FP_PI-1, 8)
         wf = Float64.(w)
         wp = wf ./ FP_P
-        vr = fp_mulmod(VF8(Tuple(x)), VF8(Tuple(wf)), VF8(Tuple(wp)))
-        @test [vr[i] for i in 1:8] == fp_mulmod.(x, wf, wp)
-        vr2 = fp_reduce(VF8(Tuple(x)))
-        @test [vr2[i] for i in 1:8] == fp_reduce.(x)
+        vr = fp_mulmod(VF8(Tuple(x)), VF8(Tuple(wf)), VF8(Tuple(wp)), FP_CTX1)
+        @test [vr[i] for i in 1:8] == fp_mulmod.(x, wf, wp, Ref(FP_CTX1))
+        vr2 = fp_reduce(VF8(Tuple(x)), FP_CTX1)
+        @test [vr2[i] for i in 1:8] == fp_reduce.(x, Ref(FP_CTX1))
     end
 end
 
 @testset "fp ntt transform" begin
     rng = MersenneTwister(0xf18)
     for N in (4, 8, 64, 512, 1024, 12, 20, 48, 96, 160, 240, 1536)
-        plan = fp_ntt_plan(N)
+        plan = fp_ntt_plan(N, FP_CTX1)
         x = Float64.(rand(rng, UInt64(0):FP_PI-1, N))
         y = copy(x)
         fp_ntt_fwd!(y, plan)
@@ -101,7 +102,7 @@ end
         end
         fa, fb = Float64.(a), Float64.(b)
         fp_ntt_fwd!(fa, plan); fp_ntt_fwd!(fb, plan)
-        fc = fp_mulmod2.(fa, fb)
+        fc = fp_mulmod2.(fa, fb, Ref(FP_CTX1))
         fp_ntt_inv!(fc, plan)
         @test big.(fp_canon.(fc)) == mod.(c, big(FP_PI))
     end
