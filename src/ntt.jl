@@ -1,5 +1,6 @@
-# NTT multiplication prototype over the Goldilocks field GF(p),
-# p = 2^64 - 2^32 + 1.  Standalone: not wired into mul! dispatch.
+# NTT multiplication over the Goldilocks field GF(p), p = 2^64 - 2^32 + 1.
+# mul!/sqr! in algorithms.jl dispatch here above the MUL_NTT_*/SQR_NTT_*
+# thresholds.
 #
 # p - 1 = 2^32·(2^32 - 1) and 2^32 - 1 = 3·5·17·257·65537, so power-of-two
 # transforms exist up to length 2^32 and lengths m·2^k for m in (3, 5, 15)
@@ -249,12 +250,26 @@ function build_plan(N::Int)
     return NttPlan(N, N2, gf_inv(N % UInt64), oddf, oddi, fwd, inv)
 end
 
-# plans are pure functions of N, so share them across calls
+# plans are pure functions of N, so share them across calls.  Every large
+# multiply looks one up, so the hit path is a lock-free atomic snapshot
+# read; the lock only serializes builders, which copy-and-swap the dict.
+mutable struct NttPlanCache
+    @atomic plans::Dict{Int,NttPlan}
+end
 const NTT_PLAN_LOCK = ReentrantLock()
-const NTT_PLAN_CACHE = Dict{Int,NttPlan}()
+const NTT_PLAN_CACHE = NttPlanCache(Dict{Int,NttPlan}())
 function ntt_plan(N::Int)
+    plan = get(@atomic(:acquire, NTT_PLAN_CACHE.plans), N, nothing)
+    plan === nothing || return plan
     lock(NTT_PLAN_LOCK) do
-        get!(() -> build_plan(N), NTT_PLAN_CACHE, N)
+        plans = @atomic :acquire NTT_PLAN_CACHE.plans
+        cached = get(plans, N, nothing)
+        cached === nothing || return cached
+        built = build_plan(N)
+        next = copy(plans)
+        next[N] = built
+        @atomic :release NTT_PLAN_CACHE.plans = next
+        return built
     end
 end
 
@@ -264,6 +279,13 @@ end
 #   a + ωb + ω²c == (a - c) + u        a + ω²b + ωc == (a - b) - u
 # so one rotation multiply serves both outputs.  The same identity applies
 # to the inverse stage with its own root.  Radix-5 is the plain DFT matrix.
+
+# Winograd radix-3 core, shared by the scalar and V8 paths of both
+# directions (twiddle multiplies stay at the call sites)
+@inline function dft3(a, b, c, ω, addf::F, subf::G, mulf::H) where {F,G,H}
+    u = mulf(subf(b, c), ω)
+    return addf(a, addf(b, c)), addf(subf(a, c), u), subf(subf(a, b), u)
+end
 
 function radix3_fwd!(x::Vector{UInt64}, o::Int, st::OddStage)
     Q = st.Q
@@ -277,10 +299,8 @@ function radix3_fwd!(x::Vector{UInt64}, o::Int, st::OddStage)
             a = SIMD.vload(V8, x, i0)
             b = SIMD.vload(V8, x, i0 + Q)
             c = SIMD.vload(V8, x, i0 + 2Q)
-            u = gf_mulv(gf_subv(b, c), ω3v)
-            SIMD.vstore(gf_addv(a, gf_addv(b, c)), x, i0)
-            y1 = gf_addv(gf_subv(a, c), u)
-            y2 = gf_subv(gf_subv(a, b), u)
+            y0, y1, y2 = dft3(a, b, c, ω3v, gf_addv, gf_subv, gf_mulv)
+            SIMD.vstore(y0, x, i0)
             SIMD.vstore(gf_mulv(y1, SIMD.vload(V8, w1, j + 1)), x, i0 + Q)
             SIMD.vstore(gf_mulv(y2, SIMD.vload(V8, w2, j + 1)), x, i0 + 2Q)
             j += 8
@@ -291,10 +311,10 @@ function radix3_fwd!(x::Vector{UInt64}, o::Int, st::OddStage)
         a = x[i0]
         b = x[i0+Q]
         c = x[i0+2Q]
-        u = gf_mul(gf_sub(b, c), ω3)
-        x[i0] = gf_add(a, gf_add(b, c))
-        x[i0+Q] = gf_mul(gf_add(gf_sub(a, c), u), w1[j+1])
-        x[i0+2Q] = gf_mul(gf_sub(gf_sub(a, b), u), w2[j+1])
+        y0, y1, y2 = dft3(a, b, c, ω3, gf_add, gf_sub, gf_mul)
+        x[i0] = y0
+        x[i0+Q] = gf_mul(y1, w1[j+1])
+        x[i0+2Q] = gf_mul(y2, w2[j+1])
         j += 1
     end
     return x
@@ -312,10 +332,10 @@ function radix3_inv!(x::Vector{UInt64}, o::Int, st::OddStage)
             t0 = SIMD.vload(V8, x, i0)
             t1 = gf_mulv(SIMD.vload(V8, x, i0 + Q), SIMD.vload(V8, w1, j + 1))
             t2 = gf_mulv(SIMD.vload(V8, x, i0 + 2Q), SIMD.vload(V8, w2, j + 1))
-            u = gf_mulv(gf_subv(t1, t2), λ3v)
-            SIMD.vstore(gf_addv(t0, gf_addv(t1, t2)), x, i0)
-            SIMD.vstore(gf_addv(gf_subv(t0, t2), u), x, i0 + Q)
-            SIMD.vstore(gf_subv(gf_subv(t0, t1), u), x, i0 + 2Q)
+            y0, y1, y2 = dft3(t0, t1, t2, λ3v, gf_addv, gf_subv, gf_mulv)
+            SIMD.vstore(y0, x, i0)
+            SIMD.vstore(y1, x, i0 + Q)
+            SIMD.vstore(y2, x, i0 + 2Q)
             j += 8
         end
     end
@@ -324,10 +344,10 @@ function radix3_inv!(x::Vector{UInt64}, o::Int, st::OddStage)
         t0 = x[i0]
         t1 = gf_mul(x[i0+Q], w1[j+1])
         t2 = gf_mul(x[i0+2Q], w2[j+1])
-        u = gf_mul(gf_sub(t1, t2), λ3)
-        x[i0] = gf_add(t0, gf_add(t1, t2))
-        x[i0+Q] = gf_add(gf_sub(t0, t2), u)
-        x[i0+2Q] = gf_sub(gf_sub(t0, t1), u)
+        y0, y1, y2 = dft3(t0, t1, t2, λ3, gf_add, gf_sub, gf_mul)
+        x[i0] = y0
+        x[i0+Q] = y1
+        x[i0+2Q] = y2
         j += 1
     end
     return x
@@ -402,8 +422,7 @@ function radix5_inv!(x::Vector{UInt64}, o::Int, st::OddStage)
             t2 = gf_mulv(SIMD.vload(V8, x, i0 + 2Q), SIMD.vload(V8, w2, j + 1))
             t3 = gf_mulv(SIMD.vload(V8, x, i0 + 3Q), SIMD.vload(V8, w3, j + 1))
             t4 = gf_mulv(SIMD.vload(V8, x, i0 + 4Q), SIMD.vload(V8, w4, j + 1))
-            y0, y1, y2, y3, y4 = dft5(t0, t1, t2, t3, t4, v1, v2, v3, v4,
-                                      gf_addv, gf_mulv)
+            y0, y1, y2, y3, y4 = dft5(t0, t1, t2, t3, t4, v1, v2, v3, v4, gf_addv, gf_mulv)
             SIMD.vstore(y0, x, i0)
             SIMD.vstore(y1, x, i0 + Q)
             SIMD.vstore(y2, x, i0 + 2Q)
@@ -419,16 +438,30 @@ function radix5_inv!(x::Vector{UInt64}, o::Int, st::OddStage)
         t2 = gf_mul(x[i0+2Q], w2[j+1])
         t3 = gf_mul(x[i0+3Q], w3[j+1])
         t4 = gf_mul(x[i0+4Q], w4[j+1])
-        y0, y1, y2, y3, y4 = dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4,
-                                  gf_add, gf_mul)
-        x[i0] = y0
-        x[i0+Q] = y1
-        x[i0+2Q] = y2
-        x[i0+3Q] = y3
-        x[i0+4Q] = y4
+        x[i0],x[i0+Q],x[i0+2Q],x[i0+3Q],x[i0+4Q] = dft5(t0, t1, t2, t3, t4, c1, c2, c3, c4, gf_add, gf_mul)
         j += 1
     end
     return x
+end
+
+# ---------------------------------------------------------------------------
+# Radix-4 butterfly cores shared by the scalar, V8, and shuffle paths
+# (twiddle multiplies stay at the call sites).  i == 2^48; i^-1 == -i, so
+# the inverse keeps gf_mul_i and swaps the add/sub pair around w.
+@inline function dft4_fwd(a, b, c, d, addf::F, subf::G, mulif::H) where {F,G,H}
+    apc = addf(a, c)
+    amc = subf(a, c)
+    bpd = addf(b, d)
+    ibmd = mulif(subf(b, d))
+    return addf(apc, bpd), addf(amc, ibmd), subf(apc, bpd), subf(amc, ibmd)
+end
+
+@inline function dft4_inv(t0, t1, t2, t3, addf::F, subf::G, mulif::H) where {F,G,H}
+    u = addf(t0, t2)
+    p = subf(t0, t2)
+    v = addf(t1, t3)
+    w = mulif(subf(t1, t3))
+    return addf(u, v), subf(p, w), subf(u, v), addf(p, w)
 end
 
 # ---------------------------------------------------------------------------
@@ -487,15 +520,9 @@ function ntt_smallq_fwd!(x::Vector{UInt64}, o::Int, N2::Int, ::Val{Q},
         v2 = SIMD.vload(V8, x, i0 + 16)
         v3 = SIMD.vload(V8, x, i0 + 24)
         a, b, c, d = ntt_gather4(Val(Q), v0, v1, v2, v3)
-        apc = gf_addv(a, c)
-        amc = gf_subv(a, c)
-        bpd = gf_addv(b, d)
-        ibmd = gf_mul_iv(gf_subv(b, d))
-        y0 = gf_addv(apc, bpd)
-        y1 = gf_mulv(gf_addv(amc, ibmd), vw1)
-        y2 = gf_mulv(gf_subv(apc, bpd), vw2)
-        y3 = gf_mulv(gf_subv(amc, ibmd), vw3)
-        o0, o1, o2, o3 = ntt_scatter4(Val(Q), y0, y1, y2, y3)
+        y0, y1, y2, y3 = dft4_fwd(a, b, c, d, gf_addv, gf_subv, gf_mul_iv)
+        o0, o1, o2, o3 = ntt_scatter4(Val(Q), y0, gf_mulv(y1, vw1),
+                                      gf_mulv(y2, vw2), gf_mulv(y3, vw3))
         SIMD.vstore(o0, x, i0)
         SIMD.vstore(o1, x, i0 + 8)
         SIMD.vstore(o2, x, i0 + 16)
@@ -515,15 +542,9 @@ function ntt_smallq_inv!(x::Vector{UInt64}, o::Int, N2::Int, ::Val{Q},
         v2 = SIMD.vload(V8, x, i0 + 16)
         v3 = SIMD.vload(V8, x, i0 + 24)
         y0, y1, y2, y3 = ntt_gather4(Val(Q), v0, v1, v2, v3)
-        t1 = gf_mulv(y1, vw1)
-        t2 = gf_mulv(y2, vw2)
-        t3 = gf_mulv(y3, vw3)
-        u = gf_addv(y0, t2)
-        p = gf_subv(y0, t2)
-        v = gf_addv(t1, t3)
-        w = gf_mul_iv(gf_subv(t1, t3))   # i^-1 == -i: add/sub swapped
-        o0, o1, o2, o3 = ntt_scatter4(Val(Q), gf_addv(u, v), gf_subv(p, w),
-                                      gf_subv(u, v), gf_addv(p, w))
+        z0, z1, z2, z3 = dft4_inv(y0, gf_mulv(y1, vw1), gf_mulv(y2, vw2),
+                                  gf_mulv(y3, vw3), gf_addv, gf_subv, gf_mul_iv)
+        o0, o1, o2, o3 = ntt_scatter4(Val(Q), z0, z1, z2, z3)
         SIMD.vstore(o0, x, i0)
         SIMD.vstore(o1, x, i0 + 8)
         SIMD.vstore(o2, x, i0 + 16)
@@ -557,17 +578,15 @@ function ntt_fwd_pow2!(x::Vector{UInt64}, o::Int, plan::NttPlan)
                     b = SIMD.vload(V8, x, i0 + q)
                     c = SIMD.vload(V8, x, i0 + 2q)
                     d = SIMD.vload(V8, x, i0 + 3q)
-                    apc = gf_addv(a, c)
-                    amc = gf_subv(a, c)
-                    bpd = gf_addv(b, d)
-                    ibmd = gf_mul_iv(gf_subv(b, d))
+                    y0, y1, y2, y3 = dft4_fwd(a, b, c, d,
+                                              gf_addv, gf_subv, gf_mul_iv)
                     vw1 = SIMD.vload(V8, w1, j + 1)
                     vw2 = SIMD.vload(V8, w2, j + 1)
                     vw3 = SIMD.vload(V8, w3, j + 1)
-                    SIMD.vstore(gf_addv(apc, bpd), x, i0)
-                    SIMD.vstore(gf_mulv(gf_addv(amc, ibmd), vw1), x, i0 + q)
-                    SIMD.vstore(gf_mulv(gf_subv(apc, bpd), vw2), x, i0 + 2q)
-                    SIMD.vstore(gf_mulv(gf_subv(amc, ibmd), vw3), x, i0 + 3q)
+                    SIMD.vstore(y0, x, i0)
+                    SIMD.vstore(gf_mulv(y1, vw1), x, i0 + q)
+                    SIMD.vstore(gf_mulv(y2, vw2), x, i0 + 2q)
+                    SIMD.vstore(gf_mulv(y3, vw3), x, i0 + 3q)
                 end
             end
         elseif N2 >= 32
@@ -581,14 +600,12 @@ function ntt_fwd_pow2!(x::Vector{UInt64}, o::Int, plan::NttPlan)
                     b = x[s+j+q+1]
                     c = x[s+j+2q+1]
                     d = x[s+j+3q+1]
-                    apc = gf_add(a, c)
-                    amc = gf_sub(a, c)
-                    bpd = gf_add(b, d)
-                    ibmd = gf_mul_i(gf_sub(b, d))
-                    x[s+j+1] = gf_add(apc, bpd)
-                    x[s+j+q+1] = gf_mul(gf_add(amc, ibmd), w1[j+1])
-                    x[s+j+2q+1] = gf_mul(gf_sub(apc, bpd), w2[j+1])
-                    x[s+j+3q+1] = gf_mul(gf_sub(amc, ibmd), w3[j+1])
+                    y0, y1, y2, y3 = dft4_fwd(a, b, c, d,
+                                              gf_add, gf_sub, gf_mul_i)
+                    x[s+j+1] = y0
+                    x[s+j+q+1] = gf_mul(y1, w1[j+1])
+                    x[s+j+2q+1] = gf_mul(y2, w2[j+1])
+                    x[s+j+3q+1] = gf_mul(y3, w3[j+1])
                 end
             end
         end
@@ -632,14 +649,7 @@ function ntt_inv_pow2!(x::Vector{UInt64}, o::Int, plan::NttPlan)
             t1 = gf_mul(x[s+2], ninv)
             t2 = gf_mul(x[s+3], ninv)
             t3 = gf_mul(x[s+4], ninv)
-            u = gf_add(t0, t2)
-            p = gf_sub(t0, t2)
-            v = gf_add(t1, t3)
-            w = gf_mul_i(gf_sub(t1, t3))
-            x[s+1] = gf_add(u, v)
-            x[s+2] = gf_sub(p, w)
-            x[s+3] = gf_sub(u, v)
-            x[s+4] = gf_add(p, w)
+            x[s+1], x[s+2], x[s+3], x[s+4] = dft4_inv(t0, t1, t2, t3, gf_add, gf_sub, gf_mul_i)
         end
     else
         # N2 == 1 or 2 with even log2: only N2 == 1, scale alone
@@ -662,14 +672,11 @@ function ntt_inv_pow2!(x::Vector{UInt64}, o::Int, plan::NttPlan)
                     t1 = gf_mulv(SIMD.vload(V8, x, i0 + q), vw1)
                     t2 = gf_mulv(SIMD.vload(V8, x, i0 + 2q), vw2)
                     t3 = gf_mulv(SIMD.vload(V8, x, i0 + 3q), vw3)
-                    u = gf_addv(t0, t2)
-                    p = gf_subv(t0, t2)
-                    v = gf_addv(t1, t3)
-                    w = gf_mul_iv(gf_subv(t1, t3))   # i^-1 == -i
-                    SIMD.vstore(gf_addv(u, v), x, i0)
-                    SIMD.vstore(gf_subv(p, w), x, i0 + q)
-                    SIMD.vstore(gf_subv(u, v), x, i0 + 2q)
-                    SIMD.vstore(gf_addv(p, w), x, i0 + 3q)
+                    y0, y1, y2, y3 = dft4_inv(t0, t1, t2, t3, gf_addv, gf_subv, gf_mul_iv)
+                    SIMD.vstore(y0, x, i0)
+                    SIMD.vstore(y1, x, i0 + q)
+                    SIMD.vstore(y2, x, i0 + 2q)
+                    SIMD.vstore(y3, x, i0 + 3q)
                 end
             end
         elseif N2 >= 32
@@ -683,14 +690,7 @@ function ntt_inv_pow2!(x::Vector{UInt64}, o::Int, plan::NttPlan)
                     t1 = gf_mul(x[s+j+q+1], w1[j+1])
                     t2 = gf_mul(x[s+j+2q+1], w2[j+1])
                     t3 = gf_mul(x[s+j+3q+1], w3[j+1])
-                    u = gf_add(t0, t2)
-                    p = gf_sub(t0, t2)
-                    v = gf_add(t1, t3)
-                    w = gf_mul_i(gf_sub(t1, t3))   # i^-1 == -i
-                    x[s+j+1] = gf_add(u, v)
-                    x[s+j+q+1] = gf_sub(p, w)
-                    x[s+j+2q+1] = gf_sub(u, v)
-                    x[s+j+3q+1] = gf_add(p, w)
+                    x[s+j+1], x[s+j+q+1], x[s+j+2q+1], x[s+j+3q+1] = dft4_inv(t0, t1, t2, t3, gf_add, gf_sub, gf_mul_i)
                 end
             end
         end
@@ -723,6 +723,11 @@ function ntt_inv!(x::Vector{UInt64}, plan::NttPlan)
 end
 
 # ---------------------------------------------------------------------------
+# Coefficient-domain layer, in pipeline order: size the transform (ntt_len,
+# ntt_params), split limbs into chunk coefficients (ntt_pack), multiply
+# lanewise between the transforms (ntt_pointwise!), and reassemble the
+# product limbs (ntt_unpack!).
+
 # smallest supported transform length >= T: m·2^k, m in (1, 3, 5, 15), k >= 2
 function ntt_len(T::Int)
     best = nextpow(2, max(T, 4))
@@ -757,9 +762,10 @@ end
 # no special case); only the last few chunks, where limbs[lo+w+2] may not
 # exist, take the guarded path.
 function ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::Int)
-    x = zeros(UInt64, N)
+    x = Vector{UInt64}(undef, N)   # the loops cover x[1:nch], the fill! the rest
     mask = (UInt64(1) << b) - 1
-    imax = min(nch - 1, (64 * (n - 1) - 1) ÷ b)   # b*i < 64(n-1) ⟹ w+2 <= n
+    # b*i < 64(n-1) ⟹ w+2 <= n; fld, not ÷: n == 1 must give imax == -1
+    imax = min(nch - 1, fld(64 * (n - 1) - 1, b))
     @inbounds for i in 0:imax
         bit = i * b
         w = bit >> 6
@@ -777,15 +783,34 @@ function ntt_pack(limbs::Memory{Limb}, lo::Int, n::Int, b::Int, nch::Int, N::Int
         end
         x[i+1] = c & mask
     end
+    fill!(view(x, nch+1:N), UInt64(0))
     return x
 end
 
-# Accumulate coefficients x[1:nconv] (each < 2^63) into r[ro+1..ro+rn] as
-# Σ x[i+1]·2^(b·i).  Coefficients arrive in increasing bit order, so a
-# streaming 128-bit accumulator absorbs all carries: between flushes the
-# pending contributions total < 2^128 (each added term is < 2^(63+64) and
-# successive terms shift up by b), and each iteration needs at most one
-# flush since b <= 32 < 64.
+# lanewise xa .= xa .* xb in GF(p); N is a supported transform length
+function ntt_pointwise!(xa::Vector{UInt64}, xb::Vector{UInt64})
+    n = length(xa)
+    i = 1
+    if n >= 8
+        @inbounds while i + 7 <= n
+            SIMD.vstore(gf_mulv(SIMD.vload(V8, xa, i), SIMD.vload(V8, xb, i)), xa, i)
+            i += 8
+        end
+    end
+    @inbounds while i <= n
+        xa[i] = gf_mul(xa[i], xb[i])
+        i += 1
+    end
+    return xa
+end
+
+# Accumulate coefficients x[1:nconv] (each < p < 2^64, by ntt_params'
+# exactness bound) into r[ro+1..ro+rn] as Σ x[i+1]·2^(b·i).  Coefficients
+# arrive in increasing bit order, so a streaming 128-bit accumulator absorbs
+# all carries: shifts stay below 64 between flushes, so the pending sum is
+# < 2^64·2^63·Σ_j 2^(-j·b) <= 2^64·2^64 == 2^128 with strict inequality
+# from the coefficient bound — a ~2x margin, so don't weaken the flush
+# cadence.  Each iteration needs at most one flush since b <= 32 < 64.
 function ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{UInt64},
                      nconv::Int, b::Int)
     acc = UInt128(0)
@@ -812,41 +837,17 @@ function ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{UInt64},
 end
 
 # ---------------------------------------------------------------------------
-# mpn-layer entry points.  mul!/sqr! in algorithms.jl dispatch here above the
-# thresholds (benchmark-tuned via bench/bench_ntt.jl): the NTT beats
-# Karatsuba from ~800 balanced limbs, and for unbalanced operands only once
-# the smaller one is substantial (Karatsuba's unbalanced path is
-# ~max·min^0.585 while the NTT pays for the combined length).
-const NTT_MUL_MIN = 256    # smaller operand at least this many limbs
-const NTT_MUL_SUM = 1792   # combined limb count at least this
+# mpn-layer entry points.  mul!/sqr! in algorithms.jl dispatch here above
+# the MUL_NTT_*/SQR_NTT_* thresholds defined alongside the other tuned
+# constants at the top of algorithms.jl.
 
-# lanewise xa .= xa .* xb in GF(p); N is a supported transform length
-function ntt_pointwise!(xa::Vector{UInt64}, xb::Vector{UInt64})
-    n = length(xa)
-    i = 1
-    if n >= 8
-        @inbounds while i + 7 <= n
-            SIMD.vstore(gf_mulv(SIMD.vload(V8, xa, i), SIMD.vload(V8, xb, i)), xa, i)
-            i += 8
-        end
-    end
-    @inbounds while i <= n
-        xa[i] = gf_mul(xa[i], xb[i])
-        i += 1
-    end
-    return xa
-end
-
-# bit length of the m-limb magnitude at a[ao+1..]; tolerates an unnormalized
-# (zero) top limb, in which case it's a valid upper bound
-@inline ntt_bits(a::Memory{Limb}, ao::Int, m::Int) =
-    max(64 * (m - 1) + Base.top_set_bit(@inbounds a[ao+m]), 1)
-
-# r[ro+1..ro+m+n] = a[ao+1..ao+m] * b[bo+1..bo+n]; r must not alias a or b
-function ntt_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
+# r[ro+1..ro+m+n] = a[ao+1..ao+m] * b[bo+1..bo+n], both nonzero; r must not
+# alias a or b.  magnitude_bits tolerates an unnormalized (zero) top limb,
+# where it's still a valid upper bound (powermod passes such operands).
+function mul_ntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                   b::Memory{Limb}, bo::Int, n::Int)
-    bits_a = ntt_bits(a, ao, m)
-    bits_b = ntt_bits(b, bo, n)
+    bits_a = magnitude_bits(a, ao, m)
+    bits_b = magnitude_bits(b, bo, n)
     bch, N = ntt_params(bits_a, bits_b)
     plan = ntt_plan(N)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
@@ -860,10 +861,10 @@ function ntt_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     return nothing
 end
 
-# r[ro+1..ro+2n] = a[ao+1..ao+n]^2 with one forward transform instead of two;
-# r must not alias a
-function ntt_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
-    bits = ntt_bits(a, ao, n)
+# r[ro+1..ro+2n] = a[ao+1..ao+n]^2, a nonzero, with one forward transform
+# instead of two; r must not alias a
+function sqr_ntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    bits = magnitude_bits(a, ao, n)
     bch, N = ntt_params(bits, bits)
     plan = ntt_plan(N)
     nca = cld(bits, bch)
@@ -873,25 +874,4 @@ function ntt_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     ntt_inv!(xa, plan)
     ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch)
     return nothing
-end
-
-# NBig-level wrappers (used by the tests and benchmarks; production traffic
-# reaches the NTT through mul!/sqr!'s threshold dispatch)
-function ntt_mul(a::NBig, b::NBig)
-    (iszero(a) || iszero(b)) && return NBig(0, EMPTY_LIMBS)
-    la, lb = nlimbs(a), nlimbs(b)
-    (la < 16 || lb < 16) && return a * b
-    r = Memory{Limb}(undef, la + lb)
-    ntt_mul!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
-    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
-end
-
-# the (nonnegative) square of a's magnitude
-function ntt_square(a::NBig)
-    iszero(a) && return NBig(0, EMPTY_LIMBS)
-    la = nlimbs(a)
-    la < 16 && return a * a
-    r = Memory{Limb}(undef, 2la)
-    ntt_sqr!(r, 0, a.limbs, 0, la)
-    return nbig_from_limbs(1, r, 2la)
 end

@@ -41,15 +41,15 @@ afrombig(x::BigInt, n) = (v = zeros(UInt64, n); for i in 1:n; v[i] = UInt64(x & 
     @test kar_scratch_len(4 * KARATSUBA_THRESHOLD) > kar_scratch_len(2 * KARATSUBA_THRESHOLD)
 end
 
-using NativeBigInt: kar_mul!
+using NativeBigInt: mul_kar!
 
-@testset "kar_mul! balanced" begin
+@testset "mul_kar! balanced" begin
     rng = MersenneTwister(123)
     T = KARATSUBA_THRESHOLD
     check(n, a, b) = begin
         r = Memory{UInt64}(undef, 2n)
         scratch = Memory{UInt64}(undef, kar_scratch_len(n))
-        kar_mul!(r, 0, a, 0, b, 0, n, scratch, 0)
+        mul_kar!(r, 0, a, 0, b, 0, n, scratch, 0)
         @test atoref(r, 0, 2n) == atoref(a, 0, n) * atoref(b, 0, n)
     end
     # sizes spanning the threshold, odd/even splits, two+ recursion levels

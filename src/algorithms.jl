@@ -2,8 +2,25 @@
 # Knuth Algorithm D division, sqrt, powermod, and radix conversion.
 # (Montgomery reduction lives in montgomery.jl, the Lehmer gcds in gcd.jl.)
 
-# Below this operand length (limbs) mul_basecase! wins; benchmark-tuned.
+# Benchmark-tuned dispatch thresholds for mul!/sqr!, in limbs.
+# Basecase → Karatsuba (bench/bench_kar_thr.jl, bench/bench_sqr.jl):
+# sqr_basecase! does half the multiplies of mul_basecase!, so squaring stays
+# basecase longer.
 const KARATSUBA_THRESHOLD = 29
+const SQR_KARATSUBA_THRESHOLD = 52
+# Karatsuba → NTT (bench/bench_mul.jl, bench/bench_sqr.jl): the NTT wins from
+# ~900 balanced limbs, but for unbalanced operands only once the smaller one
+# is substantial (Karatsuba's unbalanced path is ~max·min^0.585 while the
+# NTT pays for the combined length).  Squaring crosses over later: sqr_ntt!
+# saves only one of mul_ntt!'s three transforms while sqr_kar! roughly
+# halves mul_kar!.
+const MUL_NTT_MIN = 256         # smaller operand at least this many limbs
+const MUL_NTT_THRESHOLD = 896   # average operand at least this many limbs
+const SQR_NTT_THRESHOLD = 1024  # operand at least this many limbs
+
+# Bit length of the n-limb magnitude at a[ao+1..ao+n], n >= 1; requires a
+# normalized (nonzero) top limb.
+@inline magnitude_bits(a, ao::Int, n::Int) = 64 * (n - 1) + Base.top_set_bit(@inbounds a[ao+n])
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -29,7 +46,7 @@ function abs_diff!(d::Memory{Limb}, dof::Int, x::Memory{Limb}, xo::Int, lo_len::
     end
 end
 
-# Scratch limbs kar_mul! needs for an n x n product: 4*ceil(n/2) per level.
+# Scratch limbs mul_kar! needs for an n x n product: 4*ceil(n/2) per level.
 function kar_scratch_len(n::Int, thr::Int=KARATSUBA_THRESHOLD)
     len = 0
     while n >= thr
@@ -43,7 +60,7 @@ end
 # a*b = hi*B^(2h2) + (lo + hi - s*mid)*B^h2 + lo where mid = |a_lo-a_hi|*|b_lo-b_hi|.
 # The middle term equals a_lo*b_hi + a_hi*b_lo >= 0, so carries never underflow.
 # scratch must have kar_scratch_len(n) limbs free at so; r must not alias a/b.
-function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
+function mul_kar!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
                   b::Memory{Limb}, bo::Int, n::Int, scratch::Memory{Limb}, so::Int,
                   thr::Int=KARATSUBA_THRESHOLD)
     if n < thr
@@ -57,9 +74,9 @@ function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
     rec = so + 2L       # recursion scratch
     nega = abs_diff!(scratch, tmp, a, ao, h2, h)
     negb = abs_diff!(scratch, tmp + h2, b, bo, h2, h)
-    kar_mul!(scratch, mid, scratch, tmp, scratch, tmp + h2, h2, scratch, rec, thr)
-    kar_mul!(r, ro, a, ao, b, bo, h2, scratch, rec, thr)                 # lo
-    kar_mul!(r, ro + L, a, ao + h2, b, bo + h2, h, scratch, rec, thr)    # hi
+    mul_kar!(scratch, mid, scratch, tmp, scratch, tmp + h2, h2, scratch, rec, thr)
+    mul_kar!(r, ro, a, ao, b, bo, h2, scratch, rec, thr)                 # lo
+    mul_kar!(r, ro + L, a, ao + h2, b, bo + h2, h, scratch, rec, thr)    # hi
     c = add!(scratch, tmp, r, ro, L, r, ro + L, 2h)                 # tmp = lo + hi
     if nega == negb
         c -= sub_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
@@ -71,15 +88,11 @@ function kar_mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
     return nothing
 end
 
-# sqr_basecase! does half the multiplies of mul_basecase!, so squaring stays
-# basecase longer than mul; benchmark-tuned separately.
-const SQR_KARATSUBA_THRESHOLD = 52
-
 # Balanced Karatsuba squaring: r[1..2n] = a[1..n]^2. Same recursion shape as
-# kar_mul! with mid = (a_lo - a_hi)^2 >= 0, so the middle term is always
+# mul_kar! with mid = (a_lo - a_hi)^2 >= 0, so the middle term is always
 # lo + hi - mid and there is no sign tracking. Scratch layout matches
 # kar_scratch_len(n); r must not alias a.
-function kar_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
+function sqr_kar!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
                   scratch::Memory{Limb}, so::Int, thr::Int=SQR_KARATSUBA_THRESHOLD)
     if n < thr
         return sqr_basecase!(r, ro, a, ao, n)
@@ -91,9 +104,9 @@ function kar_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
     tmp = so + L        # L limbs: the difference, then lo + hi - mid
     rec = so + 2L       # recursion scratch
     abs_diff!(scratch, tmp, a, ao, h2, h)
-    kar_sqr!(scratch, mid, scratch, tmp, h2, scratch, rec, thr)
-    kar_sqr!(r, ro, a, ao, h2, scratch, rec, thr)                 # lo
-    kar_sqr!(r, ro + L, a, ao + h2, h, scratch, rec, thr)         # hi
+    sqr_kar!(scratch, mid, scratch, tmp, h2, scratch, rec, thr)
+    sqr_kar!(r, ro, a, ao, h2, scratch, rec, thr)                 # lo
+    sqr_kar!(r, ro + L, a, ao + h2, h, scratch, rec, thr)         # hi
     c = add!(scratch, tmp, r, ro, L, r, ro + L, 2h)               # tmp = lo + hi
     c -= sub_n!(scratch, tmp, scratch, tmp, scratch, mid, L)
     add_into!(r, ro + h2, 2n - h2, scratch, tmp, L)
@@ -102,16 +115,15 @@ function kar_sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
 end
 
 # r[1..2n] = a[1..n]^2, n >= 1; r must not alias a.
-function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
-              thr::Int=SQR_KARATSUBA_THRESHOLD)
-    if n < thr
+function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    if n < SQR_KARATSUBA_THRESHOLD
         return sqr_basecase!(r, ro, a, ao, n)
     end
-    if 2n >= NTT_MUL_SUM
-        return ntt_sqr!(r, ro, a, ao, n)
+    if n >= SQR_NTT_THRESHOLD
+        return sqr_ntt!(r, ro, a, ao, n)
     end
-    scratch = Memory{Limb}(undef, kar_scratch_len(n, thr))
-    kar_sqr!(r, ro, a, ao, n, scratch, 0, thr)
+    scratch = Memory{Limb}(undef, kar_scratch_len(n, SQR_KARATSUBA_THRESHOLD))
+    sqr_kar!(r, ro, a, ao, n, scratch, 0)
     return nothing
 end
 
@@ -119,22 +131,22 @@ end
 # alias a or b. Karatsuba on n-limb chunks of a; each block's low n limbs
 # accumulate into r, its high limbs land in fresh territory (plus carry).
 function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
-              b::Memory{Limb}, bo::Int, n::Int, thr::Int=KARATSUBA_THRESHOLD)
-    if n < thr
+              b::Memory{Limb}, bo::Int, n::Int)
+    if n < KARATSUBA_THRESHOLD
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
-    if n >= NTT_MUL_MIN && m + n >= NTT_MUL_SUM
-        return ntt_mul!(r, ro, a, ao, m, b, bo, n)
+    if n >= MUL_NTT_MIN && m + n >= 2MUL_NTT_THRESHOLD
+        return mul_ntt!(r, ro, a, ao, m, b, bo, n)
     end
-    scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n, thr))
-    kar_mul!(r, ro, a, ao, b, bo, n, scratch, 2n, thr)
+    scratch = Memory{Limb}(undef, 2n + kar_scratch_len(n))
+    mul_kar!(r, ro, a, ao, b, bo, n, scratch, 2n)
     i = n
     while i < m
         chunk = min(n, m - i)
         if chunk == n
-            kar_mul!(scratch, 0, a, ao + i, b, bo, n, scratch, 2n, thr)
+            mul_kar!(scratch, 0, a, ao + i, b, bo, n, scratch, 2n)
         else
-            mul!(scratch, 0, b, bo, n, a, ao + i, chunk, thr)  # ragged tail, n x chunk
+            mul!(scratch, 0, b, bo, n, a, ao + i, chunk)  # ragged tail, n x chunk
         end
         c = add_n!(r, ro + i, r, ro + i, scratch, 0, n)
         copy_tail!(r, ro + i, scratch, 0, n + 1, n + chunk)
@@ -346,7 +358,7 @@ end
 # identical output to repeatedly dividing by 2^c, but O(n). Does not touch a.
 function radix_chunks_pow2(a::Memory{Limb}, n::Int, c::Int)
     n == 0 && return Limb[]
-    bitlen = 64 * (n - 1) + Base.top_set_bit(@inbounds a[n])
+    bitlen = magnitude_bits(a, 0, n)
     nchunks = cld(bitlen, c)
     chunks = Vector{Limb}(undef, nchunks)
     mask = (one(Limb) << c) - one(Limb)
@@ -385,8 +397,7 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     # quotient below 8 (a/d < 2^(Δ+1)), so at most 7 subtraction sweeps beat
     # the scratch-alloc + normalize + invert + basecase machinery. Δ ≤ 2 also
     # forces n ≤ m+1 with a[n] < 4, so the value fits r plus one register.
-    dbits = 64 * (n - m) + Base.top_set_bit(@inbounds a[ao+n]) -
-            Base.top_set_bit(@inbounds d[do_+m])
+    dbits = magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m)
     if dbits <= 2
         copyto!(r, ro + 1, a, ao + 1, m)
         t = n > m ? (@inbounds a[ao+n]) : zero(Limb)

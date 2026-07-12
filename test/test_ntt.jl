@@ -1,7 +1,29 @@
-# NTT multiplication prototype: Goldilocks field arithmetic, transform, ntt_mul
+# NTT multiplication: Goldilocks field arithmetic, transform, mul_ntt!/sqr_ntt!
 using NativeBigInt: GF_P, gf_add, gf_sub, gf_mul, gf_pow, gf_inv,
-                    ntt_plan, ntt_fwd!, ntt_inv!
+                    ntt_plan, ntt_fwd!, ntt_inv!, mul_ntt!, sqr_ntt!,
+                    Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
+
+# NBig-level harness around the mpn entry points: forces the NTT path at any
+# size, so the differential tests also cover the small and odd-shaped
+# transforms that production mul!/sqr! dispatch (above the thresholds) never
+# reaches
+function ntt_mul(a::NBig, b::NBig)
+    (iszero(a) || iszero(b)) && return NBig(0)
+    la, lb = nlimbs(a), nlimbs(b)
+    r = Memory{Limb}(undef, la + lb)
+    mul_ntt!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
+end
+
+# the (nonnegative) square of a's magnitude
+function ntt_square(a::NBig)
+    iszero(a) && return NBig(0)
+    la = nlimbs(a)
+    r = Memory{Limb}(undef, 2la)
+    sqr_ntt!(r, 0, a.limbs, 0, la)
+    return nbig_from_limbs(1, r, 2la)
+end
 
 @testset "goldilocks field arithmetic" begin
     P = big(GF_P)
@@ -95,18 +117,18 @@ end
 
 @testset "differential ntt_mul" begin
     rng = MersenneTwister(0x9057)
-    @test iszero(NativeBigInt.ntt_mul(NBig(0), NBig(12345)))
-    @test iszero(NativeBigInt.ntt_mul(NBig(-7), NBig(0)))
-    @test BigInt(NativeBigInt.ntt_mul(NBig(-3), NBig(5))) == -15
+    @test iszero(ntt_mul(NBig(0), NBig(12345)))
+    @test iszero(ntt_mul(NBig(-7), NBig(0)))
+    @test BigInt(ntt_mul(NBig(-3), NBig(5))) == -15
 
-    # small (fallback path), mid, large, unbalanced; straddle pow2 boundaries
+    # small, mid, large, unbalanced; straddle pow2 boundaries
     for (na, nb) in ((1, 1), (3, 2), (15, 15), (16, 16), (17, 40), (100, 100),
                      (255, 257), (1024, 1024), (2000, 100), (5000, 5000),
                      (190, 190), (600, 600), (1100, 1050), (2500, 2500))
         for trial in 1:(na * nb > 10^5 ? 2 : 8)
             a = ntt_randbig(rng, na)
             b = ntt_randbig(rng, nb)
-            @test BigInt(NativeBigInt.ntt_mul(NBig(a), NBig(b))) == a * b
+            @test BigInt(ntt_mul(NBig(a), NBig(b))) == a * b
         end
     end
 end
@@ -125,10 +147,10 @@ end
 
 @testset "ntt_square and * integration" begin
     rng = MersenneTwister(0x5a2e)
-    @test iszero(NativeBigInt.ntt_square(NBig(0)))
-    for n in (16, 100, 700, 1024, 2500)
+    @test iszero(ntt_square(NBig(0)))
+    for n in (1, 5, 16, 100, 700, 1024, 2500)
         a = ntt_randbig(rng, n)
-        @test BigInt(NativeBigInt.ntt_square(NBig(a))) == a^2
+        @test BigInt(ntt_square(NBig(a))) == a^2
     end
     # `*` dispatches to the NTT above the thresholds (and stays correct
     # across them); x*x and x^2 take the squaring path

@@ -240,7 +240,7 @@ function Base.isqrt(x::NBig)
         v = (UInt128(hi) << 64) | (@inbounds x.limbs[1])
         return NBig(isqrt(v) % Limb)
     end
-    bits = 64 * (n - 1) + Base.top_set_bit(@inbounds x.limbs[n])
+    bits = magnitude_bits(x.limbs, 0, n)
     e = (64n - bits) & ~1
     # sqrtrem! needs an even limb count; odd n gets a zero low limb (a β
     # multiply — a further even shift), undone below via the root shift.
@@ -614,7 +614,7 @@ Base.widen(::Type{NBig}) = NBig
 function Base.top_set_bit(x::NBig)
     n = nlimbs(x)
     n == 0 && return 0
-    return 64 * (n - 1) + Base.top_set_bit(@inbounds x.limbs[n])
+    return magnitude_bits(x.limbs, 0, n)
 end
 
 # Arbitrary precision never overflows (matches Base's BigInt methods).

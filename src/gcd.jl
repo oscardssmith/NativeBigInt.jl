@@ -257,8 +257,8 @@ function gcd_core!(u::Memory{Limb}, lu::Int, v::Memory{Limb}, lv::Int,
             @inbounds u[2] = (x >> 64) % Limb
             return u, ((x >> 64) != 0 ? 2 : 1)
         end
-        ub = 64 * (lu - 1) + Base.top_set_bit(@inbounds u[lu])
-        vb = 64 * (lv - 1) + Base.top_set_bit(@inbounds v[lv])
+        ub = magnitude_bits(u, 0, lu)
+        vb = magnitude_bits(v, 0, lv)
         A = B = C = D = UInt64(0)
         even = true
         steps = 0

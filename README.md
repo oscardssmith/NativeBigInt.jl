@@ -1,14 +1,15 @@
 # NativeBigInt.jl
 
 Pure-Julia arbitrary-precision integer type (`NBig`) targeting GMP-competitive
-performance in the ~100–4000 bit regime. Requires a recent Julia (uses
-`Memory{UInt64}`).
+performance from ~100 bits up: within ~1.2× of GMP through the Karatsuba
+range, and faster than GMP above ~100k bits thanks to an NTT multiplication.
+Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
 
 Three layers, mirroring GMP's mpn/mpz split:
 
-- **Kernels (`src/kernels.jl`):** sign-free limb-vector primitives —
+- **Kernels (`src/kernels/`):** sign-free limb-vector primitives —
   `add_n!`/`sub_n!`, `mul_1!`/`addmul_1!`/`submul_1!`, `mul_2!`/`addmul_2!`,
   `mul_basecase!`, `lshift!`/`rshift!`, `cmp_limbs`. Division uses a
   reciprocal-based `divrem_1!` (Möller–Granlund 2/1 normalized inverse, with
@@ -23,6 +24,17 @@ Three layers, mirroring GMP's mpn/mpz split:
   path; multi-limb `divrem!` (Knuth Algorithm D basecase over `divrem_bc!`);
   power by repeated squaring; radix conversion for `string`/`parse`
   (per-limb `divrem_1!` for small values, divide-and-conquer for large).
+- **NTT multiplication (`src/ntt.jl`):** above ~1800 combined limbs,
+  `mul!`/`sqr!` dispatch to a number-theoretic transform over the Goldilocks
+  field GF(2^64 − 2^32 + 1). Radix-4 DIF/DIT with fully vectorized
+  butterflies (the 64×64 products are assembled from widening 32×32
+  multiplies, so the hot path vectorizes portably on AVX2/AVX-512/NEON, and
+  the reduction is multiplication-free since 2^64 ≡ 2^32 − 1); the fourth-root
+  rotation i = 2^48 is shift-only; sub-vector-width stages run through
+  in-register shuffle butterflies. Transform lengths m·2^k for m ∈
+  {1, 3, 5, 15} (Winograd radix-3, radix-5) keep zero-padding waste ≤ ~25%,
+  and pack/unpack stream branch-free through a 128-bit accumulator.
+  Squaring uses one forward transform instead of two.
 - **`NBig` (`src/nbig.jl`):** sign-magnitude value type
   (`signlen = sign * limb count`, little-endian normalized `Memory{UInt64}`),
   covering comparison, `+`/`-`/`*`, `divrem`/`div`/`rem`/`mod`/`fld`/`cld`,
@@ -44,6 +56,20 @@ NBig time / BigInt time — lower is better; ≤1.0 means NBig is faster.
 
 NBig matches or beats `BigInt` across the whole 128–4096 bit range for
 `+`/`-`/`*`, and is within ~1.15× for `divrem` at the top of the range.
+
+Above that, the NTT takes over (`bench/bench_mul.jl`, AVX-512 machine;
+ratio is NBig `*` / BigInt `*`):
+
+| bits    | 33k  | 66k  | 131k | 262k | 524k | 2.1M | 16.8M | 268M |
+|---------|------|------|------|------|------|------|-------|------|
+| `*`     | 1.12 | 1.15 | 0.93 | 0.85 | 0.81 | 0.69 | 0.64  | 0.74 |
+
+GMP parity lands around ~100k bits, and the lead holds at roughly 1.3–1.5×
+through the largest sizes measured (268M bits). Squaring crosses over at the
+same point with a slightly larger lead. Asymptotically the fixed-prime NTT's
+chunk width shrinks as operands grow, so Schönhage–Strassen would win again
+somewhere around 10^11 bits — beyond both memory and the field's 2-adicity
+limit, so it never matters in practice.
 
 Kernel-level benchmarks against GMP's `__gmpn_*` functions directly live
 alongside this one in `bench/` (see `bench/bench_kernels.jl`,
