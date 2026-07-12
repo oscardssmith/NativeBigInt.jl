@@ -169,3 +169,102 @@ end
     d = abs(fpntt_randbig(rng, 1000))
     @test BigInt(isqrt(NBig(d))) == isqrt(d)
 end
+
+# --------------------------------------------------------------------------
+# Two-prime CRT extension
+
+using NativeBigInt: FP_CTX2, FP_PI2, FP_PI12, mul_fpntt2!, sqr_fpntt2!,
+                    fp_ntt_unpack2!, fp_ntt_params2
+
+fp_canonc(x::Float64, F) = (v = fp_reduce(x, F); v < 0 && (v += F.p); UInt64(v))
+
+function fpntt2_mul(a::NBig, b::NBig)
+    (iszero(a) || iszero(b)) && return NBig(0)
+    la, lb = nlimbs(a), nlimbs(b)
+    r = Memory{Limb}(undef, la + lb)
+    mul_fpntt2!(r, 0, a.limbs, 0, la, b.limbs, 0, lb)
+    return nbig_from_limbs(sign(a) * sign(b), r, la + lb)
+end
+
+function fpntt2_square(a::NBig)
+    iszero(a) && return NBig(0)
+    la = nlimbs(a)
+    r = Memory{Limb}(undef, 2la)
+    sqr_fpntt2!(r, 0, a.limbs, 0, la)
+    return nbig_from_limbs(1, r, 2la)
+end
+
+@testset "fp second prime and transform" begin
+    @test FP_PI2 == 0x0001_FE00_0000_0001            # 255·2^41 + 1
+    @test Float64(FP_PI2) == FP_CTX2.p               # exactly representable
+    @test FP_PI2 - 1 == UInt64(255) << 41
+    @test (FP_PI2 - 1) % (UInt64(15) << 41) == 0     # 15·2^41 length family
+    @test FP_PI12 == UInt128(FP_PI) * FP_PI2
+
+    rng = MersenneTwister(0x2b1)
+    for N in (4, 8, 64, 512, 12, 20, 48, 240, 1536)
+        plan = fp_ntt_plan(N, FP_CTX2)
+        x = Float64.(rand(rng, UInt64(0):FP_PI2-1, N))
+        y = copy(x)
+        fp_ntt_fwd!(y, plan)
+        @test y != x
+        fp_ntt_inv!(y, plan)
+        @test fp_canonc.(y, Ref(FP_CTX2)) == UInt64.(x)
+    end
+end
+
+@testset "garner unpack vs BigInt CRT" begin
+    rng = MersenneTwister(0x6a3)
+    P1, P2 = big(FP_PI), big(FP_PI2)
+    # random (possibly unreduced, either-sign) fp representatives of each
+    # residue, as the inverse transform would hand them over
+    rep(c, P) = Float64(c % P) + rand(rng, -2:2) * Float64(P)
+    for b in (33, 40, 44, 48), nconv in (1, 7, 64, 200)
+        cs = [rand(rng, big(0):P1*P2-1) for _ in 1:nconv]
+        x1 = [rep(c, P1) for c in cs]
+        x2 = [rep(c, P2) for c in cs]
+        rn = cld(99 + b * (nconv - 1), 64) + 1
+        r = Memory{Limb}(undef, rn)
+        fp_ntt_unpack2!(r, 0, rn, x1, x2, nconv, b)
+        want = sum(c << (b * (i - 1)) for (i, c) in enumerate(cs))
+        @test sum(big(r[i]) << (64 * (i - 1)) for i in 1:rn) == want
+    end
+end
+
+@testset "differential fpntt2" begin
+    rng = MersenneTwister(0x91c4)
+    @test iszero(fpntt2_mul(NBig(0), NBig(12345)))
+    @test BigInt(fpntt2_mul(NBig(-3), NBig(5))) == -15
+    for (na, nb) in ((1, 1), (5, 3), (16, 16), (100, 100), (255, 257),
+                     (500, 300), (601, 373), (1024, 1024), (2500, 2500),
+                     (5000, 4900))
+        for trial in 1:(na * nb > 10^5 ? 2 : 8)
+            a = fpntt_randbig(rng, na)
+            b = fpntt_randbig(rng, nb)
+            @test BigInt(fpntt2_mul(NBig(a), NBig(b))) == a * b
+        end
+    end
+    # feasibility-boundary chunk widths: tiny all-ones operands reach the
+    # largest reachable b (48) with max-magnitude convolution coefficients
+    for na in 1:8, nb in 1:na
+        a = big(2)^(64na) - 1
+        b = big(2)^(64nb) - 1
+        @test BigInt(fpntt2_mul(NBig(a), NBig(b))) == a * b
+    end
+    for n in (1, 7, 100, 1024, 3000)
+        a = fpntt_randbig(rng, n)
+        @test BigInt(fpntt2_square(NBig(a))) == a^2
+    end
+    @test BigInt(fpntt2_square(NBig(big(2)^(64 * 6) - 1))) == (big(2)^(64 * 6) - 1)^2
+end
+
+@testset "fpntt2 dispatch boundary" begin
+    rng = MersenneTwister(0x77aa)
+    nm = NativeBigInt.MUL_FPNTT2_THRESHOLD
+    a = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
+    b = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
+    @test BigInt(NBig(a) * NBig(b)) == a * b
+    ns = NativeBigInt.SQR_FPNTT2_THRESHOLD
+    s = rand(rng, big(2)^(64ns - 1):big(2)^(64ns)-1)
+    @test BigInt(NBig(s)^2) == s^2
+end
