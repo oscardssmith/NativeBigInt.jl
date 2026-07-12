@@ -1,7 +1,10 @@
-# Floating-point NTT over GF(p), p = 2^49 - 2^33 + 1, following FLINT's
-# fft_small design: coefficients live in Float64, products use the FMA
-# error-free transform, and quotients use the magic-constant round.  See
-# docs/superpowers/specs/2026-07-12-fpntt-design.md for the full rationale.
+# Floating-point NTT multiplication following FLINT's fft_small design:
+# coefficients live in Float64, products use the FMA error-free transform,
+# and quotients use the magic-constant round.  The operands are split into
+# b-bit chunks and the convolution is computed by CRT over two ~2^49 primes
+# (working modulus p1·p2 ≈ 2^98.97, so b ≈ 41-44); a single-prime pipeline
+# over p1 alone is kept at the bottom of the file as an unwired test
+# cross-check.
 #
 # Arithmetic model.  Values are exact integers in balanced representation,
 # |x| < a few p.  Every operation is exactly correct (not approximately):
@@ -26,8 +29,8 @@
 # bounds empirically.
 #
 # All bounds hold for any prime p < 2^49, so the engine is parametrized by an
-# FpCtx carrying the per-prime constants; the two-prime CRT path reuses every
-# transform verbatim with the p2 context.
+# FpCtx carrying the per-prime constants and both residue transforms run
+# through the same code.
 #
 # Hardware FMA and round-to-nearest are assumed.  No @fastmath anywhere near
 # this file: contraction would break the fma(x, w, -h) cancellation.
@@ -55,7 +58,7 @@ end
 # 15 | p - 1 (the {1,3,5,15}·2^k length family), product ~2^98.97 (the
 # two-prime working modulus). FP_CTX1.pi etc. are the canonical accessors.
 const FP_CTX1 = FpCtx(UInt(2^49 - 2^33 + 1), (2, 3, 5, 17, 257)) # p1 - 1 = 2^33·3·5·17·257
-const FP_CTX2 = FpCtx(UInt(255·2^41 + 1), (2, 3, 5, 17))         # p2 - 1 = 2^41·3·5·17
+const FP_CTX2 = FpCtx(UInt(255 * 2^41 + 1), (2, 3, 5, 17))        # p2 - 1 = 2^41·3·5·17
 
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
@@ -250,8 +253,8 @@ function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
 end
 
 # ---------------------------------------------------------------------------
-# Odd-radix stages, Winograd radix-3 / plain radix-5;
-# the ω^0 output is fp_reduced, and inverse stages fp_reduce t0 on load.
+# Odd-radix stages: Winograd radix-3 and plain radix-5.  The ω^0 output is
+# fp_reduced before storing, and inverse stages fp_reduce t0 on load.
 
 function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
@@ -773,14 +776,10 @@ function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     return xa
 end
 
-# canonicalize each coefficient to [0, p) and stream limbs out.
 # ---------------------------------------------------------------------------
-# Two-prime CRT pipeline — what dispatch uses.  Both residue transforms run
-# through the shared machinery above (every bound in the header holds for
-# any prime < 2^49); the working modulus p1·p2 ≈ 2^98.97 holds the chunk
-# width at b ≈ 41-44 where a single prime's density decays with size
-# (b ≈ (49 - log2 nc)/2).  See
-# docs/superpowers/specs/2026-07-12-fpntt2-design.md.
+# Two-prime CRT pipeline — what dispatch uses.  The working modulus
+# p1·p2 ≈ 2^98.97 holds the chunk width at b ≈ 41-44 where a single prime's
+# density decays with size (b ≈ (49 - log2 nc)/2).
 
 # chunk width and transform length against the CRT modulus p1·p2.  The bound
 # min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
@@ -799,26 +798,25 @@ function fp_ntt_params2(bits_a::Int, bits_b::Int)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# Garner recombination + limb streaming.  Each coefficient is recovered from
-# its residues as c = c1 + p1·((c2 - c1)·p1^-1 mod p2) ∈ [0, p1·p2) ⊂ [0, 2^99).
-# The mod-p2 step stays in the fp domain (the residues are already Float64,
-# and ·p1^-1 is a mulmod by a fixed twiddle): c1 is canonicalized first
-# (v1 - p1 is a different value mod p2!), then t = v2 - fp_reduce(v1, F2) has
-# |t| < 1.5·p2 <= 4p, so u = fp_mulmod(t, g, gp, F2) is exact.  Only the
-# final c1 + u·p1 is integer arithmetic.
-#
-# The fp work runs 8-wide into small buffers: per-coefficient it is one long
-# serial dependency chain (reduce → canon → reduce → mulmod → canon), and a
-# scalar loop is latency-bound on it (measured ~7 ns/coeff, ~30% of the whole
-# multiply); batching leaves only the integer accumulate on the critical path.
-#
-# The 99-bit coefficients are never materialized: by linearity the product is
+# Garner recombination + limb streaming.  Each coefficient of the product's
+# base-2^b representation is recovered from its residues as
+#   c = c1 + p1·u,  u = (c2 - c1)·p1^-1 mod p2,  c ∈ [0, p1·p2) ⊂ [0, 2^99),
+# but c is never materialized: by linearity the product is
 #   Σ cᵢ·2^(b·i) = Σ c1ᵢ·2^(b·i) + p1 · Σ uᵢ·2^(b·i) = S1 + p1·S2,
 # so the loop streams S1 (into r) and S2 (into scratch) as two independent
-# 49-bit-coefficient sums, folded at the end by one addmul_1! pass at
-# kernel speed.  That replaces a per-coefficient 128-bit multiply and a
-# 192-bit accumulator window with two 128-bit accumulators (and gives the
-# core two independent carry chains instead of one).
+# sums of 49-bit values, folded at the end by one addmul_1! pass at kernel
+# speed.
+#
+# Per 8 coefficients, all SIMD: residues are canonicalized and u is computed
+# in the fp domain (·p1^-1 is a mulmod by a fixed twiddle: c1 must be
+# canonicalized FIRST — v1 - p1 is a different value mod p2 — then
+# t = v2 - fp_reduce(v1, F2) has |t| < 1.5·p2 <= 4p, so fp_mulmod is exact),
+# values are converted to integers, and each is pre-split into the window
+# halves lo = v << s, hi = v >> (64 - s) with per-lane variable shifts —
+# legal because the flush discipline below makes s = (b·i) mod 64, which is
+# data-independent.  The scalar scan is then pure adds-with-carry (a
+# variable UInt128 << there would cost a multi-uop shift sequence per
+# coefficient, since LLVM cannot prove s < 64).
 #
 # Accumulator proof (each stream).  (a1, a0) is a 128-bit window holding the
 # pending sum of contributions to bits [outbit, outbit+128); coefficient i
@@ -831,13 +829,6 @@ end
 # coefficient starts at bit i·b >= outbit + 64, and all contributions are
 # nonnegative, so nothing can carry below its own position.  The final fold
 # S1 + p1·S2 equals the true product < 2^(64·rn), so addmul_1! carries out 0.
-#
-# The window shift s is data-independent — the flush discipline makes
-# s = (b·i) mod 64 — so the split of each v into window halves
-# lo = v << s, hi = v >> (64 - s) is precomputed 8-wide with per-lane
-# variable shifts.  The scalar scan then carries only 64-bit adds; a
-# variable UInt128 << there costs a multi-uop shift sequence per
-# coefficient (LLVM cannot prove s < 64) and dominated the loop.
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64},
                          nconv::Int, b::Int)
@@ -928,8 +919,9 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     return r
 end
 
-# two-prime mpn-layer entry points, same contracts as mul_fpntt!/sqr_fpntt!;
-# pack once per operand and copy for the second prime
+# mpn-layer entry points: r[1..m+n] = a[1..m]·b[1..n], r must not alias the
+# inputs.  Chunks < 2^48 are already canonical residues mod both primes, so
+# each operand is packed once and copied for the second prime.
 function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                      b::Memory{Limb}, bo::Int, n::Int)
     bits_a = magnitude_bits(a, ao, m)
@@ -973,11 +965,11 @@ function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
 end
 
 # ---------------------------------------------------------------------------
-# Single-prime pipeline: r[1..m+n] = a·b (r must not alias the inputs).
-# UNWIRED from dispatch — the two-prime engine measured faster at every size
-# above the Karatsuba band once the two-stream unpack landed — but kept
-# (~20 lines) as an independent pipeline through the shared transform
-# machinery for the differential tests.
+# Single-prime pipeline over p1 alone (b <= 24).  UNWIRED from dispatch —
+# the two-prime engine measures faster at every size above the Karatsuba
+# band — but kept as an independent pipeline through the shared transform
+# machinery for the differential tests.  Same entry-point contracts as the
+# two-prime pipeline above.
 
 # chunk width and transform length: exactness needs every convolution
 # coefficient (a sum of min(nca, ncb) chunk products) below p, so b <= 24
