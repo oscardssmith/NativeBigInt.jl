@@ -815,7 +815,11 @@ function fp_ntt_unpack!(r::Memory{Limb}, ro::Int, rn::Int, x::Vector{Float64},
 end
 
 # ---------------------------------------------------------------------------
-# mpn-layer entry points: r[1..m+n] = a·b (r must not alias the inputs).
+# Single-prime mpn-layer entry points: r[1..m+n] = a·b (r must not alias the
+# inputs).  UNWIRED from dispatch — the two-prime engine measured faster at
+# every size above the Karatsuba band once the two-stream unpack landed —
+# but kept (with fp_ntt_params/fp_ntt_unpack!) as an independent pipeline
+# through the shared transform machinery for the differential tests.
 
 function mul_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                     b::Memory{Limb}, bo::Int, n::Int)

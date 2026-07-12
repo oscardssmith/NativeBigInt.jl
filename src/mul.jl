@@ -11,20 +11,17 @@
 # basecase longer.
 const MUL_KARATSUBA_THRESHOLD = 29
 const SQR_KARATSUBA_THRESHOLD = 52
-# Karatsuba → fp NTT (bench/bench_fpntt_spike.jl sweeps): Karatsuba leads
-# through 320 balanced limbs and is behind by 352 (squaring: leads through
-# 384, behind by 448).  For unbalanced operands the NTT needs the smaller
-# one substantial (the chunked Karatsuba path is ~max·min^0.585 while the
-# NTT pays for the combined length).
+# Karatsuba → two-prime fp NTT: Karatsuba leads through 320 balanced limbs
+# and is behind by 352 (squaring: leads through 384, behind by 448).  The
+# two-prime engine wins over single-prime at every size above this line
+# (its transforms are 2/2.5 the points since b ≈ 43 vs ≈ 17-24; only linear
+# overhead ever favored single-prime, and the two-stream unpack erased
+# that), so dispatch is fp2-only.  For unbalanced operands the NTT needs
+# the smaller one substantial (the chunked Karatsuba path is
+# ~max·min^0.585 while the NTT pays for the combined length).
 const MUL_FPNTT_MIN = 128        # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 336  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 400  # operand at least this many limbs
-# single-prime → two-prime fp NTT: single-prime chunk density decays with
-# size (b ≈ (49 − log2 N)/2), the two-prime CRT engine holds b ≈ 40-44 but
-# runs every transform twice; measured crossover ~37k limbs balanced mul,
-# ~41k squaring (benchmark sweep, this machine).
-const MUL_FPNTT2_THRESHOLD = 36864
-const SQR_FPNTT2_THRESHOLD = 40960
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -131,8 +128,6 @@ function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int,
         sqr_basecase!(r, ro, a, ao, n)
     elseif n < SQR_FPNTT_THRESHOLD
         sqr_kar!(r, ro, a, ao, n, scratch, so)
-    elseif n < SQR_FPNTT2_THRESHOLD
-        sqr_fpntt!(r, ro, a, ao, n)
     else
         sqr_fpntt2!(r, ro, a, ao, n)
     end
@@ -145,11 +140,8 @@ function sqr!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     if n < SQR_KARATSUBA_THRESHOLD
         return sqr_basecase!(r, ro, a, ao, n)
     end
-    if n >= SQR_FPNTT2_THRESHOLD
-        return sqr_fpntt2!(r, ro, a, ao, n)
-    end
     if n >= SQR_FPNTT_THRESHOLD
-        return sqr_fpntt!(r, ro, a, ao, n)
+        return sqr_fpntt2!(r, ro, a, ao, n)
     end
     sqr!(r, ro, a, ao, n, Memory{Limb}(undef, sqr_scratch_len(n)), 0)
     return nothing
@@ -163,8 +155,6 @@ function mul_bal!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int,
         mul_basecase!(r, ro, a, ao, n, b, bo, n)
     elseif n < MUL_FPNTT_THRESHOLD
         mul_kar!(r, ro, a, ao, b, bo, n, scratch, so)
-    elseif n < MUL_FPNTT2_THRESHOLD
-        mul_fpntt!(r, ro, a, ao, n, b, bo, n)
     else
         mul_fpntt2!(r, ro, a, ao, n, b, bo, n)
     end
@@ -180,10 +170,7 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
     if n >= MUL_FPNTT_MIN && m + n >= 2MUL_FPNTT_THRESHOLD
-        if m + n >= 2MUL_FPNTT2_THRESHOLD
-            return mul_fpntt2!(r, ro, a, ao, m, b, bo, n)
-        end
-        return mul_fpntt!(r, ro, a, ao, m, b, bo, n)
+        return mul_fpntt2!(r, ro, a, ao, m, b, bo, n)
     end
     scratch = Memory{Limb}(undef, 2n + mul_scratch_len(n))
     mul_bal!(r, ro, a, ao, b, bo, n, scratch, 2n)

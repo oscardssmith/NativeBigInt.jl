@@ -260,11 +260,13 @@ end
 
 @testset "fpntt2 dispatch boundary" begin
     rng = MersenneTwister(0x77aa)
-    nm = NativeBigInt.MUL_FPNTT2_THRESHOLD
-    a = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
-    b = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
-    @test BigInt(NBig(a) * NBig(b)) == a * b
-    ns = NativeBigInt.SQR_FPNTT2_THRESHOLD
-    s = rand(rng, big(2)^(64ns - 1):big(2)^(64ns)-1)
-    @test BigInt(NBig(s)^2) == s^2
+    for nm in (NativeBigInt.MUL_FPNTT_THRESHOLD - 1, NativeBigInt.MUL_FPNTT_THRESHOLD)
+        a = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
+        b = rand(rng, big(2)^(64nm - 1):big(2)^(64nm)-1)
+        @test BigInt(NBig(a) * NBig(b)) == a * b
+    end
+    for ns in (NativeBigInt.SQR_FPNTT_THRESHOLD - 1, NativeBigInt.SQR_FPNTT_THRESHOLD)
+        s = rand(rng, big(2)^(64ns - 1):big(2)^(64ns)-1)
+        @test BigInt(NBig(s)^2) == s^2
+    end
 end
