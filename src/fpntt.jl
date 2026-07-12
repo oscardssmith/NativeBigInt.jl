@@ -789,3 +789,132 @@ function sqr_fpntt!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     fp_ntt_unpack!(r, ro, 2n, xa, 2nca - 1, bch, FP_CTX1)
     return nothing
 end
+
+# ---------------------------------------------------------------------------
+# Two-prime CRT extension.  At large sizes the single-prime chunk width b
+# shrinks (b ≈ (49 - log2 nc)/2); a second prime raises the working modulus
+# to p1·p2 ≈ 2^98.97, so b ≈ 41-44: transforms shrink ~2.4x and run twice.
+# All transform code is reused verbatim with the p2 context — every bound in
+# the header holds for any prime < 2^49.  See
+# docs/superpowers/specs/2026-07-12-fpntt2-design.md.
+
+const FP_PI2 = 0x0001_FE00_0000_0001           # 560750930165761 = 255·2^41 + 1
+const FP_CTX2 = FpCtx(FP_PI2, (2, 3, 5, 17))   # p2 - 1 = 2^41 · 3 · 5 · 17
+const FP_PI12 = UInt128(FP_PI) * FP_PI2
+const FP_P1INV2 = fpi_inv(FP_PI % FP_PI2, FP_PI2)  # p1^-1 mod p2 (Garner)
+
+# chunk width and transform length against the CRT modulus p1·p2.  The bound
+# min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
+# overflows UInt128 at large b with large operands, and the descending search
+# visits large b first regardless of operand size.  Chunks < 2^48 < p2 < p1
+# are already canonical residues mod both primes, so one pack serves both.
+function fp_ntt_params2(bits_a::Int, bits_b::Int)
+    for b in 48:-1:1
+        nca = cld(bits_a, b)
+        ncb = cld(bits_b, b)
+        if UInt128(min(nca, ncb)) <= (FP_PI12 - 1) ÷ (UInt128(2)^b - 1)^2
+            return b, ntt_len(nca + ncb - 1)
+        end
+    end
+    error("unreachable: b == 1 always satisfies the bound for supported sizes")
+end
+
+# Garner recombination + limb streaming.  Each coefficient is recovered from
+# its residues as c = c1 + p1·((c2 - c1)·p1^-1 mod p2) ∈ [0, p1·p2) ⊂ [0, 2^99)
+# — exact integer arithmetic throughout, no fp bounds involved.
+#
+# Accumulator proof.  (hi, acc) is a 192-bit window holding the pending sum of
+# contributions to bits [outbit, outbit+192); coefficient i contributes
+# c·2^(i·b - outbit) with c < 2^99 and shift s < 64 (the flush keeps s in
+# [0, 64) since b < 64), i.e. each add is < 2^163.  Between two flushes s
+# advances by b >= 1, so there are at most 64 adds; with P' = P >> 64 at each
+# flush the pending value satisfies P < (P >> 64) + 64·2^163 at the fixed
+# point, giving P < 2^170 < 2^192 — the window never overflows, and hi gains
+# < 2^35 + 1 per add, never overflowing 64 bits within a window.  A flushed
+# limb is final: after the flush every remaining coefficient starts at bit
+# i·b >= outbit + 64, and all contributions are nonnegative, so nothing can
+# carry below its own position.
+function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
+                         x1::Vector{Float64}, x2::Vector{Float64},
+                         nconv::Int, b::Int)
+    acc = UInt128(0)
+    hi = UInt64(0)
+    outw = 1
+    outbit = 0
+    @inbounds for i in 0:nconv-1
+        v1 = fp_reduce(x1[i+1], FP_CTX1)
+        v1 < 0.0 && (v1 += FP_CTX1.p)
+        v2 = fp_reduce(x2[i+1], FP_CTX2)
+        v2 < 0.0 && (v2 += FP_CTX2.p)
+        c1 = unsafe_trunc(UInt64, v1)
+        c2 = unsafe_trunc(UInt64, v2)
+        c1m = c1 >= FP_PI2 ? c1 - FP_PI2 : c1      # c1 mod p2 (c1 < p1 < 2p2)
+        d = c2 >= c1m ? c2 - c1m : c2 + (FP_PI2 - c1m)
+        u = (UInt128(d) * FP_P1INV2 % FP_PI2) % UInt64
+        c = UInt128(c1) + UInt128(u) * FP_PI
+        s = i * b - outbit
+        if s >= 64
+            r[ro+outw] = acc % UInt64
+            acc = (acc >> 64) | (UInt128(hi) << 64)
+            hi = 0
+            outw += 1
+            outbit += 64
+            s -= 64
+        end
+        lo = c << s
+        t = acc + lo
+        hi += ((c >> 1) >> (127 - s)) % UInt64 + (t < acc)
+        acc = t
+    end
+    @inbounds while outw <= rn
+        r[ro+outw] = acc % UInt64
+        acc = (acc >> 64) | (UInt128(hi) << 64)
+        hi = 0
+        outw += 1
+    end
+    return r
+end
+
+# two-prime mpn-layer entry points, same contracts as mul_fpntt!/sqr_fpntt!;
+# pack once per operand and copy for the second prime
+function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
+                     b::Memory{Limb}, bo::Int, n::Int)
+    bits_a = magnitude_bits(a, ao, m)
+    bits_b = magnitude_bits(b, bo, n)
+    bch, N = fp_ntt_params2(bits_a, bits_b)
+    plan1 = fp_ntt_plan(N, FP_CTX1)
+    plan2 = fp_ntt_plan(N, FP_CTX2)
+    nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
+    xa1 = fp_ntt_pack(a, ao, m, bch, nca, N)
+    xa2 = copy(xa1)
+    xb1 = fp_ntt_pack(b, bo, n, bch, ncb, N)
+    xb2 = copy(xb1)
+    fp_ntt_fwd!(xa1, plan1)
+    fp_ntt_fwd!(xb1, plan1)
+    fp_ntt_pointwise!(xa1, xb1, FP_CTX1)
+    fp_ntt_inv!(xa1, plan1)
+    fp_ntt_fwd!(xa2, plan2)
+    fp_ntt_fwd!(xb2, plan2)
+    fp_ntt_pointwise!(xa2, xb2, FP_CTX2)
+    fp_ntt_inv!(xa2, plan2)
+    fp_ntt_unpack2!(r, ro, m + n, xa1, xa2, nca + ncb - 1, bch)
+    return nothing
+end
+
+function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
+    bits = magnitude_bits(a, ao, n)
+    bch, N = fp_ntt_params2(bits, bits)
+    plan1 = fp_ntt_plan(N, FP_CTX1)
+    plan2 = fp_ntt_plan(N, FP_CTX2)
+    nca = cld(bits, bch)
+    xa1 = fp_ntt_pack(a, ao, n, bch, nca, N)
+    xa2 = copy(xa1)
+    fp_ntt_fwd!(xa1, plan1)
+    fp_ntt_pointwise!(xa1, xa1, FP_CTX1)
+    fp_ntt_inv!(xa1, plan1)
+    fp_ntt_fwd!(xa2, plan2)
+    fp_ntt_pointwise!(xa2, xa2, FP_CTX2)
+    fp_ntt_inv!(xa2, plan2)
+    fp_ntt_unpack2!(r, ro, 2n, xa1, xa2, 2nca - 1, bch)
+    return nothing
+end
