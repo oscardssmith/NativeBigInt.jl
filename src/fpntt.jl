@@ -903,7 +903,7 @@ end
 # 192-bit accumulator window with two 128-bit accumulators (and gives the
 # core two independent carry chains instead of one).
 #
-# Accumulator proof (each stream).  acc is a 128-bit window holding the
+# Accumulator proof (each stream).  (a1, a0) is a 128-bit window holding the
 # pending sum of contributions to bits [outbit, outbit+128); coefficient i
 # contributes v·2^(i·b - outbit) with v < 2^49 and shift s < 64 (the flush
 # keeps s in [0, 64) since b < 64), i.e. each add is < 2^113.  Between two
@@ -914,18 +914,27 @@ end
 # coefficient starts at bit i·b >= outbit + 64, and all contributions are
 # nonnegative, so nothing can carry below its own position.  The final fold
 # S1 + p1·S2 equals the true product < 2^(64·rn), so addmul_1! carries out 0.
+#
+# The window shift s is data-independent — the flush discipline makes
+# s = (b·i) mod 64 — so the split of each v into window halves
+# lo = v << s, hi = v >> (64 - s) is precomputed 8-wide with per-lane
+# variable shifts.  The scalar scan then carries only 64-bit adds; a
+# variable UInt128 << there costs a multi-uop shift sequence per
+# coefficient (LLVM cannot prove s < 64) and dominated the loop.
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64},
                          nconv::Int, b::Int)
-    c1buf = Vector{UInt64}(undef, 8)
-    ubuf = Vector{UInt64}(undef, 8)
+    lob1 = Vector{UInt64}(undef, 8); hib1 = Vector{UInt64}(undef, 8)
+    lob2 = Vector{UInt64}(undef, 8); hib2 = Vector{UInt64}(undef, 8)
     s2 = Memory{Limb}(undef, rn)
     vg, vgp = VF8(FP_G2), VF8(FP_G2P)
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
     vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
-    acc1 = UInt128(0)
-    acc2 = UInt128(0)
+    ub = UInt64(b)
+    vlane = SIMD.Vec{8,UInt64}(ntuple(k -> UInt64(k - 1) * ub, 8))
+    a01 = UInt64(0); a11 = UInt64(0)   # stream 1 window, low/high limb
+    a02 = UInt64(0); a12 = UInt64(0)   # stream 2 window
     outw = 1
     s = 0             # bit offset of coefficient i within the window
     i = 0
@@ -937,40 +946,51 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
             v2 = fp_reduce(SIMD.vload(VF8, x2, i + 1), FP_CTX2)
             u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
             u = SIMD.vifelse(u < 0.0, u + FP_CTX2.p, u)
-            SIMD.vstore(reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask,
-                        c1buf, 1)
-            SIMD.vstore(reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask,
-                        ubuf, 1)
+            c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
+            uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
+            sv = (UInt64(i) * ub + vlane) & UInt64(63)
+            svc = UInt64(63) - sv
+            SIMD.vstore(c1v << sv, lob1, 1)
+            SIMD.vstore((c1v >> 1) >> svc, hib1, 1)
+            SIMD.vstore(uv << sv, lob2, 1)
+            SIMD.vstore((uv >> 1) >> svc, hib2, 1)
         else
             for j in 1:blk
                 v1 = fp_reduce(x1[i+j], FP_CTX1)
                 v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
                 v2 = fp_reduce(x2[i+j], FP_CTX2)
                 u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), FP_G2, FP_G2P, FP_CTX2)
-                ubuf[j] = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
-                c1buf[j] = unsafe_trunc(UInt64, v1)
+                c1 = unsafe_trunc(UInt64, v1)
+                uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
+                sj = (UInt64(i + j - 1) * ub) & 63
+                lob1[j] = c1 << sj; hib1[j] = (c1 >> 1) >> (63 - sj)
+                lob2[j] = uu << sj; hib2[j] = (uu >> 1) >> (63 - sj)
             end
         end
         for j in 1:blk
             if s >= 64
-                r[ro+outw] = acc1 % UInt64
-                s2[outw] = acc2 % UInt64
-                acc1 >>= 64
-                acc2 >>= 64
+                r[ro+outw] = a01
+                s2[outw] = a02
+                a01 = a11; a11 = UInt64(0)
+                a02 = a12; a12 = UInt64(0)
                 outw += 1
                 s -= 64
             end
-            acc1 += UInt128(c1buf[j]) << s
-            acc2 += UInt128(ubuf[j]) << s
+            t1 = a01 + lob1[j]
+            a11 += hib1[j] + (t1 < a01)
+            a01 = t1
+            t2 = a02 + lob2[j]
+            a12 += hib2[j] + (t2 < a02)
+            a02 = t2
             s += b
         end
         i += blk
     end
     @inbounds while outw <= rn
-        r[ro+outw] = acc1 % UInt64
-        s2[outw] = acc2 % UInt64
-        acc1 >>= 64
-        acc2 >>= 64
+        r[ro+outw] = a01
+        s2[outw] = a02
+        a01 = a11; a11 = UInt64(0)
+        a02 = a12; a12 = UInt64(0)
         outw += 1
     end
     addmul_1!(r, ro, s2, 0, rn, FP_PI)
