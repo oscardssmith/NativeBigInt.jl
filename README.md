@@ -1,14 +1,13 @@
 # NativeBigInt.jl
 
 Pure-Julia arbitrary-precision integer type (`NBig`) targeting GMP-competitive
-performance from ~100 bits up: faster than GMP for `+`/`-`/`*` overall
-(multiplication pulls well ahead above ~14k bits thanks to a floating-point
-NTT), at or ahead of GMP for `divrem` across the range (schoolbook below
-~8k bits, divide-and-conquer above riding the NTT multiplies), and
-competitive with GMP for `gcd`/`gcdx` across the range (subquadratic HGCD
-above ~19k bits, ahead of GMP's `mpn_gcd` from ~40k bits up), and
-competitive below ~4k bits for roots and friends, which are still quadratic
-and fall behind above that.
+performance from ~100 bits up: faster than GMP for `+`/`-`/`*`/`divrem`
+through ~4k bits, with multiplication pulling well ahead again above ~14k
+bits thanks to a floating-point NTT; within ~25% of GMP for `gcd`/`gcdx`
+across the range (subquadratic HGCD above ~19k bits, ahead from ~16k end to
+end); and ahead for `powermod` from ~16k bits (NTT-backed Barrett
+reduction). `isqrt` and decimal `string`/`parse` still trail GMP at large
+sizes — see the benchmark table below.
 Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
@@ -89,16 +88,33 @@ Three layers, mirroring GMP's mpn/mpz split:
 `bench/bench_highlevel.jl` compares `NBig` against `Base.BigInt` end-to-end
 (construction not included) across the target bit-size regime. Ratio is
 NBig time / BigInt time — lower is better; ≤1.0 means NBig is faster.
+Shapes: `divrem` is 2n/n; `gcd`/`gcdx` operands share a planted n/2-bit
+factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent;
+`string`/`parse` are decimal.
 
-| op       | 128 bits | 256 bits | 512 bits | 1024 bits | 2048 bits | 4096 bits |
-|----------|----------|----------|----------|-----------|-----------|-----------|
-| `+`      | 0.51     | 0.47     | 0.49     | 0.50      | 0.71      | 0.81      |
-| `-`      | 0.46     | 0.50     | 0.51     | 0.56      | 0.71      | 0.92      |
-| `*`      | 0.42     | 0.69     | 0.70     | 0.85      | 0.78      | 0.86      |
-| `divrem` | 0.39     | 0.45     | 0.69     | 0.71      | 0.98      | 0.88      |
+| op | 128 | 256 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
+|---|---|---|---|---|---|---|---|---|---|
+| `+` | 0.53 | 0.48 | 0.93 | 0.64 | 0.73 | 0.74 | 1.11 | 1.57 | 1.26 |
+| `-` | 0.54 | 0.49 | 0.91 | 0.64 | 0.85 | 1.05 | 1.15 | 1.80 | 1.51 |
+| `*` | 0.49 | 0.60 | 0.89 | 0.88 | 1.00 | 1.21 | 1.12 | 0.83 | 0.64 |
+| `divrem` | 0.41 | 0.38 | 0.67 | 0.85 | 1.05 | 0.81 | 0.94 | 1.05 | 1.11 |
+| `gcd` | 1.04 | 1.11 | 1.09 | 1.09 | 1.16 | 1.11 | 1.05 | 1.00 | 0.81 |
+| `gcdx` | 1.07 | 1.03 | 1.25 | 1.16 | 1.25 | 1.22 | 1.12 | 0.96 | 0.79 |
+| `isqrt` | 0.72 | 1.09 | 1.33 | 1.24 | 1.35 | 1.47 | 1.70 | 1.62 | 1.56 |
+| `powermod` (odd) | 2.02 | 1.09 | 1.94 | 1.59 | 1.36 | 1.33 | 1.48 | 1.07 | 0.77 |
+| `powermod` (even) | 2.02 | 2.30 | 1.98 | 1.78 | 1.12 | 1.05 | 1.35 | 1.06 | 0.76 |
+| `string` | 1.25 | 0.89 | 1.00 | 1.12 | 1.18 | 1.80 | 1.86 | 1.84 | 1.74 |
+| `parse` | 2.63 | 3.00 | 3.31 | 3.58 | 3.45 | 3.78 | 3.17 | 3.11 | 2.57 |
 
-NBig matches or beats `BigInt` across the whole 128–4096 bit range for
-all four ops.
+The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
+~4k bits and `*` pulls ahead again from ~16k as the fp NTT takes over
+(`+`/`-` drift behind at 8k+, where both sides are memory-bound and GMP's
+in-place reallocation wins). `gcd`/`gcdx` sit within ~25% throughout and
+lead from ~16k. `powermod` pays GMP's assembly-Montgomery tax at small
+sizes, reaches parity around 16k bits, and leads by ~25% at 32k where
+Barrett reduction rides the NTT. The known laggards are `isqrt` (~1.5× at
+large sizes), large-size `string` (~1.8×), and especially `parse`
+(2.5–3.8× across the board) — the natural next targets.
 
 Above that, Karatsuba carries ~2k–14k bits at rough GMP parity (0.95–1.09×
 against `__gmpn_mul`), and the two-prime fp NTT takes over at ~14k bits
