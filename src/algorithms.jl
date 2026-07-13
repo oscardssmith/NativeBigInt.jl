@@ -88,11 +88,18 @@ end
 # (lb limbs), e > 0 any Integer supporting expbit/expbits. Returns a k-limb
 # Memory (unnormalized). Sliding-window exponentiation; for odd m the values
 # live in Montgomery form with redc! after each mul/sqr, for even m each
-# product is reduced with divrem! instead.
+# product is reduced with divrem! instead. Above the per-parity Barrett
+# thresholds both give way to plain-domain Barrett reduction, which rides
+# mul!'s subquadratic engines (the flag is overridable for threshold
+# benchmarks/tests).
 function powermod_limbs(b::Memory{Limb}, lb::Int, e::Integer,
-                        m::Memory{Limb}, k::Int)
-    odd = isodd(@inbounds m[1])
+                        m::Memory{Limb}, k::Int,
+                        barrett::Bool = k >= (isodd(@inbounds m[1]) ?
+                                              BARRETT_THRESHOLD : BARRETT_EVEN_THRESHOLD))
+    odd = !barrett && isodd(@inbounds m[1])
     ninv = odd ? mont_ninv(@inbounds m[1]) : zero(Limb)
+    mu, lmu, bscratch = barrett ? barrett_setup(m, 0, k) :
+                                  (EMPTY_LIMBS, 0, EMPTY_LIMBS)
     nbits = expbits(e)
     w = nbits <= 8 ? 1 : nbits <= 24 ? 2 : nbits <= 80 ? 3 : nbits <= 240 ? 4 : 5
     tsize = 1 << (w - 1)   # table of odd powers b^1, b^3, …, b^(2^w - 1)
@@ -110,7 +117,9 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Integer,
             mul!(prod, 0, x, xo, k, y, yo, k)
         end
         @inbounds prod[2k+1] = 0
-        if odd
+        if barrett
+            barrett_reduce!(dst, dsto, prod, 0, m, 0, k, mu, lmu, bscratch, 0)
+        elseif odd
             redc!(dst, dsto, prod, 0, m, 0, k, ninv)
         else
             lt = normlen(prod, 0, 2k)

@@ -35,8 +35,14 @@ Three layers, mirroring GMP's mpn/mpz split:
   (recursive 2n/n blocks over `mul!`, so it inherits Karatsuba and the NTT;
   0.82–0.96× GMP's `mpn_tdiv_qr` from the crossover through at least 2048
   limbs) above.
-- **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt; power by repeated
-  squaring; radix conversion for `string`/`parse` — power-of-two bases pack/
+- **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt; `powermod` by
+  sliding-window exponentiation, reducing each product with Montgomery
+  `redc!` (`src/montgomery.jl`, odd moduli) or `divrem!` (even) at small
+  sizes, and above per-parity thresholds (~68 limbs odd, ~240 even —
+  `src/barrett.jl`, benchmark-tuned) with a plain-domain Barrett reduction
+  (HAC 14.42) whose two per-product multiplies ride `mul!` (so
+  Karatsuba/NTT) and whose reciprocal is one `divrem!` per modulus;
+  radix conversion for `string`/`parse` — power-of-two bases pack/
   unpack bit windows directly (O(n)); other bases use per-limb `divrem_1!` /
   Horner below `STR_DC_THRESHOLD` (40 limbs, only coarsely tuned) and a
   recursive split/combine around a `bb^(2^i)` power tree above, routing through

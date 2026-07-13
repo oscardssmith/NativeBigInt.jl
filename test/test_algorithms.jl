@@ -293,6 +293,84 @@ end
     end
 end
 
+using NativeBigInt: barrett_setup, barrett_reduce!, powermod_limbs,
+    BARRETT_THRESHOLD, BARRETT_EVEN_THRESHOLD
+
+@testset "barrett_reduce!" begin
+    rng = MersenneTwister(0xba44e77)
+
+    function checkbar(Tref::BigInt, mref::BigInt, k::Int)
+        mbuf = afrombig(mref, k)
+        mu, lmu, scratch = barrett_setup(mbuf, 0, k)
+        @test atoref(mu, 0, lmu) == (big(1) << (128k)) ÷ mref
+        r = Memory{UInt64}(undef, k)
+        barrett_reduce!(r, 0, afrombig(Tref, 2k), 0, mbuf, 0, k, mu, lmu, scratch, 0)
+        @test atoref(r, 0, k) == mod(Tref, mref)
+    end
+
+    # random sweep: any T < β^2k, m with uniform top limb
+    for trial in 1:200
+        k = rand(rng, 1:40)
+        mref = rand(rng, big(1) << (64k - 64):(big(1) << 64k) - 1)
+        mref <= 1 && (mref = big(2))
+        checkbar(rand(rng, big(0):(big(1) << 128k) - 1), mref, k)
+    end
+
+    # real usage shape (T = x·y with x, y < m) plus targeted 0/1/2-correction
+    # values: T = q·m + r with r near 0 and near m
+    for trial in 1:100
+        k = rand(rng, 1:30)
+        mref = rand(rng, big(1) << (64k - 64):(big(1) << 64k) - 1)
+        mref <= 1 && (mref = big(3))
+        x = rand(rng, big(0):mref-1)
+        y = rand(rng, big(0):mref-1)
+        checkbar(x * y, mref, k)
+        q = (big(1) << 128k - 1) ÷ mref - 1
+        checkbar(q * mref, mref, k)                      # r = 0
+        checkbar(q * mref + rand(rng, big(0):mref-1), mref, k)
+        checkbar(q * mref + mref - 1, mref, k)           # r = m - 1
+    end
+
+    # edges: m with minimal top limb, m = β^(k-1) (μ takes k+2 limbs),
+    # m = β^k - 1, T near β^2k, T < m, T = 0
+    for k in (1, 2, 3, 7, 20)
+        small_top = (big(1) << (64k - 64)) | rand(rng, big(0):(big(1) << (64k - 64)) - 1)
+        for mref in (small_top, big(1) << (64k - 64), (big(1) << 64k) - 1)
+            mref <= 1 && continue
+            checkbar((big(1) << 128k) - 1, mref, k)
+            checkbar(big(0), mref, k)
+            checkbar(mref - 1, mref, k)
+            checkbar(mref + 1, mref, k)
+            checkbar((mref - 1)^2, mref, k)
+        end
+    end
+end
+
+@testset "powermod_limbs Barrett path" begin
+    rng = MersenneTwister(0xb42)
+    # force the Barrett branch at small k (cheap) and cross-check vs BigInt,
+    # odd and even moduli, exponents crossing the window-size breakpoints
+    for trial in 1:60
+        k = rand(rng, 1:25)
+        mref = rand(rng, big(2):(big(1) << 64k) - 1)
+        mref |= big(1) << (64k - 64)                    # keep k limbs
+        trial % 2 == 0 && iseven(mref) && (mref += 1)   # both parities
+        bref = rand(rng, big(1):mref-1)
+        e = rand(rng, big(1):big(2)^rand(rng, (5, 30, 100)))
+        lb = max(cld(ndigits(bref, base=2), 64), 1)
+        r = powermod_limbs(afrombig(bref, lb), lb, e, afrombig(mref, k), k, true)
+        @test atoref(r, 0, k) == powermod(bref, e, mref)
+    end
+    # production dispatch at the per-parity thresholds, small exponent
+    for (k, low) in ((BARRETT_THRESHOLD, 1), (BARRETT_EVEN_THRESHOLD, 0))
+        mref = rand(rng, big(1) << (64k - 1):(big(1) << 64k) - 1)
+        mref = (mref & ~big(1)) | low
+        bref = rand(rng, big(1):mref-1)
+        r = powermod_limbs(afrombig(bref, k), k, big(65537), afrombig(mref, k), k)
+        @test atoref(r, 0, k) == powermod(bref, big(65537), mref)
+    end
+end
+
 using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
 
 @testset "hgcd" begin

@@ -99,6 +99,19 @@ end
         # non-NBig base with NBig modulus routes to the Montgomery method
         @test BigInt(powermod(3, NBig(n), NBig(m))) == powermod(3, n, m)
     end
+    # moduli spanning the per-parity Barrett thresholds so both reduction
+    # regimes run end to end; small exponents keep it cheap
+    for (parity, thr) in ((1, NativeBigInt.BARRETT_THRESHOLD),
+                          (0, NativeBigInt.BARRETT_EVEN_THRESHOLD))
+        for lm in (thr - 1, thr, thr + thr ÷ 4)
+            m = abs(diff_randbig(rng, lm))
+            m <= 2 && (m = big(3))
+            m % 2 == parity || (m += 1)
+            a = abs(diff_randbig(rng, rand(rng, 1:lm)))
+            n = abs(diff_randbig(rng, 1))
+            @test BigInt(powermod(NBig(a), NBig(n), NBig(m))) == powermod(a, n, m)
+        end
+    end
 end
 
 @testset "differential widen/top_set_bit/checked/Bool-rem" begin
