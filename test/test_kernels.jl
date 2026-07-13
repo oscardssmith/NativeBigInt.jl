@@ -555,7 +555,7 @@ end
 end
 
 @testset "sqrtrem!" begin
-    using NativeBigInt: sqrtrem!
+    using NativeBigInt: sqrtrem!, sqrt!
     rng = MersenneTwister(0x59b)
     for k in (1, 2, 3, 5, 10, 33), trial in 1:20
         n = 2k
@@ -570,5 +570,34 @@ end
         rref = (big(rhi) << (64h)) | toref(a, 0, h)
         @test sref == isqrt(aref)
         @test rref == aref - sref^2
+    end
+end
+
+@testset "sqrt! root-only" begin
+    using NativeBigInt: sqrt!
+    rng = MersenneTwister(0x54b)
+    function checksqrt(aref::BigInt, n::Int)
+        a = Memory{UInt64}(undef, n)
+        for i in 1:n
+            a[i] = UInt64(aref >> (64 * (i - 1)) & typemax(UInt64))
+        end
+        h = n >> 1
+        s = Memory{UInt64}(undef, h)
+        scratch = Memory{UInt64}(undef, 5h + 8)
+        sqrt!(s, 0, a, 0, n, scratch)
+        @test toref(s, 0, h) == isqrt(aref)
+    end
+    for k in (2, 3, 5, 10, 33), trial in 1:30
+        n = 2k
+        # random normalized
+        aref = rand(rng, big(2)^(64n - 2):big(2)^(64n) - 1)
+        checksqrt(aref, n)
+        # near-perfect squares: t² - 1 forces the root correction, t² and
+        # t² + small keep R tiny so the cheap positivity checks can't fire
+        t = rand(rng, big(2)^(32n - 1):big(2)^(32n) - 1)
+        for d in (big(-1), big(0), big(1), 2t - 1, 2t)
+            v = t^2 + d
+            big(2)^(64n - 2) <= v < big(2)^(64n) && checksqrt(v, n)
+        end
     end
 end

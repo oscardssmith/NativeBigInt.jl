@@ -34,7 +34,9 @@ Three layers, mirroring GMP's mpn/mpz split:
   (recursive 2n/n blocks over `mul!`, so it inherits Karatsuba and the NTT;
   0.82–0.96× GMP's `mpn_tdiv_qr` from the crossover through at least 2048
   limbs) above.
-- **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt; `powermod` by
+- **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt (Zimmermann), with a
+  root-only top level for `isqrt` that skips the final remainder square/
+  subtract whenever the root is provably exact from cheap bounds; `powermod` by
   sliding-window exponentiation, reducing each product with Montgomery
   `redc!` (`src/montgomery.jl`, odd moduli) or `divrem!` (even) at small
   sizes, and above per-parity thresholds (~68 limbs odd, ~240 even —
@@ -99,7 +101,7 @@ factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent.
 | `divrem` | 0.41 | 0.38 | 0.67 | 0.85 | 1.05 | 0.81 | 0.94 | 1.05 | 1.11 |
 | `gcd` | 1.04 | 1.11 | 1.09 | 1.09 | 1.16 | 1.11 | 1.05 | 1.00 | 0.81 |
 | `gcdx` | 1.07 | 1.03 | 1.25 | 1.16 | 1.25 | 1.22 | 1.12 | 0.96 | 0.79 |
-| `isqrt` | 0.72 | 1.09 | 1.33 | 1.24 | 1.35 | 1.47 | 1.70 | 1.62 | 1.56 |
+| `isqrt` | 0.77 | 1.01 | 1.41 | 1.34 | 1.31 | 1.36 | 1.44 | 1.61 | 1.26 |
 | `powermod` (odd) | 2.02 | 1.09 | 1.94 | 1.59 | 1.36 | 1.33 | 1.48 | 1.07 | 0.77 |
 | `powermod` (even) | 2.02 | 2.30 | 1.98 | 1.78 | 1.12 | 1.05 | 1.35 | 1.06 | 0.76 |
 
@@ -109,7 +111,7 @@ The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
 in-place reallocation wins). `gcd`/`gcdx` sit within ~25% throughout and
 lead from ~16k. `powermod` pays GMP's assembly-Montgomery tax at small
 sizes, reaches parity around 16k bits, and leads by ~25% at 32k where
-Barrett reduction rides the NTT. `isqrt` (~1.5× at large sizes) is the
+Barrett reduction rides the NTT. `isqrt` (~1.3–1.6× at large sizes) is the
 known laggard. Decimal `string`/`parse` are supported and benchmarked in
 `bench_highlevel.jl` but slower than GMP's.
 

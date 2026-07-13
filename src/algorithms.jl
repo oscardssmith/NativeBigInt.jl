@@ -10,8 +10,13 @@
 # On return a[ao+1..ao+h] holds the low limbs of the remainder a - s^2; the
 # return value is its top limb (0 or 1). scratch needs 5h+8 limbs at sco;
 # recursion levels share it (a level touches it only after its child returns).
+# With needrem = false only the root is guaranteed (a is still destroyed and
+# the return value is meaningless): the final remainder phase — a quarter-size
+# Q² square plus an h-limb subtract — runs only when R = A - S² isn't provably
+# nonnegative from U's magnitude or a two-limb bound, which is rare. The
+# recursion always needs the child's remainder, so only the top level skips.
 function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
-                  scratch::Memory{Limb}, sco::Int=0)
+                  scratch::Memory{Limb}, sco::Int=0, needrem::Bool=true)
     if n <= 2
         v = n == 1 ? UInt128(@inbounds a[ao+1]) :
             (UInt128(@inbounds a[ao+2]) << 64) | (@inbounds a[ao+1])
@@ -66,6 +71,20 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
         rhi += Int(c) + (dhi ? Int(@inbounds scratch[dd+dl]) : 0)
     end
     copyto!(s, so + 1, scratch, qq + 1, lq)
+    if !needrem
+        # S never undershoots (the correction loop below only decrements),
+        # so S is exact iff R = V - Q² ≥ 0 with V = rhi·β^h + U·β^lq + A0.
+        # Provably nonnegative when V ≥ β^2lq > Q²: rhi ≠ 0, U ≥ β^lq, or
+        # V's top two limbs clear (q1+1)² ≥ Q²/β^(2lq-2). Otherwise fall
+        # through and settle it exactly.
+        rhi != 0 && return 0
+        normlen(a, ao + 2lq, h - 2lq) != 0 && return 0
+        q1 = @inbounds scratch[qq+lq]
+        if q1 != typemax(Limb)
+            v = (UInt128(@inbounds a[ao+2lq]) << 64) | (@inbounds a[ao+2lq-1])
+            widemul(q1 + one(Limb), q1 + one(Limb)) <= v && return 0
+        end
+    end
     # R = U*β^lq + A0 - Q^2, tracked as (rhi, a[ao+1..ao+h]) with rhi signed
     sqr!(scratch, q2, scratch, qq, lq)
     rhi -= Int(sub!(a, ao, a, ao, h, scratch, q2, 2lq))
@@ -78,6 +97,14 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
         sub_1!(s, so, s, so, h, one(Limb))
     end
     return rhi
+end
+
+# Root-only square root: sqrtrem! with the top-level remainder phase elided;
+# same contract, but a's contents on return are unspecified.
+function sqrt!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
+               scratch::Memory{Limb}, sco::Int=0)
+    sqrtrem!(s, so, a, ao, n, scratch, sco, false)
+    return nothing
 end
 
 # O(1) exponent bit access; NBig overloads live in nbig.jl.

@@ -256,7 +256,7 @@ function Base.isqrt(x::NBig)
     h = nn >> 1
     s = Memory{Limb}(undef, h)
     scratch = Memory{Limb}(undef, 5h + 8)
-    sqrtrem!(s, 0, a, 0, nn, scratch)
+    sqrt!(s, 0, a, 0, nn, scratch)
     sh = (e >> 1) + 32pad
     sh > 0 && rshift!(s, 0, s, 0, h, sh)
     return nbig_from_limbs(1, s, h)
