@@ -62,6 +62,19 @@ end
         g, x, y = gcdx(NBig(a), NBig(b))
         @test (big(g), big(x), big(y)) == gcdx(a, b)
     end
+
+    # subquadratic (HGCD) sizes: straddle GCDEXT_DC/GCD_DC and go well above
+    for (trial, n) in enumerate((260, 310, 450, 700))
+        a = diff_randbig(rng, n)
+        b = diff_randbig(rng, rand(rng, n ÷ 2:n))
+        if isodd(trial)
+            g = abs(diff_randbig(rng, 6))
+            a, b = a * g, b * g
+        end
+        @test BigInt(gcd(NBig(a), NBig(b))) == gcd(a, b)
+        g, x, y = gcdx(NBig(a), NBig(b))
+        @test (big(g), big(x), big(y)) == gcdx(a, b)
+    end
 end
 
 @testset "differential powermod" begin

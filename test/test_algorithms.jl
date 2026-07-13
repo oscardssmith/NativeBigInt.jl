@@ -292,3 +292,97 @@ end
         checkdiv(a, n, d, m)
     end
 end
+
+using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
+
+@testset "hgcd" begin
+    rng = MersenneTwister(0x59cd)
+
+    # hgcd! contract, BigInt-verified: (A; B) == M * (a'; b') exactly,
+    # det(M) == +1, both outputs > s = n÷2 + 1 limbs, and nn == 0 leaves M
+    # the identity. Tiny thresholds force deep recursion on small inputs.
+    mval(M) = (atoref(M.m00, 0, M.n), atoref(M.m01, 0, M.n),
+               atoref(M.m10, 0, M.n), atoref(M.m11, 0, M.n))
+    for trial in 1:600
+        n = rand(rng, 3:40)
+        thr = rand(rng, (4, 8, 1000))
+        a0 = rand(rng, big(1):big(2)^(64n) - 1)
+        b0 = rand(rng, big(1):big(2)^(64n) - 1)
+        trial % 5 == 0 && (b0 = rand(rng, big(1):big(2)^(64 * max(n ÷ 2, 1)) - 1))
+        trial % 7 == 0 && (b0 = max(a0 - rand(rng, big(1):big(2)^32), big(1)))
+        n = max(cld(max(ndigits(a0, base=2), ndigits(b0, base=2)), 64), 1)
+        a = afrombig(a0, n + 1)
+        b = afrombig(b0, n + 1)
+        M = HgcdMatrix(hgcd_matrix_cap(n))
+        ra, rb, rn = hgcd!(a, b, n, M, thr)
+        m00, m01, m10, m11 = mval(M)
+        if rn == 0
+            @test (m00, m01, m10, m11) == (1, 0, 0, 1)
+        else
+            s = n ÷ 2 + 1
+            an = normlen(ra, 0, rn)
+            bn = normlen(rb, 0, rn)
+            av = atoref(ra, 0, an)
+            bv = atoref(rb, 0, bn)
+            @test m00 * av + m01 * bv == a0
+            @test m10 * av + m11 * bv == b0
+            @test m00 * m11 - m01 * m10 == 1
+            @test an > s && bn > s
+        end
+    end
+
+    # DC driver differential vs BigInt with tiny thresholds (deep recursion),
+    # including planted common factors, Fibonacci pairs (all-quotient-1
+    # chains), and quotient spikes (subdiv + q-1 guard).
+    for trial in 1:300
+        la, lb = rand(rng, 1:50), rand(rng, 1:50)
+        a0 = rand(rng, big(1):big(2)^(64la) - 1)
+        b0 = rand(rng, big(1):big(2)^(64lb) - 1)
+        if isodd(trial)
+            g = rand(rng, big(1):big(2)^(64 * rand(rng, 1:8)))
+            a0 *= g; b0 *= g
+        end
+        if trial % 11 == 0
+            x, y = big(1), big(1)
+            while ndigits(y, base=2) < 64la
+                x, y = y, x + y
+            end
+            a0, b0 = y, x
+        end
+        trial % 13 == 0 &&
+            (b0 = a0 * rand(rng, big(2)^200:big(2)^220) + rand(rng, big(1):a0))
+        cap = max(cld(ndigits(a0, base=2), 64), cld(ndigits(b0, base=2), 64)) + 1
+        lu = cld(ndigits(a0, base=2), 64)
+        lv = cld(ndigits(b0, base=2), 64)
+        g1, lg = gcd!(afrombig(a0, cap), lu, afrombig(b0, cap), lv;
+                      dc_thr=10, hgcd_thr=6)
+        @test atoref(g1, 0, lg) == gcd(a0, b0)
+        g2, lg, tm, lt, tpos = gcdext!(afrombig(a0, cap + 3), lu,
+                                       afrombig(b0, cap + 3), lv;
+                                       dc_thr=10, hgcd_thr=6)
+        gv = atoref(g2, 0, lg)
+        tv = atoref(tm, 0, lt) * (tpos ? 1 : -1)
+        @test gv == gcd(a0, b0)
+        @test mod(gv - tv * b0, a0) == 0        # Bézout: s*a + t*b == g
+        @test abs(tv) <= max(a0, b0) ÷ gv || gv == b0
+    end
+
+    # production thresholds: sizes straddling GCDEXT_DC/GCD_DC and well above
+    for n in (280, 320, 500, 800)
+        a0 = rand(rng, big(1):big(2)^(64n) - 1)
+        b0 = rand(rng, big(1):big(2)^(64n) - 1)
+        g = rand(rng, big(1):big(2)^320)
+        a0 *= g; b0 *= g
+        cap = max(cld(ndigits(a0, base=2), 64), cld(ndigits(b0, base=2), 64)) + 1
+        lu = cld(ndigits(a0, base=2), 64)
+        lv = cld(ndigits(b0, base=2), 64)
+        g1, lg = gcd!(afrombig(a0, cap), lu, afrombig(b0, cap), lv)
+        @test atoref(g1, 0, lg) == gcd(a0, b0)
+        g2, lg, tm, lt, tpos = gcdext!(afrombig(a0, cap + 3), lu,
+                                       afrombig(b0, cap + 3), lv)
+        gv = atoref(g2, 0, lg)
+        tv = atoref(tm, 0, lt) * (tpos ? 1 : -1)
+        @test gv == gcd(a0, b0)
+        @test mod(gv - tv * b0, a0) == 0
+    end
+end

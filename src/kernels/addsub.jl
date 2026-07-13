@@ -136,6 +136,10 @@ end
     return nothing
 end
 
+# Bit length of the n-limb magnitude at a[ao+1..ao+n], n >= 1; requires a
+# normalized (nonzero) top limb.
+@inline magnitude_bits(a, ao::Int, n::Int) = 64 * (n - 1) + Base.top_set_bit(@inbounds a[ao+n])
+
 # length of x[1..n] with zero top limbs stripped
 @inline function normlen(x::Memory{Limb}, xo::Int, n::Int)
     @inbounds while n > 0 && x[xo+n] == 0

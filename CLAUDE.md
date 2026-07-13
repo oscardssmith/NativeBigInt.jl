@@ -43,10 +43,12 @@ cover:
   changes against `bench/` and, where relevant, the generated asm
   (`bench/asm_dump.jl`).
 - **Dispatch thresholds live at the mpn layer** (`src/mul.jl`,
-  `src/algorithms.jl`), never at the NBig level, and are benchmark-tuned:
-  Karatsuba ~29 limbs (`bench/bench_kar_thr.jl`), fp NTT ~224 balanced limbs,
-  divide-and-conquer division `DC_DIV_THRESHOLD` = 100
-  (`bench/bench_dc_thr.jl`).
+  `src/div.jl`, `src/gcd.jl`), never at the NBig level, and are
+  benchmark-tuned: Karatsuba ~29 limbs (`bench/bench_kar_thr.jl`), fp NTT
+  ~224 balanced limbs, divide-and-conquer division `DC_DIV_THRESHOLD` = 100
+  (`bench/bench_dc_thr.jl`), subquadratic HGCD gcd `GCD_DC_THRESHOLD` = 300
+  / `GCDEXT_DC_THRESHOLD` = 250 / `HGCD_THRESHOLD` = 120
+  (`bench/bench_gcd_thr.jl`).
 - **Deleted algorithms:** Toom-3, the integer Goldilocks NTT (`src/ntt.jl`),
   and the single-prime fp pipeline were removed once the two-prime fp NTT
   beat them everywhere — git history has them; don't reintroduce variants
