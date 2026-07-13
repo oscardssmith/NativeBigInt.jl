@@ -89,3 +89,30 @@ end
     @test Float64(NBig(0)) === 0.0
     @test Float64(NBig(-3)) === -3.0
 end
+
+@testset "large base conversion (divide-and-conquer)" begin
+    rng = MersenneTwister(0xba5e)
+    # Sizes spanning the STR_DC_THRESHOLD crossover so both the O(n^2) and the
+    # divide-and-conquer paths get exercised against Base.BigInt.
+    for bits in (500, 2000, 5000, 20000, 100000)
+        for base in (10, 7, 36, 2, 16, 8)  # non-pow2 (D&C) and pow2 (bit paths)
+            a = rand(rng, big(0):(big(2)^bits - 1))
+            a *= rand(rng, (-1, 1))
+            na = NBig(a)
+            s = string(na; base)
+            @test s == string(a; base)
+            @test parse(NBig, s; base) == na
+        end
+    end
+    # exact-power boundaries: values like base^m - 1 and base^m stress the
+    # zero-chunk / carry edges of the recursion.
+    for base in (10, 7, 36), m in (100, 1000, 3000)
+        for a in (big(base)^m - 1, big(base)^m, big(base)^m + 1)
+            na = NBig(a)
+            @test string(na; base) == string(a; base)
+            @test parse(NBig, string(na; base); base) == na
+        end
+    end
+    @test string(NBig(0); base = 10) == "0"
+    @test parse(NBig, "0"^5000; base = 10) == NBig(0)
+end

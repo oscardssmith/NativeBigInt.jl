@@ -36,8 +36,11 @@ Three layers, mirroring GMP's mpn/mpz split:
   0.82–0.96× GMP's `mpn_tdiv_qr` from the crossover through at least 2048
   limbs) above.
 - **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt; power by repeated
-  squaring; radix conversion for `string`/`parse` (per-limb `divrem_1!` for
-  small values, divide-and-conquer for large).
+  squaring; radix conversion for `string`/`parse` — power-of-two bases pack/
+  unpack bit windows directly (O(n)); other bases use per-limb `divrem_1!` /
+  Horner below `STR_DC_THRESHOLD` (40 limbs, only coarsely tuned) and a
+  recursive split/combine around a `bb^(2^i)` power tree above, routing through
+  `divrem!`/`mul!` for O(M(n) log n) (the recursion lives in `src/nbig.jl`).
 - **gcd (`src/gcd.jl`):** Lehmer gcd/gcdext (Knuth Algorithm L) on 126-bit
   leading windows — two bracket-verified single-word phases per window
   (hgcd2-flavoured), one fused matrix pass over the operands, a full

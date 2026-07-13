@@ -355,13 +355,64 @@ end
 
 const DIGIT_CHARS = codeunits("0123456789abcdefghijklmnopqrstuvwxyz")
 
+# --- Subquadratic base conversion (non-power-of-two bases) -----------------
+# Both directions recurse by splitting exactly in half around powers
+# powtab[i] = bb^(2^(i-1)) of the big base bb = base^k, so each step is one
+# NBig divrem!/mul! and inherits Karatsuba + the NTT (O(M(n) log n)).
+# Power-of-two bases never reach here — string/parse keep their O(n) bit paths.
+# Threshold is in limbs and only coarsely tuned; the win is asymptotic.
+const STR_DC_THRESHOLD = 40
+
+# Emit exactly 2^level base-bb chunks of x (0 <= x < powtab[level+1]),
+# little-endian, into out. level 0 is the single-limb base case.
+function radix_emit!(out::Vector{Limb}, x::NBig, level::Int, powtab::Vector{NBig})
+    if level == 0
+        push!(out, iszero(x) ? zero(Limb) : (@inbounds x.limbs[1]))
+        return
+    end
+    q, r = divrem(x, @inbounds powtab[level])   # bb^(2^(level-1)), the half point
+    radix_emit!(out, r, level - 1, powtab)       # low half
+    radix_emit!(out, q, level - 1, powtab)       # high half
+    return
+end
+
+# Little-endian base-bb chunks of the nonneg NBig x (each < bb). Caller passes
+# abs(x); identical output to radix_chunks! but subquadratic.
+function radix_chunks_dc(x::NBig, bb::Limb)
+    iszero(x) && return Limb[]
+    powtab = NBig[NBig(bb)]                       # powtab[i] = bb^(2^(i-1))
+    while (@inbounds powtab[end]) <= x
+        push!(powtab, powtab[end] * powtab[end])
+    end
+    out = Limb[]
+    radix_emit!(out, x, length(powtab) - 1, powtab)
+    while length(out) > 1 && (@inbounds out[end]) == zero(Limb)
+        pop!(out)                                 # trim high zero chunks
+    end
+    return out
+end
+
+# Value of little-endian base-bb chunks c[lo .. lo + 2^level - 1] (each < bb).
+# Indices past the end of c read as zero, so c need not be padded.
+function radix_combine(c::Vector{Limb}, lo::Int, level::Int, powtab::Vector{NBig})
+    level == 0 && return NBig(lo <= length(c) ? (@inbounds c[lo]) : zero(Limb))
+    h = 1 << (level - 1)
+    low = radix_combine(c, lo, level - 1, powtab)
+    high = radix_combine(c, lo + h, level - 1, powtab)
+    return high * (@inbounds powtab[level]) + low
+end
+
 function Base.string(x::NBig; base::Integer = 10, pad::Integer = 1)
     2 <= base <= 36 || throw(ArgumentError("base must be in 2:36, got $base"))
     n = nlimbs(x)
     bb, k = big_base(Int(base))
-    scratch = Memory{Limb}(undef, n)
-    copyto!(scratch, 1, x.limbs, 1, n)
-    chunks = radix_chunks!(scratch, n, bb)
+    if !ispow2(bb) && n >= STR_DC_THRESHOLD
+        chunks = radix_chunks_dc(abs(x), bb)
+    else
+        scratch = Memory{Limb}(undef, n)
+        copyto!(scratch, 1, x.limbs, 1, n)
+        chunks = radix_chunks!(scratch, n, bb)
+    end
     # digit count of the top chunk (chunks may be empty for zero)
     ndig = (length(chunks) - 1) * k
     top = isempty(chunks) ? zero(Limb) : chunks[end]
@@ -403,6 +454,68 @@ function Base.tryparse(::Type{NBig}, s::AbstractString; base::Integer = 10)
         isempty(cs) && return nothing
     end
     bb, k = big_base(Int(base))
+    ndig = length(cs)
+    if ispow2(base)
+        # Each digit is lg = log2(base) bits at a fixed offset: pack them
+        # straight into the limb buffer, most-significant char first. O(n).
+        lg = trailing_zeros(Int(base))
+        nl = cld(ndig * lg, 64)
+        limbs = Memory{Limb}(undef, nl)
+        fill!(limbs, zero(Limb))
+        p = ndig - 1                       # significance position of current char
+        for c in cs
+            d = '0' <= c <= '9' ? c - '0' :
+                'a' <= c <= 'z' ? c - 'a' + 10 :
+                'A' <= c <= 'Z' ? c - 'A' + 10 : 99
+            d < base || return nothing
+            bitpos = p * lg
+            q = bitpos >> 6
+            off = bitpos & 63
+            @inbounds limbs[q+1] |= (d % Limb) << off
+            if off + lg > 64
+                @inbounds limbs[q+2] |= (d % Limb) >> (64 - off)
+            end
+            p -= 1
+        end
+        x = nbig_from_limbs(1, limbs, nl)
+        return neg ? -x : x
+    end
+    if ndig >= STR_DC_THRESHOLD * k
+        # Divide-and-conquer: group digits into base-bb chunks (most-significant
+        # group first, possibly short), then combine pairwise through NBig mul!.
+        firstlen = ndig % k
+        firstlen == 0 && (firstlen = k)
+        g = Vector{Limb}(undef, cld(ndig, k))
+        gi = 1
+        chunk = zero(Limb)
+        cnt = 0
+        target = firstlen
+        for c in cs
+            d = '0' <= c <= '9' ? c - '0' :
+                'a' <= c <= 'z' ? c - 'a' + 10 :
+                'A' <= c <= 'Z' ? c - 'A' + 10 : 99
+            d < base || return nothing
+            chunk = chunk * (base % Limb) + (d % Limb)
+            cnt += 1
+            if cnt == target
+                @inbounds g[gi] = chunk
+                gi += 1
+                chunk = zero(Limb)
+                cnt = 0
+                target = k
+            end
+        end
+        reverse!(g)   # little-endian for radix_combine
+        nchunks = length(g)
+        level = nchunks <= 1 ? 0 : Base.top_set_bit(nchunks - 1)   # 2^level >= nchunks
+        powtab = Vector{NBig}(undef, level)
+        level >= 1 && (powtab[1] = NBig(bb))
+        for i in 2:level
+            @inbounds powtab[i] = powtab[i-1] * powtab[i-1]
+        end
+        x = radix_combine(g, 1, level, powtab)
+        return neg ? -x : x
+    end
     bigb = NBig(bb)
     x = NBig(0, EMPTY_LIMBS)
     chunk = zero(Limb)
