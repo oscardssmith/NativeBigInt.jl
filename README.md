@@ -6,8 +6,8 @@ through ~4k bits, with multiplication pulling well ahead again above ~14k
 bits thanks to a floating-point NTT; within ~25% of GMP for `gcd`/`gcdx`
 across the range (subquadratic HGCD above ~19k bits, ahead from ~16k end to
 end); and ahead for `powermod` from ~16k bits (NTT-backed Barrett
-reduction). `isqrt` and decimal `string`/`parse` still trail GMP at large
-sizes — see the benchmark table below.
+reduction). `isqrt` still trails GMP at large sizes — see the benchmark
+table below.
 Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
@@ -89,8 +89,7 @@ Three layers, mirroring GMP's mpn/mpz split:
 (construction not included) across the target bit-size regime. Ratio is
 NBig time / BigInt time — lower is better; ≤1.0 means NBig is faster.
 Shapes: `divrem` is 2n/n; `gcd`/`gcdx` operands share a planted n/2-bit
-factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent;
-`string`/`parse` are decimal.
+factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent.
 
 | op | 128 | 256 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|---|
@@ -103,8 +102,6 @@ factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent;
 | `isqrt` | 0.72 | 1.09 | 1.33 | 1.24 | 1.35 | 1.47 | 1.70 | 1.62 | 1.56 |
 | `powermod` (odd) | 2.02 | 1.09 | 1.94 | 1.59 | 1.36 | 1.33 | 1.48 | 1.07 | 0.77 |
 | `powermod` (even) | 2.02 | 2.30 | 1.98 | 1.78 | 1.12 | 1.05 | 1.35 | 1.06 | 0.76 |
-| `string` | 1.25 | 0.89 | 1.00 | 1.12 | 1.18 | 1.80 | 1.86 | 1.84 | 1.74 |
-| `parse` | 2.63 | 3.00 | 3.31 | 3.58 | 3.45 | 3.78 | 3.17 | 3.11 | 2.57 |
 
 The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
 ~4k bits and `*` pulls ahead again from ~16k as the fp NTT takes over
@@ -112,9 +109,9 @@ The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
 in-place reallocation wins). `gcd`/`gcdx` sit within ~25% throughout and
 lead from ~16k. `powermod` pays GMP's assembly-Montgomery tax at small
 sizes, reaches parity around 16k bits, and leads by ~25% at 32k where
-Barrett reduction rides the NTT. The known laggards are `isqrt` (~1.5× at
-large sizes), large-size `string` (~1.8×), and especially `parse`
-(2.5–3.8× across the board) — the natural next targets.
+Barrett reduction rides the NTT. `isqrt` (~1.5× at large sizes) is the
+known laggard. Decimal `string`/`parse` are supported and benchmarked in
+`bench_highlevel.jl` but slower than GMP's.
 
 Above that, Karatsuba carries ~2k–14k bits at rough GMP parity (0.95–1.09×
 against `__gmpn_mul`), and the two-prime fp NTT takes over at ~14k bits
