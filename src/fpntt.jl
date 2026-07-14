@@ -129,23 +129,17 @@ function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int, P::Float64)
     return FpNttStage(q, w1, w1p, w2, w2p, w3, w3p)
 end
 
-# Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a
-# time: fp_mulmod runs on VF8, so the recurrence advances by r^8 per SIMD step,
-# trading the throughput-bound integer divide for FMA-rate modular multiplies.
+# Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a time
 function fp_twiddles(r::UInt64, n::Int, F::FpCtx)
     p = fp_prime(F)
     P = Float64(p)
     np = cld(n, 8) << 3
     t = Vector{Float64}(undef, np)
-    r8 = UInt64(1)
-    for _ in 1:8
-        r8 = UInt64(widemul(r8, r) % p)
-    end
+    r8 = powermod(r, 8, p)
     vw, vwp = VF8(Float64(r8)), VF8(Float64(r8) / P)
     v = VF8(ntuple(k -> Float64(powermod(r, k - 1, p)), 8))
-    z, vP = VF8(0.0), VF8(P)
     @inbounds for j in 1:8:np
-        SIMD.vstore(SIMD.vifelse(v < z, v + vP, v), t, j)   # canonicalize to [0, p)
+        SIMD.vstore(SIMD.vifelse(v < VF8(0.0), v + VF8(P), v), t, j) # canonicalize to [0, p)
         v = fp_mulmod(v, vw, vwp, F)
     end
     resize!(t, n)
