@@ -110,13 +110,46 @@ struct FpNttStage
     w3::Vector{Float64};  w3p::Vector{Float64}
 end
 
-function build_fp_stage(table::Vector{UInt64}, N2::Int, L::Int, P::Float64)
+function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int, P::Float64)
     q = L >> 2
     st = N2 ÷ L
     len = max(q, 8)
-    mk(f) = [Float64(table[f(j % q)*st+1]) for j in 0:len-1]
-    w1 = mk(j -> j);  w2 = mk(j -> 2j);  w3 = mk(j -> 3j)
-    return FpNttStage(q, w1, w1 ./ P, w2, w2 ./ P, w3, w3 ./ P)
+    w1 = Vector{Float64}(undef, len); w1p = Vector{Float64}(undef, len)
+    w2 = Vector{Float64}(undef, len); w2p = Vector{Float64}(undef, len)
+    w3 = Vector{Float64}(undef, len); w3p = Vector{Float64}(undef, len)
+    @inbounds for j in 0:len-1
+        jm = j < q ? j : j % q          # len > q only for the tiny q < 8 stages
+        v1 = table[jm*st+1]
+        v2 = table[2jm*st+1]
+        v3 = table[3jm*st+1]
+        w1[j+1] = v1; w1p[j+1] = v1 / P
+        w2[j+1] = v2; w2p[j+1] = v2 / P
+        w3[j+1] = v3; w3p[j+1] = v3 / P
+    end
+    return FpNttStage(q, w1, w1p, w2, w2p, w3, w3p)
+end
+
+# Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a
+# time: fp_mulmod runs on VF8, so the recurrence advances by r^8 per SIMD step,
+# trading the throughput-bound integer divide for FMA-rate modular multiplies.
+function fp_twiddles(r::UInt64, n::Int, F::FpCtx)
+    p = fp_prime(F)
+    P = Float64(p)
+    np = cld(n, 8) << 3
+    t = Vector{Float64}(undef, np)
+    r8 = UInt64(1)
+    for _ in 1:8
+        r8 = UInt64(widemul(r8, r) % p)
+    end
+    vw, vwp = VF8(Float64(r8)), VF8(Float64(r8) / P)
+    v = VF8(ntuple(k -> Float64(powermod(r, k - 1, p)), 8))
+    z, vP = VF8(0.0), VF8(P)
+    @inbounds for j in 1:8:np
+        SIMD.vstore(SIMD.vifelse(v < z, v + vP, v), t, j)   # canonicalize to [0, p)
+        v = fp_mulmod(v, vw, vwp, F)
+    end
+    resize!(t, n)
+    return t
 end
 
 struct FpOddStage
@@ -226,14 +259,13 @@ function build_fp_plan(N::Int, F::FpCtx)
 
     N2 = span
     M = max(1, (3N2) >> 2)
-    tw = Vector{UInt64}(undef, M)
-    twinv = Vector{UInt64}(undef, M)
-    fw, fi = UInt64(1), UInt64(1)
-    for j in 1:M
-        tw[j] = fw
-        twinv[j] = fi
-        fw = UInt64(UInt128(fw) * r % fp_prime(F))
-        fi = UInt64(UInt128(fi) * ri % fp_prime(F))
+    # tw[j] = r^(j-1); since r has order N2, the inverse twiddles are just the
+    # forward ones reversed: twinv[j] = r^-(j-1) = r^(N2-(j-1)) = tw[N2-j+2].
+    tw = fp_twiddles(r, N2, F)
+    twinv = Vector{Float64}(undef, M)
+    twinv[1] = 1.0
+    @inbounds for j in 2:M
+        twinv[j] = tw[N2-j+2]
     end
     fwd = FpNttStage[]
     L = N2
