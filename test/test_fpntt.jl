@@ -5,7 +5,7 @@
 # |x| <= 8p) where random in-range inputs would never stress the
 # magic-constant round.
 using NativeBigInt: FP_CTX1, FpCtx, fp_prime, fp_mulmod, fp_mulmod2,
-                    fp_reduce, fp_round, fpi_pow, fpi_inv, fp_ntt_plan,
+                    fp_reduce, fp_round, fp_ntt_plan,
                     fp_ntt_fwd!, fp_ntt_inv!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
@@ -51,9 +51,9 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
     # generator-derived roots of unity have exact order
     for logN in (1, 5, 20, 33)
         N = UInt64(2)^logN
-        ω = fpi_pow(NativeBigInt.fp_generator(FP_CTX1), (FP_PI - 1) ÷ N, FP_PI)
-        @test fpi_pow(ω, N, FP_PI) == 1
-        @test fpi_pow(ω, N >> 1, FP_PI) == FP_PI - 1
+        ω = powermod(NativeBigInt.fp_generator(FP_CTX1), (FP_PI - 1) ÷ N, FP_PI)
+        @test powermod(ω, N, FP_PI) == 1
+        @test powermod(ω, N >> 1, FP_PI) == FP_PI - 1
     end
 end
 

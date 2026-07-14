@@ -33,12 +33,9 @@
 # Hardware FMA and round-to-nearest are assumed.  No @fastmath anywhere near
 # this file: contraction would break the fma(x, w, -h) cancellation.
 
-const FP_MAGIC = 6755399441055744.0            # 1.5·2^52
 const VF8 = SIMD.Vec{8,Float64}
 
-# prime to do a NTT over and the factorization of P-1 as (prime => exponent)
-# pairs: the primes drive generator selection, and the exponent of 2 is the
-# 2-adicity that caps the transform length (see ntt_len).
+# prime to do a NTT over and the factorization of P-1 as (prime => exponent) pairs.
 struct FpCtx{P}
     facs::Tuple{Vararg{Pair{Int,Int}}}
 end
@@ -53,17 +50,17 @@ end
 end
 
 # Both primes < 2^49 (rounding bounds above)
-# 2-adicity >= 33 with, 15 | p - 1 (the {1,3,5,15}·2^k length family)
-# product ~2^98.97 (the two-prime working modulus)
-const FP_CTX1 = FpCtx{2^49 - 2^33 + 1}((2 => 33, 3 => 1, 5 => 1, 17 => 1, 257 => 1))
-const FP_CTX2 = FpCtx{255 * 2^41 + 1}((2 => 41, 3 => 1, 5 => 1, 17 => 1))
+# Of form 2^n*(2^(49-n)-1) since that allows radix 2^n and radix, 3, 5, 17 transforms
+const FP_CTX1 = FpCtx{2^33 * (2^16-1) + 1}((2 => 33, 3 => 1, 5 => 1, 17 => 1, 257 => 1))
+const FP_CTX2 = FpCtx{2^41 * (2^8 -1) + 1}((2 => 41, 3 => 1, 5 => 1, 17 => 1))
 
+# magic rounding constant. FP_MAGIC + x - FP_MAGIC rounds x to Int.
+const FP_MAGIC = 1.5*2^52 
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
 
 # r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
-# q = fp_round(x * wpinv) has no dependency on h, so both multiplies issue
-# together.
+# q = fp_round(x * wpinv) not dependent on h, so both multiplies issue together.
 @inline function fp_mulmod(x, w, wpinv, ::FpCtx{P}) where {P}
     h = x * w
     l = fma(x, w, -h)
@@ -76,8 +73,8 @@ end
 # callers use the easy end of that domain (|x| <= ~8p, quotient <= 8);
 # fp_mulmod2 uses the far edge (x = h ~ 4p², quotient ~ 4p ≈ 2^51).  The
 # result is exact either way: x is an exact integer (any double >= 2^53 in
-# magnitude is one), q·p is an integer, and their difference is small enough
-# to represent exactly.
+# magnitude is one), q·p is an integer
+# and their difference is small enough to represent exactly.
 @inline function fp_reduce(x, ::FpCtx{P}) where {P}
     q = fp_round(x * inv(P))
     return fma(q, -P, x)
@@ -92,34 +89,20 @@ end
     return fp_reduce(h, F) + l
 end
 
-# integer-domain helpers for building twiddle tables
-function fpi_pow(a::UInt64, e::Integer, p::UInt64)
-    r = UInt128(1)
-    b = UInt128(a % p)
-    while e != 0
-        isodd(e) && (r = r * b % p)
-        b = b * b % p
-        e >>= 1
-    end
-    return r % UInt64
-end
-@inline fpi_inv(a::UInt64, p::UInt64) = fpi_pow(a, p - 2, p)
-
 function fp_generator(F::FpCtx)
     for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
-        all(fpi_pow(UInt64(g), (fp_prime(F) - 1) ÷ q, fp_prime(F)) != 1 for (q, _) in F.facs) &&
+        all(powermod(UInt64(g), (fp_prime(F) - 1) ÷ q, fp_prime(F)) != 1 for (q, _) in F.facs) &&
             return UInt64(g)
     end
     error("unreachable: GF(p) has a small generator")
 end
 
 const FP_P1INV2 =                                  # p1^-1 mod p2 (Garner)
-    fpi_inv(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))
+    invmod(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))
 
 # ---------------------------------------------------------------------------
-# Transform plan: N = m·2^k, m in (1, 3, 5, 15), 2^k | p - 1.  Twiddles are
-# stored as (w, w/p) pairs so fp_mulmod's quotient estimate is a table load.
-
+# Transform plan: N = m·2^k, m divides 255, 2^k | p - 1.
+# Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient estimate is a table load.
 struct FpNttStage
     q::Int
     w1::Vector{Float64};  w1p::Vector{Float64}
@@ -144,16 +127,16 @@ struct FpOddStage
     tw::Vector{Vector{Float64}};  twp::Vector{Vector{Float64}}
 end
 
-# Winograd 5-point constants from a primitive 5th root c.  With
-# a = c + c^4, b = c^2 + c^3 (a + b = -1, the roots sum to zero):
-#   k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
+# Winograd 5-point constants from a primitive 5th root c.
+# With a = c + c^4, b = c^2 + c^3 (a + b = -1, the roots sum to zero):
+# k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
 # all canonical residues mod p (see fp_dft5 for the combine they feed).
 function fp_dft5_consts(c::UInt64, F::FpCtx)
     p = fp_prime(F)
     mulm(x, y) = UInt64(UInt128(x) * y % p)
     subm(x, y) = x >= y ? x - y : x + p - y
     c2 = mulm(c, c); c3 = mulm(c2, c); c4 = mulm(c3, c)
-    inv2 = fpi_inv(UInt64(2), p)
+    inv2 = invmod(UInt64(2), p)
     inv4 = mulm(inv2, inv2)
     a = (c + c4) % p
     b = (c2 + c3) % p
@@ -161,21 +144,21 @@ function fp_dft5_consts(c::UInt64, F::FpCtx)
                    mulm(subm(c, c4), inv2), mulm(subm(c2, c3), inv2)]
 end
 
-# Symmetric-pair constants for the 17-point DFT (see fp_dft17_uv).  Pairing
-# x_j with x_{17-j} and y_r with y_{17-r} (c^{j(17-r)} = c^{-jr}) turns the
-# 16x16 DFT matrix into 8x8 quadrants of half-sums/half-differences
-#   A_{jr} = (c^{jr} + c^{-jr})/2,  B_{jr} = (c^{jr} - c^{-jr})/2,
+# Symmetric-pair constants for the 17-point DFT (see fp_dft17_uv).
+# Pairing x_j with x_{17-j} and y_r with y_{17-r} (c^{j(17-r)} = c^{-jr})
+# turns the 16x16 DFT matrix into 8x8 quadrants of half-sums/half-differences
+# A_{jr} = (c^{jr} + c^{-jr})/2,  B_{jr} = (c^{jr} - c^{-jr})/2,
 # stored row-major by r: A_{jr} at (r-1)·16 + j, B_{jr} at (r-1)·16 + 8 + j,
 # so each output pair reads 16 contiguous constants.
 function fp_dft17_consts(c::UInt64, F::FpCtx)
     p = fp_prime(F)
     mulm(x, y) = UInt64(UInt128(x) * y % p)
     subm(x, y) = x >= y ? x - y : x + p - y
-    inv2 = fpi_inv(UInt64(2), p)
+    inv2 = invmod(UInt64(2), p)
     rot = Vector{Float64}(undef, 128)
     for r in 1:8, j in 1:8
-        cjr = fpi_pow(c, j * r % 17, p)
-        cmjr = fpi_pow(c, 17 - j * r % 17, p)
+        cjr = powermod(c, j * r % 17, p)
+        cmjr = powermod(c, 17 - j * r % 17, p)
         rot[(r-1)*16+j] = Float64(mulm((cjr + cmjr) % p, inv2))
         rot[(r-1)*16+8+j] = Float64(mulm(subm(cjr, cmjr), inv2))
     end
@@ -184,18 +167,18 @@ end
 
 function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
-    c = fpi_pow(root, Q, fp_prime(F))
+    c = powermod(root, Q, fp_prime(F))
     rot = m == 5 ? fp_dft5_consts(c, F) :
           m == 17 ? fp_dft17_consts(c, F) :
-          [Float64(fpi_pow(c, r, fp_prime(F))) for r in 1:m-1]
+          Float64[powermod(c, r, fp_prime(F)) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
-        ωr = fpi_pow(root, r, fp_prime(F))
+        ωr = powermod(root, r, fp_prime(F))
         t = Vector{Float64}(undef, Q)
         f = UInt64(1)
         for j in 1:Q
-            t[j] = Float64(f)
-            f = UInt64(UInt128(f) * ωr % fp_prime(F))
+            t[j] = f
+            f = UInt64(widemul(f, ωr) % fp_prime(F))
         end
         tw[r] = t
     end
@@ -219,12 +202,12 @@ function build_fp_plan(N::Int, F::FpCtx)
     m = N >> k
     @assert m in (1, 3, 5, 15, 17, 51, 85, 255) && (m == 1 || k >= 2)
     @assert (fp_prime(F) - 1) % N == 0
-    ω = fpi_pow(fp_generator(F), (fp_prime(F) - 1) ÷ N, fp_prime(F))
-    @assert fpi_pow(ω, N >> 1, fp_prime(F)) == fp_prime(F) - 1
-    m % 3 == 0 && @assert fpi_pow(ω, N ÷ 3, fp_prime(F)) != 1
-    m % 5 == 0 && @assert fpi_pow(ω, N ÷ 5, fp_prime(F)) != 1
-    m % 17 == 0 && @assert fpi_pow(ω, N ÷ 17, fp_prime(F)) != 1
-    ωinv = fpi_inv(ω, fp_prime(F))
+    ω = powermod(fp_generator(F), (fp_prime(F) - 1) ÷ N, fp_prime(F))
+    @assert powermod(ω, N >> 1, fp_prime(F)) == fp_prime(F) - 1
+    m % 3 == 0 && @assert powermod(ω, N ÷ 3, fp_prime(F)) != 1
+    m % 5 == 0 && @assert powermod(ω, N ÷ 5, fp_prime(F)) != 1
+    m % 17 == 0 && @assert powermod(ω, N ÷ 17, fp_prime(F)) != 1
+    ωinv = invmod(ω, fp_prime(F))
 
     oddf = FpOddStage[]
     oddi = FpOddStage[]
@@ -234,8 +217,8 @@ function build_fp_plan(N::Int, F::FpCtx)
         if m % mf == 0
             push!(oddf, build_fp_odd(mf, span, r, F))
             push!(oddi, build_fp_odd(mf, span, ri, F))
-            r = fpi_pow(r, mf, fp_prime(F))
-            ri = fpi_pow(ri, mf, fp_prime(F))
+            r = powermod(r, mf, fp_prime(F))
+            ri = powermod(ri, mf, fp_prime(F))
             span ÷= mf
         end
     end
@@ -264,8 +247,8 @@ function build_fp_plan(N::Int, F::FpCtx)
         push!(inv, build_fp_stage(twinv, N2, L, Float64(fp_prime(F))))
         L <<= 2
     end
-    wi = N2 >= 4 ? Float64(fpi_pow(r, N2 >> 2, fp_prime(F))) : 1.0
-    ninv = Float64(fpi_inv(N % UInt64, fp_prime(F)))
+    wi = N2 >= 4 ? Float64(powermod(r, N2 >> 2, fp_prime(F))) : 1.0
+    ninv = Float64(invmod(N % UInt64, fp_prime(F)))
     return FpNttPlan(F, N, N2, ninv, ninv / Float64(fp_prime(F)), wi, wi / Float64(fp_prime(F)), oddf, oddi, fwd, inv)
 end
 
