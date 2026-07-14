@@ -36,27 +36,27 @@
 const FP_MAGIC = 6755399441055744.0            # 1.5·2^52
 const VF8 = SIMD.Vec{8,Float64}
 
-# Per-prime constants as a type-parameter singleton: every property access
-# const-folds to a literal in the compiled code (measured ~3-4% faster than
-# carrying them as runtime struct fields), while the engine stays parametric
-# over the prime.  Properties: pi (the prime as UInt64), p, pn = -p,
-# pinv = 1/p, facs (prime factors of p-1).
-struct FpCtx{PI,FACS} end
-FpCtx(pi::UInt64, facs::Tuple) = FpCtx{pi,facs}()
-@inline function Base.getproperty(::FpCtx{PI,FACS}, s::Symbol) where {PI,FACS}
-    s === :pi   && return PI
-    s === :p    && return Float64(PI)
-    s === :pn   && return -Float64(PI)
-    s === :pinv && return 1.0 / Float64(PI)
-    s === :facs && return FACS
-    error("FpCtx has no property $s")
+# prime to do a NTT over and the factorization of P-1 as (prime => exponent)
+# pairs: the primes drive generator selection, and the exponent of 2 is the
+# 2-adicity that caps the transform length (see ntt_len).
+struct FpCtx{P}
+    facs::Tuple{Vararg{Pair{Int,Int}}}
+end
+@inline fp_prime(::FpCtx{P}) where {P} = UInt64(P)
+
+# 2-adicity of p-1: the exponent of the (2 => k) pair.
+@inline function two_adicity(F::FpCtx)
+    for (q, e) in F.facs
+        q == 2 && return e
+    end
+    return 0
 end
 
-# The primes.  Both < 2^49 (rounding bounds above), 2-adicity >= 33 with
-# 15 | p - 1 (the {1,3,5,15}·2^k length family), product ~2^98.97 (the
-# two-prime working modulus). FP_CTX1.pi etc. are the canonical accessors.
-const FP_CTX1 = FpCtx(UInt(2^49 - 2^33 + 1), (2, 3, 5, 17, 257)) # p1 - 1 = 2^33·3·5·17·257
-const FP_CTX2 = FpCtx(UInt(255 * 2^41 + 1), (2, 3, 5, 17))        # p2 - 1 = 2^41·3·5·17
+# Both primes < 2^49 (rounding bounds above)
+# 2-adicity >= 33 with, 15 | p - 1 (the {1,3,5,15}·2^k length family)
+# product ~2^98.97 (the two-prime working modulus)
+const FP_CTX1 = FpCtx{2^49 - 2^33 + 1}((2 => 33, 3 => 1, 5 => 1, 17 => 1, 257 => 1))
+const FP_CTX2 = FpCtx{255 * 2^41 + 1}((2 => 41, 3 => 1, 5 => 1, 17 => 1))
 
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
@@ -64,11 +64,11 @@ const FP_CTX2 = FpCtx(UInt(255 * 2^41 + 1), (2, 3, 5, 17))        # p2 - 1 = 2^4
 # r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
 # q = fp_round(x * wpinv) has no dependency on h, so both multiplies issue
 # together.
-@inline function fp_mulmod(x, w, wpinv, F::FpCtx)
+@inline function fp_mulmod(x, w, wpinv, ::FpCtx{P}) where {P}
     h = x * w
     l = fma(x, w, -h)
     q = fp_round(x * wpinv)
-    return fma(q, F.pn, h) + l
+    return fma(q, -P, h) + l
 end
 
 # r ≡ x (mod p), |r| <= p(1/2 + |x|·2^-52/p): exact whenever the quotient
@@ -78,9 +78,9 @@ end
 # result is exact either way: x is an exact integer (any double >= 2^53 in
 # magnitude is one), q·p is an integer, and their difference is small enough
 # to represent exactly.
-@inline function fp_reduce(x, F::FpCtx)
-    q = fp_round(x * F.pinv)
-    return fma(q, F.pn, x)
+@inline function fp_reduce(x, ::FpCtx{P}) where {P}
+    q = fp_round(x * inv(P))
+    return fma(q, -P, x)
 end
 
 # r ≡ x·y (mod p) for two data operands (no precomputed quotient), inputs
@@ -107,14 +107,14 @@ end
 
 function fp_generator(F::FpCtx)
     for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
-        all(fpi_pow(UInt64(g), (F.pi - 1) ÷ q, F.pi) != 1 for q in F.facs) &&
+        all(fpi_pow(UInt64(g), (fp_prime(F) - 1) ÷ q, fp_prime(F)) != 1 for (q, _) in F.facs) &&
             return UInt64(g)
     end
     error("unreachable: GF(p) has a small generator")
 end
 
 const FP_P1INV2 =                                  # p1^-1 mod p2 (Garner)
-    fpi_inv(FP_CTX1.pi % FP_CTX2.pi, FP_CTX2.pi)
+    fpi_inv(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))
 
 # ---------------------------------------------------------------------------
 # Transform plan: N = m·2^k, m in (1, 3, 5, 15), 2^k | p - 1.  Twiddles are
@@ -149,7 +149,7 @@ end
 #   k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
 # all canonical residues mod p (see fp_dft5 for the combine they feed).
 function fp_dft5_consts(c::UInt64, F::FpCtx)
-    p = F.pi
+    p = fp_prime(F)
     mulm(x, y) = UInt64(UInt128(x) * y % p)
     subm(x, y) = x >= y ? x - y : x + p - y
     c2 = mulm(c, c); c3 = mulm(c2, c); c4 = mulm(c3, c)
@@ -161,23 +161,45 @@ function fp_dft5_consts(c::UInt64, F::FpCtx)
                    mulm(subm(c, c4), inv2), mulm(subm(c2, c3), inv2)]
 end
 
+# Symmetric-pair constants for the 17-point DFT (see fp_dft17_uv).  Pairing
+# x_j with x_{17-j} and y_r with y_{17-r} (c^{j(17-r)} = c^{-jr}) turns the
+# 16x16 DFT matrix into 8x8 quadrants of half-sums/half-differences
+#   A_{jr} = (c^{jr} + c^{-jr})/2,  B_{jr} = (c^{jr} - c^{-jr})/2,
+# stored row-major by r: A_{jr} at (r-1)·16 + j, B_{jr} at (r-1)·16 + 8 + j,
+# so each output pair reads 16 contiguous constants.
+function fp_dft17_consts(c::UInt64, F::FpCtx)
+    p = fp_prime(F)
+    mulm(x, y) = UInt64(UInt128(x) * y % p)
+    subm(x, y) = x >= y ? x - y : x + p - y
+    inv2 = fpi_inv(UInt64(2), p)
+    rot = Vector{Float64}(undef, 128)
+    for r in 1:8, j in 1:8
+        cjr = fpi_pow(c, j * r % 17, p)
+        cmjr = fpi_pow(c, 17 - j * r % 17, p)
+        rot[(r-1)*16+j] = Float64(mulm((cjr + cmjr) % p, inv2))
+        rot[(r-1)*16+8+j] = Float64(mulm(subm(cjr, cmjr), inv2))
+    end
+    return rot
+end
+
 function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
-    c = fpi_pow(root, Q, F.pi)
+    c = fpi_pow(root, Q, fp_prime(F))
     rot = m == 5 ? fp_dft5_consts(c, F) :
-          [Float64(fpi_pow(c, r, F.pi)) for r in 1:m-1]
+          m == 17 ? fp_dft17_consts(c, F) :
+          [Float64(fpi_pow(c, r, fp_prime(F))) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
-        ωr = fpi_pow(root, r, F.pi)
+        ωr = fpi_pow(root, r, fp_prime(F))
         t = Vector{Float64}(undef, Q)
         f = UInt64(1)
         for j in 1:Q
             t[j] = Float64(f)
-            f = UInt64(UInt128(f) * ωr % F.pi)
+            f = UInt64(UInt128(f) * ωr % fp_prime(F))
         end
         tw[r] = t
     end
-    return FpOddStage(m, span, Q, rot, rot ./ F.p, tw, [t ./ F.p for t in tw])
+    return FpOddStage(m, span, Q, rot, rot ./ Float64(fp_prime(F)), tw, [t ./ Float64(fp_prime(F)) for t in tw])
 end
 
 struct FpNttPlan{C<:FpCtx}
@@ -195,24 +217,25 @@ end
 function build_fp_plan(N::Int, F::FpCtx)
     k = trailing_zeros(N)
     m = N >> k
-    @assert m in (1, 3, 5, 15) && (m == 1 || k >= 2)
-    @assert (F.pi - 1) % N == 0
-    ω = fpi_pow(fp_generator(F), (F.pi - 1) ÷ N, F.pi)
-    @assert fpi_pow(ω, N >> 1, F.pi) == F.pi - 1
-    m % 3 == 0 && @assert fpi_pow(ω, N ÷ 3, F.pi) != 1
-    m % 5 == 0 && @assert fpi_pow(ω, N ÷ 5, F.pi) != 1
-    ωinv = fpi_inv(ω, F.pi)
+    @assert m in (1, 3, 5, 15, 17, 51, 85, 255) && (m == 1 || k >= 2)
+    @assert (fp_prime(F) - 1) % N == 0
+    ω = fpi_pow(fp_generator(F), (fp_prime(F) - 1) ÷ N, fp_prime(F))
+    @assert fpi_pow(ω, N >> 1, fp_prime(F)) == fp_prime(F) - 1
+    m % 3 == 0 && @assert fpi_pow(ω, N ÷ 3, fp_prime(F)) != 1
+    m % 5 == 0 && @assert fpi_pow(ω, N ÷ 5, fp_prime(F)) != 1
+    m % 17 == 0 && @assert fpi_pow(ω, N ÷ 17, fp_prime(F)) != 1
+    ωinv = fpi_inv(ω, fp_prime(F))
 
     oddf = FpOddStage[]
     oddi = FpOddStage[]
     span = N
     r, ri = ω, ωinv
-    for mf in (3, 5)
+    for mf in (3, 5, 17)
         if m % mf == 0
             push!(oddf, build_fp_odd(mf, span, r, F))
             push!(oddi, build_fp_odd(mf, span, ri, F))
-            r = fpi_pow(r, mf, F.pi)
-            ri = fpi_pow(ri, mf, F.pi)
+            r = fpi_pow(r, mf, fp_prime(F))
+            ri = fpi_pow(ri, mf, fp_prime(F))
             span ÷= mf
         end
     end
@@ -226,24 +249,24 @@ function build_fp_plan(N::Int, F::FpCtx)
     for j in 1:M
         tw[j] = fw
         twinv[j] = fi
-        fw = UInt64(UInt128(fw) * r % F.pi)
-        fi = UInt64(UInt128(fi) * ri % F.pi)
+        fw = UInt64(UInt128(fw) * r % fp_prime(F))
+        fi = UInt64(UInt128(fi) * ri % fp_prime(F))
     end
     fwd = FpNttStage[]
     L = N2
     while L >= 4
-        push!(fwd, build_fp_stage(tw, N2, L, F.p))
+        push!(fwd, build_fp_stage(tw, N2, L, Float64(fp_prime(F))))
         L >>= 2
     end
     inv = FpNttStage[]
     L = isodd(k) ? 8 : 16
     while L <= N2
-        push!(inv, build_fp_stage(twinv, N2, L, F.p))
+        push!(inv, build_fp_stage(twinv, N2, L, Float64(fp_prime(F))))
         L <<= 2
     end
-    wi = N2 >= 4 ? Float64(fpi_pow(r, N2 >> 2, F.pi)) : 1.0
-    ninv = Float64(fpi_inv(N % UInt64, F.pi))
-    return FpNttPlan(F, N, N2, ninv, ninv / F.p, wi, wi / F.p, oddf, oddi, fwd, inv)
+    wi = N2 >= 4 ? Float64(fpi_pow(r, N2 >> 2, fp_prime(F))) : 1.0
+    ninv = Float64(fpi_inv(N % UInt64, fp_prime(F)))
+    return FpNttPlan(F, N, N2, ninv, ninv / Float64(fp_prime(F)), wi, wi / Float64(fp_prime(F)), oddf, oddi, fwd, inv)
 end
 
 mutable struct FpNttPlanCache
@@ -252,7 +275,7 @@ end
 const FPNTT_PLAN_LOCK = ReentrantLock()
 const FPNTT_PLAN_CACHE = FpNttPlanCache(Dict{Tuple{Int,UInt64},FpNttPlan}())
 function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
-    key = (N, F.pi)
+    key = (N, fp_prime(F))
     plan = get(@atomic(:acquire, FPNTT_PLAN_CACHE.plans), key, nothing)
     plan === nothing || return plan::FpNttPlan{C}
     r = lock(FPNTT_PLAN_LOCK) do
@@ -269,8 +292,9 @@ function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
 end
 
 # ---------------------------------------------------------------------------
-# Odd-radix stages: Winograd radix-3 and plain radix-5.  The ω^0 output is
-# fp_reduced before storing, and inverse stages fp_reduce t0 on load.
+# Odd-radix stages: Winograd radix-3, plain radix-5, symmetric-pair radix-17.
+# The ω^0 output is fp_reduced before storing, and inverse stages fp_reduce
+# t0 on load.
 
 function fp_radix3_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
     Q = st.Q
@@ -457,6 +481,140 @@ function fp_radix5_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
         x[i0+2Q] = y2
         x[i0+3Q] = y3
         x[i0+4Q] = y4
+        j += 1
+    end
+    return x
+end
+
+# Symmetric-pair 17-point DFT output pair (see fp_dft17_consts): with
+# s_j = x_j + x_{17-j}, d_j = x_j - x_{17-j},
+#   y_r      = x_0 + u_r + v_r,   u_r = Σ_j s_j·A_{jr}
+#   y_{17-r} = x_0 + u_r - v_r,   v_r = Σ_j d_j·B_{jr}
+# for r in 1..8 — 128 mulmods per column instead of the DFT matrix's 256.
+# Bounds: inputs |x| <= ~0.94p give |s|,|d| <= 2p (mulmod-legal), each
+# mulmod out <= 0.75p, so |u|,|v| <= 6p; both are fp_reduced here before the
+# ±-combine, so every y is <= |x0| + ~1.02p <= ~2p — legal as the forward
+# twiddle-mulmod argument and as the inverse next-stage load.  The sums are
+# balanced trees purely for latency; every order is exact (integers < 2^53).
+@inline function fp_dft17_uv(s::NTuple{8,T}, d::NTuple{8,T}, base::Int,
+                             rot::Vector{Float64}, rotp::Vector{Float64},
+                             F::FpCtx) where {T}
+    @inbounds begin
+        Base.Cartesian.@nexprs 8 j -> u_j =
+            fp_mulmod(s[j], T(rot[base+j]), T(rotp[base+j]), F)
+        Base.Cartesian.@nexprs 8 j -> v_j =
+            fp_mulmod(d[j], T(rot[base+8+j]), T(rotp[base+8+j]), F)
+    end
+    u = ((u_1 + u_2) + (u_3 + u_4)) + ((u_5 + u_6) + (u_7 + u_8))
+    v = ((v_1 + v_2) + (v_3 + v_4)) + ((v_5 + v_6) + (v_7 + v_8))
+    return fp_reduce(u, F), fp_reduce(v, F)
+end
+
+function fp_radix17_fwd!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
+    Q = st.Q
+    rot, rotp = st.rot, st.rotp
+    w, wp = st.tw, st.twp
+    j = 0
+    if Q >= 8
+        @inbounds while j + 8 <= Q
+            i0 = o + j + 1
+            x0 = SIMD.vload(VF8, x, i0)
+            Base.Cartesian.@nexprs 8 jj -> begin
+                a_jj = SIMD.vload(VF8, x, i0 + jj * Q)
+                b_jj = SIMD.vload(VF8, x, i0 + (17 - jj) * Q)
+                s_jj = a_jj + b_jj
+                d_jj = a_jj - b_jj
+            end
+            s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
+            d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
+            y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
+            SIMD.vstore(fp_reduce(x0 + y0, F), x, i0)
+            for r in 1:8
+                u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
+                xu = x0 + u
+                SIMD.vstore(fp_mulmod(xu + v, SIMD.vload(VF8, w[r], j + 1),
+                                      SIMD.vload(VF8, wp[r], j + 1), F), x, i0 + r * Q)
+                SIMD.vstore(fp_mulmod(xu - v, SIMD.vload(VF8, w[17-r], j + 1),
+                                      SIMD.vload(VF8, wp[17-r], j + 1), F), x, i0 + (17 - r) * Q)
+            end
+            j += 8
+        end
+    end
+    @inbounds while j < Q
+        i0 = o + j + 1
+        x0 = x[i0]
+        Base.Cartesian.@nexprs 8 jj -> begin
+            a_jj = x[i0+jj*Q]
+            b_jj = x[i0+(17-jj)*Q]
+            s_jj = a_jj + b_jj
+            d_jj = a_jj - b_jj
+        end
+        s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
+        d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
+        y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
+        x[i0] = fp_reduce(x0 + y0, F)
+        for r in 1:8
+            u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
+            xu = x0 + u
+            x[i0+r*Q] = fp_mulmod(xu + v, w[r][j+1], wp[r][j+1], F)
+            x[i0+(17-r)*Q] = fp_mulmod(xu - v, w[17-r][j+1], wp[17-r][j+1], F)
+        end
+        j += 1
+    end
+    return x
+end
+
+function fp_radix17_inv!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx)
+    Q = st.Q
+    rot, rotp = st.rot, st.rotp
+    w, wp = st.tw, st.twp
+    j = 0
+    if Q >= 8
+        @inbounds while j + 8 <= Q
+            i0 = o + j + 1
+            t0 = fp_reduce(SIMD.vload(VF8, x, i0), F)
+            Base.Cartesian.@nexprs 8 jj -> begin
+                a_jj = fp_mulmod(SIMD.vload(VF8, x, i0 + jj * Q),
+                                 SIMD.vload(VF8, w[jj], j + 1),
+                                 SIMD.vload(VF8, wp[jj], j + 1), F)
+                b_jj = fp_mulmod(SIMD.vload(VF8, x, i0 + (17 - jj) * Q),
+                                 SIMD.vload(VF8, w[17-jj], j + 1),
+                                 SIMD.vload(VF8, wp[17-jj], j + 1), F)
+                s_jj = a_jj + b_jj
+                d_jj = a_jj - b_jj
+            end
+            s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
+            d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
+            y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
+            SIMD.vstore(fp_reduce(t0 + y0, F), x, i0)
+            for r in 1:8
+                u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
+                tu = t0 + u
+                SIMD.vstore(tu + v, x, i0 + r * Q)
+                SIMD.vstore(tu - v, x, i0 + (17 - r) * Q)
+            end
+            j += 8
+        end
+    end
+    @inbounds while j < Q
+        i0 = o + j + 1
+        t0 = fp_reduce(x[i0], F)
+        Base.Cartesian.@nexprs 8 jj -> begin
+            a_jj = fp_mulmod(x[i0+jj*Q], w[jj][j+1], wp[jj][j+1], F)
+            b_jj = fp_mulmod(x[i0+(17-jj)*Q], w[17-jj][j+1], wp[17-jj][j+1], F)
+            s_jj = a_jj + b_jj
+            d_jj = a_jj - b_jj
+        end
+        s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
+        d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
+        y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
+        x[i0] = fp_reduce(t0 + y0, F)
+        for r in 1:8
+            u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
+            tu = t0 + u
+            x[i0+r*Q] = tu + v
+            x[i0+(17-r)*Q] = tu - v
+        end
         j += 1
     end
     return x
@@ -721,7 +879,8 @@ function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
     F = plan.ctx
     for st in plan.oddf
         for o in 0:st.span:plan.N-1
-            st.m == 3 ? fp_radix3_fwd!(x, o, st, F) : fp_radix5_fwd!(x, o, st, F)
+            st.m == 3 ? fp_radix3_fwd!(x, o, st, F) :
+            st.m == 5 ? fp_radix5_fwd!(x, o, st, F) : fp_radix17_fwd!(x, o, st, F)
         end
     end
     for o in 0:plan.N2:plan.N-1
@@ -737,7 +896,8 @@ function fp_ntt_inv!(x::Vector{Float64}, plan::FpNttPlan)
     end
     for st in plan.oddi
         for o in 0:st.span:plan.N-1
-            st.m == 3 ? fp_radix3_inv!(x, o, st, F) : fp_radix5_inv!(x, o, st, F)
+            st.m == 3 ? fp_radix3_inv!(x, o, st, F) :
+            st.m == 5 ? fp_radix5_inv!(x, o, st, F) : fp_radix17_inv!(x, o, st, F)
         end
     end
     return x
@@ -748,21 +908,31 @@ end
 # (ntt_len), split limbs into chunk coefficients (fp_ntt_pack), and multiply
 # lanewise between the transforms (fp_ntt_pointwise!).
 
-# smallest selected transform length >= T: m·2^k, m in (1, 3, 5), plus
-# m = 15 at large sizes only.  A 15·2^k transform pays two separate strided
-# odd passes: below ~2^14 points that overhead loses outright to the
-# 2^(k+4) pow2 transform (fwd 480: 609ns vs 512: 382ns), but once the pow2
-# transform spills cache the fifteen independent 2^k-point blocks win big
-# (fwd+inv 1.26x at 15·2^18 vs 2^22, 1.74x at 15·2^20 vs 2^24), so the 15
-# family is admitted from its measured tie point (15·2^10 = 15360).
-function ntt_len(T::Int)
-    best = nextpow(2, max(T, 4))
-    for m in (3, 5)
-        c = m * nextpow(2, max(cld(T, m), 4))
+# Smallest transform length >= T: m·2^k, m in (1, 3, 5) at every size, the
+# expensive multipliers (15 and the 17 family) only from k >= 14.
+# The odd radixes are slower, so combining 2 of them is quite expensive,
+# (and the 17-point butterfly is a lot slower),
+# but once the pow2 transform spills cache the tighter padding wins
+# (fwd+inv 1.26x at 15·2^18 vs 2^22, 1.74x at 15·2^20 vs 2^24, 0.80x at
+# 255·2^15 vs 2^23).  The uniform k >= 14 floor gives up <= ~5% in a few
+# narrow bands against the per-m measured tie points (15·2^10, 17·2^15,
+# 51·2^14, 85·2^13, 255·2^14 — bench/bench_radix17.jl), accepted for the
+# simpler rule: the affected sizes are ones where NBig is already well
+# ahead of GMP.
+# A pure 2^k tops out at 2^33 (~18 GB operands) because N must factor p1, p2
+# The odd multipliers extend the reach up to 255·2^33 (~4 TB operands).
+function ntt_len(T::Int, ctxs::FpCtx...)
+    maxk = minimum(two_adicity(F) for F in ctxs)
+    best = typemax(Int)
+    for m in (1, 3, 5, 15, 17, 51, 85, 255)           # multiples of 3, 5, 17 each used <= once
+        k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
+        k <= maxk || continue                         # 2^k must divide p-1
+        m <= 5 || k >= 14 || continue                 # odd-multiplier floor
+        c = m << k
         c < best && (best = c)
     end
-    c = 15 * nextpow(2, max(cld(T, 15), 4))
-    c >= 15360 && c < best && (best = c)
+    best == typemax(Int) &&
+        throw(ArgumentError("fp NTT length $T exceeds the 255·2^$maxk the primes support"))
     return best
 end
 
@@ -822,12 +992,12 @@ end
 # largest b keeping chunks below both primes (48 here), so one pack serves
 # both residues.
 function fp_ntt_params2(bits_a::Int, bits_b::Int, F1::FpCtx, F2::FpCtx)
-    for b in Base.top_set_bit(min(F1.pi, F2.pi))-1:-1:1
+    for b in Base.top_set_bit(min(fp_prime(F1), fp_prime(F2)))-1:-1:1
         nca = cld(bits_a, b)
         ncb = cld(bits_b, b)
         if UInt128(min(nca, ncb)) <=
-           (UInt128(F1.pi) * F2.pi - 1) ÷ (UInt128(2)^b - 1)^2
-            return b, ntt_len(nca + ncb - 1)
+           (UInt128(fp_prime(F1)) * fp_prime(F2) - 1) ÷ (UInt128(2)^b - 1)^2
+            return b, ntt_len(nca + ncb - 1, F1, F2)
         end
     end
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
@@ -874,7 +1044,7 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     # One buffer, quarters: lo1 | hi1 | lo2 | hi2.
     stage = Vector{UInt64}(undef, 32)
     g = Float64(FP_P1INV2)          # the Garner inverse as an fp_mulmod
-    gp = g / FP_CTX2.p              # twiddle; const-folds to literals
+    gp = g / Float64(fp_prime(FP_CTX2))              # twiddle; const-folds to literals
     vg, vgp = VF8(g), VF8(gp)
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
@@ -888,10 +1058,10 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     i = 0
     @inbounds while i + 8 <= nconv
         v1 = fp_reduce(SIMD.vload(VF8, x1, i + 1), FP_CTX1)
-        v1 = SIMD.vifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+        v1 = SIMD.vifelse(v1 < 0.0, v1 + Float64(fp_prime(FP_CTX1)), v1)
         v2 = fp_reduce(SIMD.vload(VF8, x2, i + 1), FP_CTX2)
         u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
-        u = SIMD.vifelse(u < 0.0, u + FP_CTX2.p, u)
+        u = SIMD.vifelse(u < 0.0, u + Float64(fp_prime(FP_CTX2)), u)
         c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
         uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
         sv = (UInt64(i) * ub + vlane) & UInt64(63)
@@ -921,11 +1091,11 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     end
     @inbounds while i < nconv
         v1 = fp_reduce(x1[i+1], FP_CTX1)
-        v1 = ifelse(v1 < 0.0, v1 + FP_CTX1.p, v1)
+        v1 = ifelse(v1 < 0.0, v1 + Float64(fp_prime(FP_CTX1)), v1)
         v2 = fp_reduce(x2[i+1], FP_CTX2)
         u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
         c1 = unsafe_trunc(UInt64, v1)
-        uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + FP_CTX2.p, u))
+        uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + Float64(fp_prime(FP_CTX2)), u))
         if s >= 64
             r[ro+outw] = a01
             s2[outw] = a02
@@ -950,7 +1120,7 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
         a02 = a12; a12 = UInt64(0)
         outw += 1
     end
-    addmul_1!(r, ro, s2, 0, rn, FP_CTX1.pi)
+    addmul_1!(r, ro, s2, 0, rn, fp_prime(FP_CTX1))
     return r
 end
 

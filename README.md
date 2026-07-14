@@ -95,9 +95,12 @@ Three layers, mirroring GMP's mpn/mpz split:
   the lazy bounds, so the hot loop is pure mul/fma/add traffic, and every
   operation is exactly correct by rounding-error analysis, not
   approximation. Radix-4 DIF/DIT, transform lengths m·2^k for
-  m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; m = 15 joins above
-  ~2^14 points, where its cache-blocked odd passes beat one monolithic
-  pow-2 transform) keeping zero-padding waste ≤ ~25%, in-register shuffle
+  m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; the heavier odd
+  multipliers — m = 15 and the symmetric-pair radix-17 family
+  m ∈ {17, 51, 85, 255} — join from m·2^14 points, where their
+  cache-blocked odd passes and tighter padding beat one monolithic pow-2
+  transform) keeping zero-padding waste
+  ≤ ~25% (≤ ~18% once the 17 family is admitted), in-register shuffle
   butterflies for sub-vector-width stages, and squaring with one forward
   transform instead of two.
 - **`NBig` (`src/nbig.jl`):** sign-magnitude value type
