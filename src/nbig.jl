@@ -246,17 +246,21 @@ function Base.isqrt(x::NBig)
     # multiply — a further even shift), undone below via the root shift.
     pad = isodd(n) ? 1 : 0
     nn = n + pad
-    a = Memory{Limb}(undef, nn)
-    pad == 1 && (@inbounds a[1] = 0)
-    if e == 0
-        copyto!(a, pad + 1, x.limbs, 1, n)
-    else
-        lshift!(a, pad, x.limbs, 0, n, e)
-    end
     h = nn >> 1
+    # separate allocations for the operand copy (destroyed by sqrt!) and the
+    # scratch: one combined slab crosses Julia's ~2KB allocation-pool limit
+    # from 4k bits up (a >2KB Memory costs ~15x a pooled one), exactly where
+    # the total runtime is still sub-microsecond.
+    buf = Memory{Limb}(undef, nn)
+    pad == 1 && (@inbounds buf[1] = 0)
+    if e == 0
+        copyto!(buf, pad + 1, x.limbs, 1, n)
+    else
+        lshift!(buf, pad, x.limbs, 0, n, e)
+    end
+    scratch = Memory{Limb}(undef, sqrt_scratch_len(h))
     s = Memory{Limb}(undef, h)
-    scratch = Memory{Limb}(undef, 5h + 8)
-    sqrt!(s, 0, a, 0, nn, scratch)
+    sqrt!(s, 0, buf, 0, nn, scratch, 0)
     sh = (e >> 1) + 32pad
     sh > 0 && rshift!(s, 0, s, 0, h, sh)
     return nbig_from_limbs(1, s, h)

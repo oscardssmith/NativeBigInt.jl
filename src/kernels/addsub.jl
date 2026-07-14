@@ -103,7 +103,20 @@ end
     return brw
 end
 
-# ripple-add the carry c into r starting at index i
+# r[1..n] = a[1..n] + b, returns the carry out (0 or 1)
+@inline function add_1!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int, b::Limb)
+    c = b
+    i = 1
+    @inbounds while c != 0 && i <= n
+        s, o = Base.add_with_overflow(a[ao+i], c)
+        r[ro+i] = s
+        c = Limb(o)
+        i += 1
+    end
+    r === a && ro == ao || copy_tail!(r, ro, a, ao, i, n)
+    return c
+end
+
 # r[1..n] = a[1..n] - b, returns the borrow out (0 or 1)
 @inline function sub_1!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int, b::Limb)
     brw = b
@@ -118,15 +131,11 @@ end
     return brw
 end
 
-# ripple-add the carry c into r starting at index i
+# ripple-add the carry c into r starting at index i; the carry must not run
+# off the end (add_1! is the variant that returns the carry out instead)
 @inline function add_carry!(r::Memory{Limb}, ro::Int, rlen::Int, i::Int, c::Limb)
-    @inbounds while c != 0
-        @assert i <= rlen "add_carry! carry out of range"
-        s, o = Base.add_with_overflow(r[ro+i], c)
-        r[ro+i] = s
-        c = Limb(o)
-        i += 1
-    end
+    c = add_1!(r, ro + i - 1, r, ro + i - 1, rlen - i + 1, c)
+    @assert c == 0 "add_carry! carry out of range"
     return nothing
 end
 

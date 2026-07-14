@@ -249,11 +249,13 @@ end
 # Degenerate super-row for divrem_bc!: ⟨n1,n0⟩ == ⟨d1,d0⟩ violates the div_3by2
 # precondition but forces qhat = β-1 exactly, and the window bound W < β·d rules
 # out a borrow past the top limb. Refresh the stale top slot, one scalar submul,
-# then return the re-paired window ⟨n1,n0⟩. Rare (cold) path.
+# then return the re-paired window ⟨n1,n0⟩. Rare (cold) path. s low divisor
+# limbs are skipped (0 for the exact basecase; divappr_bc!'s row truncation).
 @inline function divrem_bc_degrow!(u::Memory{Limb}, uo::Int, j::Int,
-                                   d::Memory{Limb}, do_::Int, m::Int, n0::Limb)
+                                   d::Memory{Limb}, do_::Int, m::Int, n0::Limb,
+                                   s::Int)
     @inbounds u[uo+j+m-1] = n0
-    submul_1!(u, uo+j-1, d, do_, m, typemax(Limb))
+    submul_1!(u, uo+j-1+s, d, do_+s, m-s, typemax(Limb))
     return (@inbounds u[uo+j+m-1]), (@inbounds u[uo+j+m-2])
 end
 
@@ -284,7 +286,7 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     j = qn
     @inbounds while j >= 2
         if n1 == d1 && n0 == d0
-            n1, n0 = divrem_bc_degrow!(u, uo, j, d, do_, m, n0)
+            n1, n0 = divrem_bc_degrow!(u, uo, j, d, do_, m, n0, 0)
             q[qo+j] = typemax(Limb)
             j -= 1
             continue
@@ -315,7 +317,7 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     @inbounds if j == 1   # leftover scalar row (3/2 qhat, error ≤ 1)
         if n1 == d1 && n0 == d0
             qhat = typemax(Limb)
-            n1, n0 = divrem_bc_degrow!(u, uo, 1, d, do_, m, n0)
+            n1, n0 = divrem_bc_degrow!(u, uo, 1, d, do_, m, n0, 0)
         else
             qhat, r1, r0 = div_3by2(n1, n0, u[uo+m-1], d1, d0, v)
             cy = m > 2 ? submul_1!(u, uo, d, do_, m-2, qhat) : zero(Limb)
@@ -337,5 +339,90 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     end
     @inbounds u[uo+m] = n1
     @inbounds u[uo+m-1] = n0
+    return qh
+end
+
+# Approximate-quotient schoolbook division: divrem_bc! with every row's submul
+# truncated to the top (row + 2) low divisor limbs — the triangle instead of
+# the square, ~qn²/2 submul work in the balanced case. Same contract except
+# u's contents on return are unspecified (no remainder) and the quotient is a
+# one-sided over-approximation: q_true ≤ q̂ ≤ q_true + 2. Soundness: row j's
+# neglected products are confined to positions ≤ m-4-G (G = 2 guard limbs,
+# constant across rows since the kept length shrinks with j) and total less
+# than qn·β^(m-2-G)/2 ≤ D·β^(-G)/2, while every window read sits at positions
+# ≥ m-2 — so the run is exact schoolbook on a numerator perturbed upward by
+# Δ < D, and each row's divisor is a truncation of d (only ever smaller):
+# the quotient never undershoots and overshoots by at most ⌈Δ/D⌉ + 1 ≤ 2.
+# Add-backs must restore exactly the truncated window that was subtracted.
+function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
+                     d::Memory{Limb}, do_::Int, m::Int, v::Limb)
+    qn = nn - m
+    qh = zero(Limb)
+    if cmp_limbs(u, uo+qn, m, d, do_, m) >= 0
+        qh = one(Limb)
+        sub_n!(u, uo+qn, u, uo+qn, d, do_, m)
+    end
+    d1 = @inbounds d[do_+m]
+    d0 = @inbounds d[do_+m-1]
+    dd = (DLimb(d1) << 64) | d0
+    n1 = @inbounds u[uo+nn]
+    n0 = @inbounds u[uo+nn-1]
+    j = qn
+    @inbounds while j >= 2
+        s = m - 4 - j    # neglected low limbs: keep the top (j+2) of d[1..m-2]
+        s < 0 && (s = 0)
+        if n1 == d1 && n0 == d0
+            n1, n0 = divrem_bc_degrow!(u, uo, j, d, do_, m, n0, s)
+            q[qo+j] = typemax(Limb)
+            j -= 1
+            continue
+        end
+        qhi, t1, t0 = div_3by2(n1, n0, u[uo+j+m-2], d1, d0, v)
+        qlo, r1, r0 = div_3by2(t1, t0, u[uo+j+m-3], d1, d0, v)
+        co1, co0 = m - 2 > s ? submul_2!(u, uo+j-2+s, d, do_+s, m-2-s, qlo, qhi) :
+                               (zero(Limb), zero(Limb))
+        rr = (DLimb(r1) << 64) | r0
+        co = (DLimb(co1) << 64) | co0
+        brw = rr < co
+        rr -= co
+        qq = (DLimb(qhi) << 64) | qlo
+        while brw   # rare: estimate 1 or 2 too large, add the truncated window back
+            qq -= one(DLimb)
+            c = m - 2 > s ? add_n!(u, uo+j-2+s, u, uo+j-2+s, d, do_+s, m-2-s) : zero(Limb)
+            sm, o1 = Base.add_with_overflow(rr, dd)
+            sm, o2 = Base.add_with_overflow(sm, DLimb(c))
+            brw = !(o1 | o2)   # 128-bit overflow cancels the borrow
+            rr = sm
+        end
+        q[qo+j] = (qq >> 64) % Limb
+        q[qo+j-1] = qq % Limb
+        n1 = (rr >> 64) % Limb
+        n0 = rr % Limb
+        j -= 2
+    end
+    @inbounds if j == 1   # leftover scalar row (3/2 qhat, error ≤ 1)
+        s = m - 5 < 0 ? 0 : m - 5
+        if n1 == d1 && n0 == d0
+            qhat = typemax(Limb)
+            n1, n0 = divrem_bc_degrow!(u, uo, 1, d, do_, m, n0, s)
+        else
+            qhat, r1, r0 = div_3by2(n1, n0, u[uo+m-1], d1, d0, v)
+            cy = m - 2 > s ? submul_1!(u, uo+s, d, do_+s, m-2-s, qhat) : zero(Limb)
+            cy1 = Limb(r0 < cy)
+            r0 -= cy
+            cy2 = r1 < cy1
+            r1 -= cy1
+            if cy2   # rare: qhat one too large, add the truncated window back
+                qhat -= one(Limb)
+                c = m - 2 > s ? add_n!(u, uo+s, u, uo+s, d, do_+s, m-2-s) : zero(Limb)
+                sm = ((DLimb(r1) << 64) | r0) + dd + c
+                r1 = (sm >> 64) % Limb   # 128-bit overflow cancels the borrow
+                r0 = sm % Limb
+            end
+            n1 = r1
+            n0 = r0
+        end
+        q[qo+1] = qhat
+    end
     return qh
 end

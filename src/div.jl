@@ -8,10 +8,13 @@
 # For m ≥ 3, a[n] must be nonzero unless n == m (the small-quotient fast
 # path bounds the quotient by a[n]'s bit position).
 # Writes n-m+1 quotient limbs (top may be zero) and m remainder limbs
-# (unnormalized). One scratch Memory holds the shifted numerator copy (n+1
-# limbs) and, for unnormalized d, the shifted divisor; a is not modified.
+# (unnormalized); a is not modified. scratch holds the shifted numerator
+# copy, the shifted divisor for unnormalized d, and the dc block scratch —
+# n + 1 + 2m limbs at sco (callers running division in a loop or recursion
+# pass their own; the no-scratch method allocates).
 function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
-                 a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int)
+                 a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int,
+                 scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0)
     if m == 1
         @inbounds r[ro+1] = divrem_1!(q, qo, a, ao, n, d[do_+1])
         return nothing
@@ -41,27 +44,31 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     end
     l = leading_zeros(@inbounds d[do_+m])
     nn = n + 1
-    scratch = Memory{Limb}(undef, nn + (l > 0 ? m : 0))
+    if scratch === nothing
+        scratch = Memory{Limb}(undef, nn + 2m)
+        sco = 0
+    end
     if l == 0
-        copyto!(scratch, 1, a, ao + 1, n)
-        @inbounds scratch[nn] = zero(Limb)
+        copyto!(scratch, sco + 1, a, ao + 1, n)
+        @inbounds scratch[sco+nn] = zero(Limb)
         dv, dvo = d, do_
     else
-        @inbounds scratch[nn] = lshift!(scratch, 0, a, ao, n, l)
-        lshift!(scratch, nn, d, do_, m, l)
-        dv, dvo = scratch, nn
+        @inbounds scratch[sco+nn] = lshift!(scratch, sco, a, ao, n, l)
+        lshift!(scratch, sco + nn, d, do_, m, l)
+        dv, dvo = scratch, sco + nn
     end
     v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
     # qh == 0 either way: Q < β^(nn-m)
     if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
-        divrem_dc!(q, qo, scratch, 0, nn, dv, dvo, m, v)
+        divrem_dc!(q, qo, scratch, sco, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
+                   scratch, sco + nn + m)
     else
-        divrem_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)
+        divrem_bc!(q, qo, scratch, sco, nn, dv, dvo, m, v)
     end
     if l == 0
-        copyto!(r, ro + 1, scratch, 1, m)
+        copyto!(r, ro + 1, scratch, sco + 1, m)
     else
-        rshift!(r, ro, scratch, 0, m, l)
+        rshift!(r, ro, scratch, sco, m, l)
     end
     return nothing
 end
@@ -157,16 +164,123 @@ end
 # with the previous remainder (< d), so only the leading block can set qh.
 function divrem_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
                     d::Memory{Limb}, do_::Int, m::Int, v::Limb,
-                    thr::Int=DC_DIV_THRESHOLD)
+                    thr::Int=DC_DIV_THRESHOLD,
+                    scratch::Memory{Limb}=Memory{Limb}(undef, m), so::Int=0)
     qn = nn - m
     thr = max(thr, 4)
-    scratch = Memory{Limb}(undef, m)
     s = qn <= m ? qn : qn - m * ((qn - 1) ÷ m)
     off = qn - s
-    qh = divrem_dc_partial!(q, qo + off, u, uo + off, d, do_, m, s, v, scratch, 0, thr)
+    qh = divrem_dc_partial!(q, qo + off, u, uo + off, d, do_, m, s, v, scratch, so, thr)
     while off > 0
         off -= m
-        divrem_dc_n!(q, qo + off, u, uo + off, d, do_, m, v, scratch, 0, thr)
+        divrem_dc_n!(q, qo + off, u, uo + off, d, do_, m, v, scratch, so, thr)
     end
     return qh
+end
+
+# One-sided bound on divappr!'s quotient over-approximation, in ulps:
+# entry/per-level divisor truncation contributes ≤ 1 each (numerator ≤ β^qn·d
+# against a kept top ≥ β^(t-1), t = qn+2), the triangle basecase ≤ 2, and the
+# dc recursion halves the block per level — ≤ ~20 for any feasible size.
+# The differential test asserts the measured error never exceeds this.
+const DIVAPPR_ERR = Limb(32)
+
+# Approximate leading quotient block, no remainder: writes s quotient limbs q̂
+# for the top m+s live limbs of u by the m-limb normalized d, with
+# q_true ≤ q̂ ≤ q_true + E (E per DIVAPPR_ERR); u above uo is destroyed and
+# holds nothing meaningful. Returns the extra top quotient bit/carry (the
+# over-approximation of a maximal true quotient can carry out; callers fold
+# it). Structure: truncate the divisor to its top s+2 limbs (only they can
+# move the quotient by > 1 ulp — Lemma 1 in the divappr spec), peel the top
+# ⌈s/2⌉ quotient limbs exactly with divrem_dc_partial! (their remainder feeds
+# the rest; approximating them would scale the error by β^s2), and recurse on
+# the bottom half — the recursion is where the remainder work is saved.
+function divappr_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
+                             d::Memory{Limb}, do_::Int, m::Int, s::Int, v::Limb,
+                             scratch::Memory{Limb}, so::Int, thr::Int)
+    if m > s + 2
+        drop = m - (s + 2)
+        return divappr_dc_partial!(q, qo, u, uo + drop, d, do_ + drop, s + 2, s,
+                                   v, scratch, so, thr)
+    end
+    s < thr && return divappr_bc!(q, qo, u, uo, m + s, d, do_, m, v)
+    s2 = s >> 1
+    qh = divrem_dc_partial!(q, qo + s2, u, uo + s2, d, do_, m, s - s2, v,
+                            scratch, so, thr)
+    c = divappr_dc_partial!(q, qo, u, uo, d, do_, m, s2, v, scratch, so, thr)
+    if c != zero(Limb)   # rare: the lo block's over-approximation carried out
+        qh += add_1!(q, qo + s2, q, qo + s2, s - s2, c)
+    end
+    return qh
+end
+
+# Approximate quotient with divrem_dc!'s peeling and contract, minus the
+# remainder: all quotient blocks above the bottom-most are computed exactly
+# (their remainders feed lower blocks), only the bottom block runs the
+# approximate recursion. u is destroyed, holds no remainder.
+function divappr_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
+                     d::Memory{Limb}, do_::Int, m::Int, v::Limb,
+                     thr::Int=DC_DIV_THRESHOLD,
+                     scratch::Memory{Limb}=Memory{Limb}(undef, m), so::Int=0)
+    qn = nn - m
+    thr = max(thr, 4)
+    qn <= m && return divappr_dc_partial!(q, qo, u, uo, d, do_, m, qn, v, scratch, so, thr)
+    s = qn - m * ((qn - 1) ÷ m)
+    off = qn - s
+    qh = divrem_dc_partial!(q, qo + off, u, uo + off, d, do_, m, s, v, scratch, so, thr)
+    while off > m
+        off -= m
+        divrem_dc_n!(q, qo + off, u, uo + off, d, do_, m, v, scratch, so, thr)
+    end
+    c = divappr_dc_partial!(q, qo, u, uo, d, do_, m, m, v, scratch, so, thr)
+    if c != zero(Limb)
+        qh += add_1!(q, qo + m, q, qo + m, qn - m, c)
+    end
+    return qh
+end
+
+# Approximate quotient, divrem!'s operand contract without the remainder:
+# a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1, writes n-m+1 quotient limbs
+# q̂ with floor(a/d) ≤ q̂ ≤ floor(a/d) + DIVAPPR_ERR; a is not modified. The
+# appended-zero normalization limb keeps even the over-approximated quotient
+# inside n-m+1 limbs (q < 2β^(qn-1) ≪ β^qn), so there is no carry to return.
+# scratch needs n + 1 + 3m limbs at sco (allocated when not passed).
+function divappr!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int,
+                  d::Memory{Limb}, do_::Int, m::Int,
+                  scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0)
+    qn = n - m + 1
+    if m > qn + 2
+        # only the top qn+2 divisor limbs can move the quotient by > 1 ulp;
+        # drop the rest along with the matching low numerator limbs
+        drop = m - (qn + 2)
+        return divappr!(q, qo, a, ao + drop, n - drop, d, do_ + drop, m - drop,
+                        scratch, sco)
+    end
+    if scratch === nothing
+        scratch = Memory{Limb}(undef, n + 1 + 3m)
+        sco = 0
+    end
+    if m <= 2 || magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m) <= 2
+        # exact fast paths; remainder discarded into scratch
+        return divrem!(q, qo, scratch, sco, a, ao, n, d, do_, m, scratch, sco + m)
+    end
+    l = leading_zeros(@inbounds d[do_+m])
+    nn = n + 1
+    if l == 0
+        copyto!(scratch, sco + 1, a, ao + 1, n)
+        @inbounds scratch[sco+nn] = zero(Limb)
+        dv, dvo = d, do_
+    else
+        @inbounds scratch[sco+nn] = lshift!(scratch, sco, a, ao, n, l)
+        lshift!(scratch, sco + nn, d, do_, m, l)
+        dv, dvo = scratch, sco + nn
+    end
+    v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
+    if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
+        divappr_dc!(q, qo, scratch, sco, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
+                    scratch, sco + nn + m)
+    else
+        divappr_bc!(q, qo, scratch, sco, nn, dv, dvo, m, v)
+    end
+    return nothing
 end

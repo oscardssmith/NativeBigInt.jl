@@ -6,8 +6,8 @@ through ~4k bits, with multiplication pulling well ahead again above ~14k
 bits thanks to a floating-point NTT; within ~25% of GMP for `gcd`/`gcdx`
 across the range (subquadratic HGCD above ~19k bits, ahead from ~16k end to
 end); and ahead for `powermod` from ~16k bits (NTT-backed Barrett
-reduction). `isqrt` still trails GMP at large sizes — see the benchmark
-table below.
+reduction); and within ~15% of GMP for `isqrt` across the range (ahead below
+~512 bits and above ~32k) — see the benchmark table below.
 Requires a recent Julia (uses `Memory{UInt64}`).
 
 ## Algorithms
@@ -28,15 +28,36 @@ Three layers, mirroring GMP's mpn/mpz split:
   limbs, benchmark-tuned) with a general unbalanced-operand path; `mul!`/
   `sqr!` hand off to the fp NTT at ~224 balanced limbs. This NTT implementation
   benchmarks better than Toom-3 for all sizes (and thus presumably better than
-  the higher degree Toom algorithms as well).
+  the higher degree Toom algorithms as well). `mullo!`/`sqrlo!` are exact low
+  short products (result mod β^k): truncated paired-row basecases at
+  0.55–0.75× the full product deep into the Karatsuba range, a Mulders split
+  (~0.69k full low block + two recursive cross products) above
+  `MULLO_BASECASE_THRESHOLD`/`SQRLO_BASECASE_THRESHOLD`, and plain `mul!` +
+  discard once the balanced product reaches the NTT
+  (`bench/bench_mullo_thr.jl`).
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over
   `divrem_bc!` below ~100 limbs, GMP-`dcpi1`-style divide-and-conquer division
   (recursive 2n/n blocks over `mul!`, so it inherits Karatsuba and the NTT;
   0.82–0.96× GMP's `mpn_tdiv_qr` from the crossover through at least 2048
-  limbs) above.
+  limbs) above. `divappr!` is the quotient-only variant: a one-sided
+  approximate quotient (never below the true one, within `DIVAPPR_ERR = 32`
+  ulps) that skips all remainder work — a triangle-truncated schoolbook
+  basecase (`divappr_bc!`, per-row divisor truncation) and a dc recursion
+  that peels the top quotient half exactly and recurses approximately on the
+  bottom with a truncated divisor.
 - **Algorithms (`src/algorithms.jl`):** Karatsuba sqrt (Zimmermann), with a
-  root-only top level for `isqrt` that skips the final remainder square/
-  subtract whenever the root is provably exact from cheap bounds; `powermod` by
+  root-only top level for `isqrt`: above 16 top-level quotient limbs (~4k
+  bits) the division runs as `divappr!` with one guard limb and a mantissa
+  interval certificate settles whether the candidate root is exact or one
+  too big — no remainder, no final square — reconstructing the remainder
+  with one mul only in the ambiguous band (~2⁻⁵⁷ of inputs, plus perfect
+  squares); below that the exact division's remainder feeds cheap positivity
+  bounds that skip the final remainder square/subtract. Every level divides
+  its halved numerator by the top of the root buffer directly
+  (⌊N/2S′⌋ = ⌊(N>>1)/S′⌋ with U = 2U₁+ε): S′ is already normalized, so
+  there is no divisor construction and no per-level renormalization shift,
+  and the division engines run on the disposable numerator in place (no
+  defensive copy; the remainder lands where the numerator was); `powermod` by
   sliding-window exponentiation, reducing each product with Montgomery
   `redc!` (`src/montgomery.jl`, odd moduli) or `divrem!` (even) at small
   sizes, and above per-parity thresholds (~68 limbs odd, ~240 even —
@@ -95,15 +116,15 @@ factor; `powermod` uses an n-bit modulus and a 512-bit-capped exponent.
 
 | op | 128 | 256 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|---|
-| `+` | 0.53 | 0.48 | 0.93 | 0.64 | 0.73 | 0.74 | 1.11 | 1.57 | 1.26 |
-| `-` | 0.54 | 0.49 | 0.91 | 0.64 | 0.85 | 1.05 | 1.15 | 1.80 | 1.51 |
-| `*` | 0.49 | 0.60 | 0.89 | 0.88 | 1.00 | 1.21 | 1.12 | 0.83 | 0.64 |
-| `divrem` | 0.41 | 0.38 | 0.67 | 0.85 | 1.05 | 0.81 | 0.94 | 1.05 | 1.11 |
-| `gcd` | 1.04 | 1.11 | 1.09 | 1.09 | 1.16 | 1.11 | 1.05 | 1.00 | 0.81 |
-| `gcdx` | 1.07 | 1.03 | 1.25 | 1.16 | 1.25 | 1.22 | 1.12 | 0.96 | 0.79 |
-| `isqrt` | 0.77 | 1.01 | 1.41 | 1.34 | 1.31 | 1.36 | 1.44 | 1.61 | 1.26 |
-| `powermod` (odd) | 2.02 | 1.09 | 1.94 | 1.59 | 1.36 | 1.33 | 1.48 | 1.07 | 0.77 |
-| `powermod` (even) | 2.02 | 2.30 | 1.98 | 1.78 | 1.12 | 1.05 | 1.35 | 1.06 | 0.76 |
+| `+` | 0.51 | 0.55 | 0.92 | 0.60 | 0.88 | 0.75 | 1.02 | 1.48 | 1.21 |
+| `-` | 0.53 | 0.50 | 0.89 | 0.60 | 0.83 | 0.88 | 1.17 | 1.82 | 1.55 |
+| `*` | 0.50 | 0.61 | 0.87 | 0.87 | 1.12 | 1.19 | 1.12 | 0.84 | 0.65 |
+| `divrem` | 0.41 | 0.37 | 0.66 | 0.86 | 1.05 | 0.82 | 0.88 | 1.04 | 1.10 |
+| `gcd` | 1.04 | 1.11 | 1.09 | 1.08 | 1.16 | 1.09 | 1.06 | 0.99 | 0.81 |
+| `gcdx` | 1.01 | 0.99 | 1.25 | 1.25 | 1.25 | 1.22 | 1.12 | 0.97 | 0.79 |
+| `isqrt` | 0.81 | 0.96 | 1.14 | 1.09 | 1.12 | 1.14 | 1.07 | 1.05 | 0.94 |
+| `powermod` (odd) | 2.00 | 1.14 | 1.95 | 1.67 | 1.36 | 1.33 | 1.48 | 1.07 | 0.76 |
+| `powermod` (even) | 2.05 | 2.31 | 1.98 | 1.82 | 1.15 | 1.11 | 1.36 | 1.06 | 0.77 |
 
 The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
 ~4k bits and `*` pulls ahead again from ~16k as the fp NTT takes over
@@ -111,9 +132,16 @@ The broad shape: the core ring ops (`+`/`-`/`*`/`divrem`) beat GMP through
 in-place reallocation wins). `gcd`/`gcdx` sit within ~25% throughout and
 lead from ~16k. `powermod` pays GMP's assembly-Montgomery tax at small
 sizes, reaches parity around 16k bits, and leads by ~25% at 32k where
-Barrett reduction rides the NTT. `isqrt` (~1.3–1.6× at large sizes) is the
-known laggard. Decimal `string`/`parse` are supported and benchmarked in
-`bench_highlevel.jl` but slower than GMP's.
+Barrett reduction rides the NTT. `isqrt` sits within ~15% of GMP across the
+range (per-input variance ±15%): the root-only divappr top level plus the
+normalized-divisor level step (divide by S′, engines run in place) and
+pool-sized allocations closed the former ~40% mid-range gap. An
+approximate-Newton chain over short products (every level sqrlo+divappr) was
+built and measured against this baseline and lost everywhere — the root-only
+top already banks the big term, and reconstructing the child remainder costs
+a half-size square the exact recursion gets as a byproduct — so it was
+deleted (git history has it). Decimal `string`/`parse` are supported and
+benchmarked in `bench_highlevel.jl` but slower than GMP's.
 
 Above that, Karatsuba carries ~2k–14k bits at rough GMP parity (0.95–1.09×
 against `__gmpn_mul`), and the two-prime fp NTT takes over at ~14k bits

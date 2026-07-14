@@ -27,6 +27,11 @@ end
     for trial in 1:300
         n = rand(rng, 1:12)
         trial % 20 == 0 && (n = rand(rng, 30:100))
+        # mid band: divappr top level at recursion depths 2-4
+        trial % 15 == 0 && (n = rand(rng, 80:340))
+        # deep divappr certificate path (dc-sized top-level division);
+        # a² lands on the always-fallback boundary
+        trial % 50 == 0 && (n = rand(rng, 400:560))
         a = abs(diff_randbig(rng, n))
         for x in (a, a^2, a^2 - 1, a^2 + 1)
             s = isqrt(NBig(x))

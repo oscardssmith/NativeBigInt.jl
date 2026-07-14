@@ -127,6 +127,94 @@ using NativeBigInt: MUL_FPNTT_THRESHOLD, SQR_FPNTT_THRESHOLD, sqr!
     end
 end
 
+using NativeBigInt: mullo!, sqrlo!, mullo_scratch_len, sqrlo_scratch_len,
+    MULLO_BASECASE_THRESHOLD, SQRLO_BASECASE_THRESHOLD, MULLO_FULL_THRESHOLD,
+    SQRLO_FULL_THRESHOLD
+
+@testset "mullo!/sqrlo! low short products" begin
+    rng = MersenneTwister(0x10c4)
+    β = big(1) << 64
+
+    # exact low-k limbs; r gets k+2 limbs of capacity (top two are clobber
+    # slack per the contract), sentinel-filled so stale content is caught
+    function checkmullo(la, lb, k, a, b; scratch::Bool=false)
+        r = amem(fill(0xdeadbeefdeadbeef, k + 2))
+        if scratch
+            so = 3   # nonzero offset
+            s = Memory{UInt64}(undef, so + mullo_scratch_len(k))
+            mullo!(r, 0, a, 0, la, b, 0, lb, k, s, so)
+        else
+            mullo!(r, 0, a, 0, la, b, 0, lb, k)
+        end
+        @test atoref(r, 0, k) == (atoref(a, 0, la) * atoref(b, 0, lb)) % β^k
+    end
+    function checksqrlo(la, k, a; scratch::Bool=false)
+        r = amem(fill(0xdeadbeefdeadbeef, k + 2))
+        if scratch
+            so = 3
+            s = Memory{UInt64}(undef, so + sqrlo_scratch_len(k))
+            sqrlo!(r, 0, a, 0, la, k, s, so)
+        else
+            sqrlo!(r, 0, a, 0, la, k)
+        end
+        @test atoref(r, 0, k) == atoref(a, 0, la)^2 % β^k
+    end
+
+    Tb = MULLO_BASECASE_THRESHOLD
+    Ts = SQRLO_BASECASE_THRESHOLD
+    Tf = MULLO_FULL_THRESHOLD
+    Tfs = SQRLO_FULL_THRESHOLD
+
+    # k spanning tiny sizes, the basecase → Mulders crossover, the Mulders
+    # band, and the full-product fallback; shapes: balanced, unbalanced,
+    # operands longer than k (clamping), product shorter than k (zero fill),
+    # k within two limbs of the full product (r-slack fallback)
+    for k in (1, 2, 3, 5, 8, Tb - 1, Tb, Tb + 1, 2Tb + 3, Tf - 1, Tf, Tf + 17)
+        shapes = [(k, k), (k, max(1, k ÷ 2)), (k, max(1, 2k ÷ 3)),
+                  (max(1, k - 1), max(1, k - 1)),
+                  (k, 1), (k, 2), (max(1, k ÷ 3), max(1, k ÷ 3)),
+                  (k + 4, k + 4), (2k, max(1, k ÷ 2))]
+        for (la, lb) in shapes, trial in 1:2
+            a = amem(rand(rng, UInt64, la)); b = amem(rand(rng, UInt64, lb))
+            checkmullo(la, lb, k, a, b)
+            checkmullo(lb, la, k, b, a)           # argument-order symmetry
+        end
+    end
+    # all-ones adversarial: maximum carry chains across the truncation cut
+    for k in (Tb - 1, Tb + 1, 2Tb + 3), (la, lb) in ((k, k), (k, k ÷ 2 + 1))
+        a = amem(fill(typemax(UInt64), la)); b = amem(fill(typemax(UInt64), lb))
+        checkmullo(la, lb, k, a, b)
+    end
+    # caller-provided scratch at an offset matches the allocating form
+    for k in (Tb + 5, 2Tb + 3, Tf + 17), (la, lb) in ((k, k), (k, k ÷ 2 + 1))
+        a = amem(rand(rng, UInt64, la)); b = amem(rand(rng, UInt64, lb))
+        checkmullo(la, lb, k, a, b; scratch=true)
+    end
+
+    # sqrlo: same sweep; la relative to k exercises the truncated triangle
+    # (k ≤ 2la - 3), the r-slack full square (2la ≤ k + 2), and zero fill
+    for k in (1, 2, 3, 5, 8, Ts - 1, Ts, Ts + 1, 2Ts + 3, Tfs - 1, Tfs, Tfs + 17)
+        for la in unique((k, max(1, k - 1), max(1, 2k ÷ 3), max(1, (k + 2) ÷ 2),
+                          max(1, k ÷ 2), max(1, k ÷ 3), k + 4)), trial in 1:2
+            checksqrlo(la, k, amem(rand(rng, UInt64, la)))
+        end
+    end
+    for k in (Ts - 1, Ts + 1, 2Ts + 3), la in (k, 2k ÷ 3 + 2)
+        checksqrlo(la, k, amem(fill(typemax(UInt64), la)))
+    end
+    for k in (Ts + 5, 2Ts + 3, Tfs + 17), la in (k, 2k ÷ 3 + 2)
+        checksqrlo(la, k, amem(rand(rng, UInt64, la)); scratch=true)
+    end
+
+    # random shape fuzz across the whole dispatch surface
+    for trial in 1:200
+        k = rand(rng, 1:3Tb)
+        la = rand(rng, 1:k + 8); lb = rand(rng, 1:k + 8)
+        checkmullo(la, lb, k, amem(rand(rng, UInt64, la)), amem(rand(rng, UInt64, lb)))
+        checksqrlo(la, k, amem(rand(rng, UInt64, la)))
+    end
+end
+
 @testset "divrem! multi-limb" begin
     rng = MersenneTwister(23)
 
@@ -463,4 +551,67 @@ using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
         @test gv == gcd(a0, b0)
         @test mod(gv - tv * b0, a0) == 0
     end
+end
+
+@testset "divappr! approximate quotient" begin
+    using NativeBigInt: divappr!, DIVAPPR_ERR
+    rng = MersenneTwister(0xd1ab)
+    hib = UInt64(1) << 63
+    β = big(1) << 64
+
+    # q̂ - floor(a/d): the contract is one-sided over-approximation by at most
+    # DIVAPPR_ERR ulps, with a unmodified and no remainder computed.
+    function apprerr(aref::BigInt, n, dref::BigInt, m)
+        a = afrombig(aref, n)
+        acopy = copy(a)
+        d = afrombig(dref, m)
+        q = Memory{UInt64}(undef, n - m + 1)
+        divappr!(q, 0, a, 0, n, d, 0, m)
+        @test a == acopy
+        return atoref(q, 0, n - m + 1) - aref ÷ dref
+    end
+
+    maxerr = big(0)
+    function checkshape(n, m, dref, aref)
+        err = apprerr(aref, n, dref, m)
+        @test 0 <= err <= DIVAPPR_ERR
+        maxerr = max(maxerr, err)
+    end
+
+    # small random sweep: m = 1, 2, small-quotient path, unnormalized divisors
+    for trial in 1:150
+        n = rand(rng, 1:30); m = rand(rng, 1:n)
+        dref = rand(rng, big(1):β^m - 1)
+        dref >= β^(m - 1) || (dref += β^(m - 1))
+        checkshape(n, m, dref, rand(rng, big(0):β^n - 1))
+    end
+
+    # dc shapes: threshold-straddling, balanced 2m/m, sqrt shape (qn ≈ m + 2),
+    # short quotient over long divisor (entry truncation), deep recursion
+    shapes = [(199, 100), (200, 101), (240, 120), (300, 150), (700, 350),
+              (260, 129), (262, 130),               # sqrt shape qn = m + 2
+              (349, 300), (420, 400), (150, 130),   # qn ≪ m entry truncation
+              (511, 128), (1000, 128)]              # multi-block peeling
+    for (n, m) in shapes, trial in 1:6
+        dref = rand(rng, big(0):β^m - 1) | (big(1) << (64m - 64))
+        rand(rng) < 0.5 && (dref |= big(hib) << (64 * (m - 1)))
+        aref = rand(rng, big(0):β^n - 1)
+        checkshape(n, m, dref, aref)
+        # adversarial low divisor mass + boundary numerators
+        dadv = (big(hib) << (64 * (m - 1))) | (β^(m - 1) - 1)
+        k = rand(rng, big(0):β^(n - m) - 1)
+        for w in (big(0), big(1), dadv - 1)
+            k * dadv + w < β^n && checkshape(n, m, dadv, k * dadv + w)
+        end
+    end
+
+    # exact multiples and all-ones stress at dc size
+    for trial in 1:10
+        m = 128; n = 256
+        dref = rand(rng, big(0):β^m - 1) | (big(hib) << (64 * (m - 1)))
+        qref = rand(rng, big(0):β^(n - m) - 1)
+        qref * dref < β^n && checkshape(n, m, dref, qref * dref)
+        checkshape(n, m, dref, β^n - 1)
+    end
+    @test maxerr <= DIVAPPR_ERR
 end

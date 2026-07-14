@@ -564,7 +564,7 @@ end
         aref = toref(a, 0, n)
         h = k
         s = Memory{UInt64}(undef, h)
-        scratch = Memory{UInt64}(undef, 5h + 8)
+        scratch = Memory{UInt64}(undef, NativeBigInt.sqrt_scratch_len(h))
         rhi = sqrtrem!(s, 0, a, 0, n, scratch)
         sref = toref(s, 0, h)
         rref = (big(rhi) << (64h)) | toref(a, 0, h)
@@ -583,7 +583,7 @@ end
         end
         h = n >> 1
         s = Memory{UInt64}(undef, h)
-        scratch = Memory{UInt64}(undef, 5h + 8)
+        scratch = Memory{UInt64}(undef, NativeBigInt.sqrt_scratch_len(h))
         sqrt!(s, 0, a, 0, n, scratch)
         @test toref(s, 0, h) == isqrt(aref)
     end
@@ -596,6 +596,92 @@ end
         # t² + small keep R tiny so the cheap positivity checks can't fire
         t = rand(rng, big(2)^(32n - 1):big(2)^(32n) - 1)
         for d in (big(-1), big(0), big(1), 2t - 1, 2t)
+            v = t^2 + d
+            big(2)^(64n - 2) <= v < big(2)^(64n) && checksqrt(v, n)
+        end
+    end
+end
+
+@testset "divappr_bc! approximate quotient" begin
+    using NativeBigInt: divappr_bc!
+    rng = MersenneTwister(0xd1a)
+    hib = UInt64(1) << 63
+    β = big(1) << 64
+
+    # Returns q̂ - floor(u/d); the contract is one-sided over-approximation
+    # by at most 2 ulps (spec §2.2/§2.4), with u destroyed and no remainder.
+    function apprerr(uref::BigInt, nn, dref::BigInt, m)
+        u = Memory{UInt64}(undef, nn)
+        for i in 1:nn
+            u[i] = UInt64((uref >> (64 * (i - 1))) & typemax(UInt64))
+        end
+        d = Memory{UInt64}(undef, m)
+        for i in 1:m
+            d[i] = UInt64((dref >> (64 * (i - 1))) & typemax(UInt64))
+        end
+        q = Memory{UInt64}(undef, nn - m)
+        v = invert_pi1(d[m], d[m-1])
+        qh = divappr_bc!(q, 0, u, 0, nn, d, 0, m, v)
+        got_q = (big(qh) << (64 * (nn - m))) | toref(q, 0, nn - m)
+        return got_q - uref ÷ dref
+    end
+
+    maxerr = big(0)
+    for m in (2, 3, 4, 5, 8, 13, 40, 97), qn in (1, 2, 3, m - 1, m, m + 2)
+        qn < 1 && continue
+        nn = m + qn
+        for trial in 1:15
+            dref = rand(rng, big(0):β^m - 1) | (big(hib) << (64 * (m - 1)))
+            uref = rand(rng, big(0):β^nn - 1)
+            err = apprerr(uref, nn, dref, m)
+            @test 0 <= err <= 2
+            maxerr = max(maxerr, err)
+        end
+        # adversarial: minimal top limb with all-ones low limbs maximizes the
+        # mass a truncating implementation neglects; boundary numerators sit
+        # where a 1-ulp overestimate flips the floor
+        dref = (big(hib) << (64 * (m - 1))) | (β^(m - 1) - 1)
+        for trial in 1:15
+            k = rand(rng, big(0):β^(qn - 1) - 1) << 64 | rand(rng, UInt64)
+            k = min(k, β^qn - 1)
+            for w in (big(0), big(1), dref - 1, dref ÷ 2)
+                uref = k * dref + w
+                uref < β^nn || continue
+                err = apprerr(uref, nn, dref, m)
+                @test 0 <= err <= 2
+                maxerr = max(maxerr, err)
+            end
+        end
+    end
+    @test maxerr <= 2
+end
+
+@testset "sqrt! divappr certificate path" begin
+    using NativeBigInt: sqrt!, SQRT_DIVAPPR_THRESHOLD
+    rng = MersenneTwister(0x5dca)
+    function checksqrt(aref::BigInt, n::Int)
+        a = Memory{UInt64}(undef, n)
+        for i in 1:n
+            a[i] = UInt64(aref >> (64 * (i - 1)) & typemax(UInt64))
+        end
+        h = n >> 1
+        s = Memory{UInt64}(undef, h)
+        scratch = Memory{UInt64}(undef, NativeBigInt.sqrt_scratch_len(h))
+        sqrt!(s, 0, a, 0, n, scratch)
+        @test toref(s, 0, h) == isqrt(aref)
+    end
+    # sizes with l = h>>1 straddling and well above the divappr gate
+    thr = SQRT_DIVAPPR_THRESHOLD
+    for h in (2thr - 2, 2thr - 1, 2thr, 2thr + 1, 2thr + 5, 3thr, 512)
+        n = 2h
+        for trial in 1:4
+            checksqrt(rand(rng, big(2)^(64n - 2):big(2)^(64n) - 1), n)
+        end
+        # adversarial: perfect squares sit on the certificate boundary
+        # (always-fallback), t²±1 exercise correction and tiny remainders,
+        # t²-t forces the confident-decrement branch, 2t-ish maxes R
+        t = rand(rng, big(2)^(32n - 1):big(2)^(32n) - 1)
+        for d in (-t, big(-1), big(0), big(1), t, 2t - 1, 2t)
             v = t^2 + d
             big(2)^(64n - 2) <= v < big(2)^(64n) && checksqrt(v, n)
         end
