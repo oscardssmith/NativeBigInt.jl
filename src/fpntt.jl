@@ -92,9 +92,12 @@ end
     return fma(q, -P, x)
 end
 
-# r ≡ x·y (mod p) for two data operands (no precomputed quotient), inputs
-# |x|,|y| <= 2p: reduce the rounded high part, add back the exact FMA error
-# (an integer <= ulp(h)/2, so the final add is exact too)
+# r ≡ x·y (mod p) for two data operands (no precomputed quotient).
+# Requires |x·y| <= 2^51·p so fp_reduce's fp_round stays exact; the engine
+# feeds |x·y| <= 4p² (< 2^51·p for p < 2^49), so this is never tight.
+# Reduce the rounded high part h, then add back the exact FMA error l = x·y - h:
+# when |x·y| >= 2^53 both h and l are integers and r = x·y - q·p is an exact
+# integer < 2^49; otherwise h = x·y exactly and l = 0. Either way the add is exact.
 @inline function fp_mulmod2(x, y, F::FpCtx)
     h = x * y
     l = fma(x, y, -h)
@@ -150,7 +153,7 @@ struct FpOddStage
     span::Int
     Q::Int
     rot::Vector{Float64};  rotp::Vector{Float64}
-    tw::Vector{Vector{Float64}};  twp::Vector{Vector{Float64}}
+    tw::Vector{Vector{Float64}}
 end
 
 # Winograd 5-point constants from a primitive 5th root c.
@@ -202,7 +205,7 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
         ωr = powermod(root, r, fp_prime(F))
         tw[r] = fp_twiddles(ωr, Q, F)
     end
-    return FpOddStage(m, span, Q, rot, rot ./ fp_prime(F), tw, [t ./ fp_prime(F) for t in tw])
+    return FpOddStage(m, span, Q, rot, rot ./ fp_prime(F), tw)
 end
 
 struct FpNttPlan{C<:FpCtx}
@@ -295,7 +298,7 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
                     ::Val{FWD}) where {FWD}
     Q = st.Q
     ω3, ω3p = st.rot[1], st.rotp[1]
-    w1, w1p, w2, w2p = st.tw[1], st.twp[1], st.tw[2], st.twp[2]
+    w1, w2 = st.tw[1], st.tw[2]
     j = 0
     @inbounds while j + 8 <= Q
         i0 = o + j + 1
@@ -306,10 +309,8 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
         end
         y0 = fp_reduce(y0, F)
-        y1 = fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
-                       SIMD.vload(VF8, w1p, j + 1), F)
-        y2 = fp_mulmod(y2, SIMD.vload(VF8, w2, j + 1),
-                       SIMD.vload(VF8, w2p, j + 1), F)
+        y1 = fp_mulmod2(y1, SIMD.vload(VF8, w1, j + 1), F)
+        y2 = fp_mulmod2(y2, SIMD.vload(VF8, w2, j + 1), F)
         if !FWD
             y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
         end
@@ -327,8 +328,8 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
         end
         y0 = fp_reduce(y0, F)
-        y1 = fp_mulmod(y1, w1[j+1], w1p[j+1], F)
-        y2 = fp_mulmod(y2, w2[j+1], w2p[j+1], F)
+        y1 = fp_mulmod2(y1, w1[j+1], F)
+        y2 = fp_mulmod2(y2, w2[j+1], F)
         if !FWD
             y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
         end
@@ -374,7 +375,6 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
     k1, k2, k3, k4 = st.rot[1], st.rot[2], st.rot[3], st.rot[4]
     k1p, k2p, k3p, k4p = st.rotp[1], st.rotp[2], st.rotp[3], st.rotp[4]
     w = st.tw
-    wp = st.twp
     j = 0
     @inbounds while j + 8 <= Q
         i0 = o + j + 1
@@ -388,14 +388,10 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
                                          k1p, k2p, k3p, k4p, F)
         end
         y0 = fp_reduce(y0, F)
-        y1 = fp_mulmod(y1, SIMD.vload(VF8, w[1], j + 1),
-                       SIMD.vload(VF8, wp[1], j + 1), F)
-        y2 = fp_mulmod(y2, SIMD.vload(VF8, w[2], j + 1),
-                       SIMD.vload(VF8, wp[2], j + 1), F)
-        y3 = fp_mulmod(y3, SIMD.vload(VF8, w[3], j + 1),
-                       SIMD.vload(VF8, wp[3], j + 1), F)
-        y4 = fp_mulmod(y4, SIMD.vload(VF8, w[4], j + 1),
-                       SIMD.vload(VF8, wp[4], j + 1), F)
+        y1 = fp_mulmod2(y1, SIMD.vload(VF8, w[1], j + 1), F)
+        y2 = fp_mulmod2(y2, SIMD.vload(VF8, w[2], j + 1), F)
+        y3 = fp_mulmod2(y3, SIMD.vload(VF8, w[3], j + 1), F)
+        y4 = fp_mulmod2(y4, SIMD.vload(VF8, w[4], j + 1), F)
         if !FWD
             y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
                                          k1p, k2p, k3p, k4p, F)
@@ -420,10 +416,10 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
                                          k1, k2, k3, k4, k1p, k2p, k3p, k4p, F)
         end
         y0 = fp_reduce(y0, F)
-        y1 = fp_mulmod(y1, w[1][j+1], wp[1][j+1], F)
-        y2 = fp_mulmod(y2, w[2][j+1], wp[2][j+1], F)
-        y3 = fp_mulmod(y3, w[3][j+1], wp[3][j+1], F)
-        y4 = fp_mulmod(y4, w[4][j+1], wp[4][j+1], F)
+        y1 = fp_mulmod2(y1, w[1][j+1], F)
+        y2 = fp_mulmod2(y2, w[2][j+1], F)
+        y3 = fp_mulmod2(y3, w[3][j+1], F)
+        y4 = fp_mulmod2(y4, w[4][j+1], F)
         if !FWD
             y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4,
                                          k1, k2, k3, k4, k1p, k2p, k3p, k4p, F)
@@ -463,12 +459,11 @@ end
     return fp_reduce(u, F), fp_reduce(v, F)
 end
 
-function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
-                     ::Val{FWD}) where {P, FWD}
+function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
+                     ::Val{FWD}) where {FWD}
     Q = st.Q
     rot, rotp = st.rot, st.rotp
     w = st.tw
-    invp = inv(P)   # derive w/p on the fly (one mul) instead of a second table load
     j = 0
     @inbounds while j + 8 <= Q
         i0 = o + j + 1
@@ -478,10 +473,8 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
             a_jj = SIMD.vload(VF8, x, i0 + jj * Q)
             b_jj = SIMD.vload(VF8, x, i0 + (17 - jj) * Q)
             if !FWD
-                wa_jj = SIMD.vload(VF8, w[jj], j + 1)
-                a_jj = fp_mulmod(a_jj, wa_jj, wa_jj * invp, F)
-                wb_jj = SIMD.vload(VF8, w[17-jj], j + 1)
-                b_jj = fp_mulmod(b_jj, wb_jj, wb_jj * invp, F)
+                a_jj = fp_mulmod2(a_jj, SIMD.vload(VF8, w[jj], j + 1), F)
+                b_jj = fp_mulmod2(b_jj, SIMD.vload(VF8, w[17-jj], j + 1), F)
             end
             s_jj = a_jj + b_jj
             d_jj = a_jj - b_jj
@@ -496,10 +489,8 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
             yr = xu + v
             ym = xu - v
             if FWD
-                wr = SIMD.vload(VF8, w[r], j + 1)
-                yr = fp_mulmod(yr, wr, wr * invp, F)
-                wm = SIMD.vload(VF8, w[17-r], j + 1)
-                ym = fp_mulmod(ym, wm, wm * invp, F)
+                yr = fp_mulmod2(yr, SIMD.vload(VF8, w[r], j + 1), F)
+                ym = fp_mulmod2(ym, SIMD.vload(VF8, w[17-r], j + 1), F)
             end
             SIMD.vstore(yr, x, i0 + r * Q)
             SIMD.vstore(ym, x, i0 + (17 - r) * Q)
@@ -514,10 +505,8 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
             a_jj = x[i0+jj*Q]
             b_jj = x[i0+(17-jj)*Q]
             if !FWD
-                wa_jj = w[jj][j+1]
-                a_jj = fp_mulmod(a_jj, wa_jj, wa_jj * invp, F)
-                wb_jj = w[17-jj][j+1]
-                b_jj = fp_mulmod(b_jj, wb_jj, wb_jj * invp, F)
+                a_jj = fp_mulmod2(a_jj, w[jj][j+1], F)
+                b_jj = fp_mulmod2(b_jj, w[17-jj][j+1], F)
             end
             s_jj = a_jj + b_jj
             d_jj = a_jj - b_jj
@@ -532,10 +521,8 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
             yr = xu + v
             ym = xu - v
             if FWD
-                wr = w[r][j+1]
-                yr = fp_mulmod(yr, wr, wr * invp, F)
-                wm = w[17-r][j+1]
-                ym = fp_mulmod(ym, wm, wm * invp, F)
+                yr = fp_mulmod2(yr, w[r][j+1], F)
+                ym = fp_mulmod2(ym, w[17-r][j+1], F)
             end
             x[i0+r*Q] = yr
             x[i0+(17-r)*Q] = ym
