@@ -294,28 +294,26 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
     ω3, ω3p = st.rot[1], st.rotp[1]
     w1, w1p, w2, w2p = st.tw[1], st.twp[1], st.tw[2], st.twp[2]
     j = 0
-    if Q >= 8
-        @inbounds while j + 8 <= Q
-            i0 = o + j + 1
-            y0 = SIMD.vload(VF8, x, i0)
-            y1 = SIMD.vload(VF8, x, i0 + Q)
-            y2 = SIMD.vload(VF8, x, i0 + 2Q)
-            if FWD
-                y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
-            end
-            y0 = fp_reduce(y0, F)
-            y1 = fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
-                           SIMD.vload(VF8, w1p, j + 1), F)
-            y2 = fp_mulmod(y2, SIMD.vload(VF8, w2, j + 1),
-                           SIMD.vload(VF8, w2p, j + 1), F)
-            if !FWD
-                y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
-            end
-            SIMD.vstore(y0, x, i0)
-            SIMD.vstore(y1, x, i0 + Q)
-            SIMD.vstore(y2, x, i0 + 2Q)
-            j += 8
+    @inbounds while j + 8 <= Q
+        i0 = o + j + 1
+        y0 = SIMD.vload(VF8, x, i0)
+        y1 = SIMD.vload(VF8, x, i0 + Q)
+        y2 = SIMD.vload(VF8, x, i0 + 2Q)
+        if FWD
+            y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
         end
+        y0 = fp_reduce(y0, F)
+        y1 = fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
+                       SIMD.vload(VF8, w1p, j + 1), F)
+        y2 = fp_mulmod(y2, SIMD.vload(VF8, w2, j + 1),
+                       SIMD.vload(VF8, w2p, j + 1), F)
+        if !FWD
+            y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
+        end
+        SIMD.vstore(y0, x, i0)
+        SIMD.vstore(y1, x, i0 + Q)
+        SIMD.vstore(y2, x, i0 + 2Q)
+        j += 8
     end
     @inbounds while j < Q
         i0 = o + j + 1
@@ -375,39 +373,37 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
     w = st.tw
     wp = st.twp
     j = 0
-    if Q >= 8
-        @inbounds while j + 8 <= Q
-            i0 = o + j + 1
-            y0 = SIMD.vload(VF8, x, i0)
-            y1 = SIMD.vload(VF8, x, i0 + Q)
-            y2 = SIMD.vload(VF8, x, i0 + 2Q)
-            y3 = SIMD.vload(VF8, x, i0 + 3Q)
-            y4 = SIMD.vload(VF8, x, i0 + 4Q)
-            if FWD
-                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
-                                             k1p, k2p, k3p, k4p, F)
-            end
-            y0 = fp_reduce(y0, F)
-            y1 = fp_mulmod(y1, SIMD.vload(VF8, w[1], j + 1),
-                           SIMD.vload(VF8, wp[1], j + 1), F)
-            y2 = fp_mulmod(y2, SIMD.vload(VF8, w[2], j + 1),
-                           SIMD.vload(VF8, wp[2], j + 1), F)
-            y3 = fp_mulmod(y3, SIMD.vload(VF8, w[3], j + 1),
-                           SIMD.vload(VF8, wp[3], j + 1), F)
-            y4 = fp_mulmod(y4, SIMD.vload(VF8, w[4], j + 1),
-                           SIMD.vload(VF8, wp[4], j + 1), F)
-            if !FWD
-                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
-                                             k1p, k2p, k3p, k4p, F)
-                y0 = fp_reduce(y0, F)
-            end
-            SIMD.vstore(y0, x, i0)
-            SIMD.vstore(y1, x, i0 + Q)
-            SIMD.vstore(y2, x, i0 + 2Q)
-            SIMD.vstore(y3, x, i0 + 3Q)
-            SIMD.vstore(y4, x, i0 + 4Q)
-            j += 8
+    @inbounds while j + 8 <= Q
+        i0 = o + j + 1
+        y0 = SIMD.vload(VF8, x, i0)
+        y1 = SIMD.vload(VF8, x, i0 + Q)
+        y2 = SIMD.vload(VF8, x, i0 + 2Q)
+        y3 = SIMD.vload(VF8, x, i0 + 3Q)
+        y4 = SIMD.vload(VF8, x, i0 + 4Q)
+        if FWD
+            y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
+                                         k1p, k2p, k3p, k4p, F)
         end
+        y0 = fp_reduce(y0, F)
+        y1 = fp_mulmod(y1, SIMD.vload(VF8, w[1], j + 1),
+                       SIMD.vload(VF8, wp[1], j + 1), F)
+        y2 = fp_mulmod(y2, SIMD.vload(VF8, w[2], j + 1),
+                       SIMD.vload(VF8, wp[2], j + 1), F)
+        y3 = fp_mulmod(y3, SIMD.vload(VF8, w[3], j + 1),
+                       SIMD.vload(VF8, wp[3], j + 1), F)
+        y4 = fp_mulmod(y4, SIMD.vload(VF8, w[4], j + 1),
+                       SIMD.vload(VF8, wp[4], j + 1), F)
+        if !FWD
+            y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
+                                         k1p, k2p, k3p, k4p, F)
+            y0 = fp_reduce(y0, F)
+        end
+        SIMD.vstore(y0, x, i0)
+        SIMD.vstore(y1, x, i0 + Q)
+        SIMD.vstore(y2, x, i0 + 2Q)
+        SIMD.vstore(y3, x, i0 + 3Q)
+        SIMD.vstore(y4, x, i0 + 4Q)
+        j += 8
     end
     @inbounds while j < Q
         i0 = o + j + 1
@@ -464,49 +460,48 @@ end
     return fp_reduce(u, F), fp_reduce(v, F)
 end
 
-function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
-                     ::Val{FWD}) where {FWD}
+function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx{P},
+                     ::Val{FWD}) where {P, FWD}
     Q = st.Q
     rot, rotp = st.rot, st.rotp
-    w, wp = st.tw, st.twp
+    w = st.tw
+    invp = inv(P)   # derive w/p on the fly (one mul) instead of a second table load
     j = 0
-    if Q >= 8
-        @inbounds while j + 8 <= Q
-            i0 = o + j + 1
-            x0 = SIMD.vload(VF8, x, i0)
-            FWD || (x0 = fp_reduce(x0, F))
-            Base.Cartesian.@nexprs 8 jj -> begin
-                a_jj = SIMD.vload(VF8, x, i0 + jj * Q)
-                b_jj = SIMD.vload(VF8, x, i0 + (17 - jj) * Q)
-                if !FWD
-                    a_jj = fp_mulmod(a_jj, SIMD.vload(VF8, w[jj], j + 1),
-                                     SIMD.vload(VF8, wp[jj], j + 1), F)
-                    b_jj = fp_mulmod(b_jj, SIMD.vload(VF8, w[17-jj], j + 1),
-                                     SIMD.vload(VF8, wp[17-jj], j + 1), F)
-                end
-                s_jj = a_jj + b_jj
-                d_jj = a_jj - b_jj
+    @inbounds while j + 8 <= Q
+        i0 = o + j + 1
+        x0 = SIMD.vload(VF8, x, i0)
+        FWD || (x0 = fp_reduce(x0, F))
+        Base.Cartesian.@nexprs 8 jj -> begin
+            a_jj = SIMD.vload(VF8, x, i0 + jj * Q)
+            b_jj = SIMD.vload(VF8, x, i0 + (17 - jj) * Q)
+            if !FWD
+                wa_jj = SIMD.vload(VF8, w[jj], j + 1)
+                a_jj = fp_mulmod(a_jj, wa_jj, wa_jj * invp, F)
+                wb_jj = SIMD.vload(VF8, w[17-jj], j + 1)
+                b_jj = fp_mulmod(b_jj, wb_jj, wb_jj * invp, F)
             end
-            s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
-            d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
-            y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
-            SIMD.vstore(fp_reduce(x0 + y0, F), x, i0)
-            for r in 1:8
-                u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
-                xu = x0 + u
-                yr = xu + v
-                ym = xu - v
-                if FWD
-                    yr = fp_mulmod(yr, SIMD.vload(VF8, w[r], j + 1),
-                                   SIMD.vload(VF8, wp[r], j + 1), F)
-                    ym = fp_mulmod(ym, SIMD.vload(VF8, w[17-r], j + 1),
-                                   SIMD.vload(VF8, wp[17-r], j + 1), F)
-                end
-                SIMD.vstore(yr, x, i0 + r * Q)
-                SIMD.vstore(ym, x, i0 + (17 - r) * Q)
-            end
-            j += 8
+            s_jj = a_jj + b_jj
+            d_jj = a_jj - b_jj
         end
+        s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
+        d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
+        y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
+        SIMD.vstore(fp_reduce(x0 + y0, F), x, i0)
+        for r in 1:8
+            u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, rotp, F)
+            xu = x0 + u
+            yr = xu + v
+            ym = xu - v
+            if FWD
+                wr = SIMD.vload(VF8, w[r], j + 1)
+                yr = fp_mulmod(yr, wr, wr * invp, F)
+                wm = SIMD.vload(VF8, w[17-r], j + 1)
+                ym = fp_mulmod(ym, wm, wm * invp, F)
+            end
+            SIMD.vstore(yr, x, i0 + r * Q)
+            SIMD.vstore(ym, x, i0 + (17 - r) * Q)
+        end
+        j += 8
     end
     @inbounds while j < Q
         i0 = o + j + 1
@@ -516,8 +511,10 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             a_jj = x[i0+jj*Q]
             b_jj = x[i0+(17-jj)*Q]
             if !FWD
-                a_jj = fp_mulmod(a_jj, w[jj][j+1], wp[jj][j+1], F)
-                b_jj = fp_mulmod(b_jj, w[17-jj][j+1], wp[17-jj][j+1], F)
+                wa_jj = w[jj][j+1]
+                a_jj = fp_mulmod(a_jj, wa_jj, wa_jj * invp, F)
+                wb_jj = w[17-jj][j+1]
+                b_jj = fp_mulmod(b_jj, wb_jj, wb_jj * invp, F)
             end
             s_jj = a_jj + b_jj
             d_jj = a_jj - b_jj
@@ -532,8 +529,10 @@ function fp_radix17!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             yr = xu + v
             ym = xu - v
             if FWD
-                yr = fp_mulmod(yr, w[r][j+1], wp[r][j+1], F)
-                ym = fp_mulmod(ym, w[17-r][j+1], wp[17-r][j+1], F)
+                wr = w[r][j+1]
+                yr = fp_mulmod(yr, wr, wr * invp, F)
+                wm = w[17-r][j+1]
+                ym = fp_mulmod(ym, wm, wm * invp, F)
             end
             x[i0+r*Q] = yr
             x[i0+(17-r)*Q] = ym
