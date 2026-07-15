@@ -106,37 +106,18 @@ end
 
 # ---------------------------------------------------------------------------
 # Transform plan: N = m·2^k, m divides 255, 2^k | p - 1.
-# One stage type serves every radix (m in 3/4/5/17).  span is the block the
-# stage tiles the length-N block with, Q the twiddle stride; tw holds the m-1
-# twiddle columns and rot/rotp the DFT combine constants — empty for radix-4,
-# whose sole DFT4 twiddle i is the shared plan-level wi.  Twiddle tables store w
-# only: every radix reduces its products through fp_mulmod2, recovering the
-# quotient from the rounded product instead of a w/p table (halving the table
-# traffic, neutral-to-faster).
+# FpNttStage serves every radix (m in 3/4/5/17).
+# span is the block the stage tiles the length-N block with, Q the twiddle stride; 
+# tw holds the m-1 twiddle columns and rot/rotp the DFT combine constants — 
+# for radix-4 that is its sole DFT4 twiddle wi.
+# Twiddle tables store w only: every radix reduces its products through fp_mulmod2
+# recovering the quotient from the rounded product instead of a w/p table
 struct FpNttStage
     m::Int
     span::Int
     Q::Int
     rot::Vector{Float64};  rotp::Vector{Float64}
     tw::Vector{Vector{Float64}}
-end
-
-function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int)
-    q = L >> 2
-    st = N2 ÷ L
-    len = max(q, 8)
-    w1 = Vector{Float64}(undef, len)
-    w2 = Vector{Float64}(undef, len)
-    w3 = Vector{Float64}(undef, len)
-    @inbounds for j in 0:len-1
-        jm = j < q ? j : j % q          # len > q only for the tiny q < 8 stages
-        w1[j+1] = table[jm*st+1]
-        w2[j+1] = table[2jm*st+1]
-        w3[j+1] = table[3jm*st+1]
-    end
-    # span = N2 (the block every radix-4 stage tiles), so fp_apply_stage!'s
-    # 0:span:N loop is uniform across radices; L=4q is recovered from Q.
-    return FpNttStage(4, N2, q, Float64[], Float64[], [w1, w2, w3])
 end
 
 # Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a time
@@ -206,15 +187,27 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     return FpNttStage(m, span, Q, rot, rot ./ fp_prime(F), tw)
 end
 
+function build_fp_4(table::Vector{Float64}, span::Int, L::Int, wi::Float64, wip::Float64)
+    q = L >> 2
+    st = span ÷ L
+    len = max(q, 8)
+    w1 = Vector{Float64}(undef, len)
+    w2 = Vector{Float64}(undef, len)
+    w3 = Vector{Float64}(undef, len)
+    @inbounds for j in 0:len-1
+        jm = j < q ? j : j % q # len > q only for the tiny q < 8 stages
+        w1[j+1] = table[jm*st+1]
+        w2[j+1] = table[2jm*st+1]
+        w3[j+1] = table[3jm*st+1]
+    end
+    return FpNttStage(4, span, q, [wi], [wip], [w1, w2, w3])
+end
+
 struct FpNttPlan{C<:FpCtx}
     ctx::C
     N::Int
     ninv::Float64
     ninvp::Float64  # 1/N; applied in the unpack
-    wi::Float64
-    wip::Float64    # i = ω2^(N2/4), the DFT4 combine's twiddle (N2 = pow2 block)
-    # every stage in application order: the odd radices (17,5,3) that decimate N
-    # into N2 blocks, then the radix-4 stages (L = N2 down to 4) within each block.
     stages::Vector{FpNttStage}
 end
 
@@ -240,16 +233,17 @@ function build_fp_plan(N::Int, F::FpCtx)
         end
     end
 
-    N2 = span
-    tw = fp_twiddles(r, N2, F)
-    L = N2
-    while L >= 4
-        push!(stages, build_fp_stage(tw, N2, L))
-        L >>= 2
+    tw = fp_twiddles(r, span, F)
+    # i = ω2^(span/4), the DFT4 combine's twiddle, shared by every radix-4 stage
+    # in this block (stored in each stage's rot/rotp, mirroring the odd radices).
+    wi = powermod(r, span >> 2, fp_prime(F))   # r^0 == 1 when span < 4
+    wip = Float64(wi) / fp_prime(F)
+    # radix-4 stages, butterfly length L = span, span/4, ... down to 4
+    for s in 0:2:trailing_zeros(span)-2
+        push!(stages, build_fp_4(tw, span, span >> s, Float64(wi), wip))
     end
-    wi = N2 >= 4 ? powermod(r, N2 >> 2, fp_prime(F)) : 1
     ninv = invmod(N % UInt64, fp_prime(F))
-    return FpNttPlan(F, N, Float64(ninv), ninv / fp_prime(F), Float64(wi), wi / fp_prime(F), stages)
+    return FpNttPlan(F, N, Float64(ninv), ninv / fp_prime(F), stages)
 end
 
 mutable struct FpNttPlanCache
@@ -587,8 +581,8 @@ end
 end
 
 function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
-                    stg::FpNttStage, wi::Float64, wip::Float64, F::FpCtx,
-                    ::Val{FWD}) where {Q,FWD}
+                    stg::FpNttStage, F::FpCtx, ::Val{FWD}) where {Q,FWD}
+    wi, wip = stg.rot[1], stg.rotp[1]
     vw1 = SIMD.vload(VF8, stg.tw[1], 1)
     vw2 = SIMD.vload(VF8, stg.tw[2], 1)
     vw3 = SIMD.vload(VF8, stg.tw[3], 1)
@@ -617,19 +611,27 @@ function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
     return x
 end
 
-# ---------------------------------------------------------------------------
-# Power-of-two pipelines, radix-4.
+# Twiddle-free radix-2 pass over the whole buffer.
+# Outputs <= 2·0.9p which works because users handle 2p inputs.
+@inline function fp_radix2!(x::Vector{Float64}, N::Int)
+    @inbounds for s in 0:2:N-1
+        u = x[s+1]; v = x[s+2]
+        x[s+1] = u + v
+        x[s+2] = u - v
+    end
+    return x
+end
 
-# One radix-4 stage (butterfly span L = 4q) over the length-N2 block at
-# offset o.  Both directions run the same twiddle+reduce pass (reduce the
+# radix-4 stage (butterfly span = 4q) over the length-N2 block at
+# offset o. Both directions run the same twiddle+reduce pass (reduce the
 # ω^0 lane, twiddle the rest); FWD picks which side of it the DFT4 combine
 # sits on — before for the forward (stage = twiddle·DFT4), after for the
 # reverse (the transpose, DFT4·twiddle).  Reverse outputs store raw; the
 # next stage's ω^0 reduce or the unpack's 1/N mulmod absorbs them.
-function fp_pow2_stage!(x::Vector{Float64}, o::Int, stg::FpNttStage,
-                        wi::Float64, wip::Float64, F::FpCtx,
-                        ::Val{FWD}) where {FWD}
-    (;span, q) = stg
+function fp_radix4!(x::Vector{Float64}, o::Int, stg::FpNttStage, F::FpCtx,
+                    ::Val{FWD}) where {FWD}
+    span, q = stg.span, stg.Q
+    wi, wip = stg.rot[1], stg.rotp[1]
     w1, w2, w3 = stg.tw[1], stg.tw[2], stg.tw[3]
     if q >= 8
         for s in o:4q:o+span-1
@@ -656,11 +658,11 @@ function fp_pow2_stage!(x::Vector{Float64}, o::Int, stg::FpNttStage,
             end
         end
     elseif span >= 32
-        q == 4 ? fp_smallq!(x, o, span, Val(4), stg, wi, wip, F, Val(FWD)) :
-        q == 2 ? fp_smallq!(x, o, span, Val(2), stg, wi, wip, F, Val(FWD)) :
-                 fp_smallq!(x, o, span, Val(1), stg, wi, wip, F, Val(FWD))
+        q == 4 ? fp_smallq!(x, o, span, Val(4), stg, F, Val(FWD)) :
+        q == 2 ? fp_smallq!(x, o, span, Val(2), stg, F, Val(FWD)) :
+                 fp_smallq!(x, o, span, Val(1), stg, F, Val(FWD))
     else
-        for s in o:4q:o+N2-1
+        for s in o:4q:o+span-1
             @inbounds for j in 0:q-1
                 y0 = x[s+j+1]
                 y1 = x[s+j+q+1]
@@ -689,27 +691,15 @@ end
 # Apply one stage across the whole length-N buffer, in either direction: every
 # radix tiles the buffer into blocks of st.span (N2 for radix-4, the decimation
 # span for the odd radices).  FWD selects which side of the twiddle+reduce the
-# DFT combine sits on (see fp_pow2_stage! / the fp_radix* functions).
+# DFT combine sits on (see the fp_radix* functions).
 function fp_apply_stage!(x::Vector{Float64}, st::FpNttStage, plan::FpNttPlan,
                          ::Val{FWD}) where {FWD}
     F = plan.ctx
     for o in 0:st.span:plan.N-1
-        st.m == 4 ? fp_pow2_stage!(x, o, st, plan.wi, plan.wip, F, Val(FWD)) :
+        st.m == 4 ? fp_radix4!(x, o, st, F, Val(FWD)) :
         st.m == 3 ? fp_radix3!(x, o, st, F, Val(FWD)) :
         st.m == 5 ? fp_radix5!(x, o, st, F, Val(FWD)) :
                     fp_radix17!(x, o, st, F, Val(FWD))
-    end
-    return x
-end
-
-# Twiddle-free radix-2 pass over the whole buffer: k odd leaves one factor of 2
-# after the radix-4 stages (forward's last op, reverse's first).  Outputs
-# <= 2·0.9p feed the pointwise stage, whose quotient bound tolerates 2p inputs.
-@inline function fp_radix2!(x::Vector{Float64}, N::Int)
-    @inbounds for s in 0:2:N-1
-        u = x[s+1]; v = x[s+2]
-        x[s+1] = u + v
-        x[s+2] = u - v
     end
     return x
 end
@@ -722,10 +712,9 @@ function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
     return x
 end
 
-# Transpose of fp_ntt_fwd! (same twiddles, stages reversed): consumes the
-# forward's scrambled output order and returns natural order.  Fed the
-# pointwise product Ĉ it yields N·c[(N-t) mod N]; the unpack reads
-# descending and folds in the 1/N.
+# Transpose of fp_ntt_fwd! (same twiddles, stages reversed to unscramble the order).
+# Fed the pointwise product Ĉ it yields N·c[(N-t) mod N].
+# the unpack reads descending and folds in the 1/N.
 function fp_ntt_rev!(x::Vector{Float64}, plan::FpNttPlan)
     isodd(trailing_zeros(plan.N)) && fp_radix2!(x, plan.N)
     for st in Iterators.reverse(plan.stages)
@@ -795,12 +784,10 @@ end
 function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     n = length(xa)
     i = 1
-    if n >= 8
-        @inbounds while i + 7 <= n
-            SIMD.vstore(fp_mulmod2(SIMD.vload(VF8, xa, i), SIMD.vload(VF8, xb, i), F),
-                        xa, i)
-            i += 8
-        end
+    @inbounds while i + 7 <= n
+        SIMD.vstore(fp_mulmod2(SIMD.vload(VF8, xa, i), SIMD.vload(VF8, xb, i), F),
+                    xa, i)
+        i += 8
     end
     @inbounds while i <= n
         xa[i] = fp_mulmod2(xa[i], xb[i], F)
