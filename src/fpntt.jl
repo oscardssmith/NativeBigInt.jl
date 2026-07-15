@@ -228,7 +228,10 @@ function build_fp_plan(N::Int, F::FpCtx)
     oddf = FpOddStage[]
     span = N
     r = ω
-    for mf in (3, 5, 17)
+    # peel the arithmetic-heaviest radix first: it lands at span == N, where the
+    # twiddle table is largest and least reused, so its dense mulmods overlap the
+    # memory traffic the cheaper radices can't hide (matters for m in 51/85/255).
+    for mf in (17, 5, 3)
         if m % mf == 0
             push!(oddf, build_fp_odd(mf, span, r, F))
             r = powermod(r, mf, fp_prime(F))
