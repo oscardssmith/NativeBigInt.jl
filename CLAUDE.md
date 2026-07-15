@@ -19,10 +19,14 @@ julia --project -e 'using Pkg; Pkg.test()'
 # (test/runtests.jl just includes the per-area files under one @testset.)
 julia --project -e 'using NativeBigInt, Test, Random; include("test/test_kernels.jl")'
 
-# Benchmarks (not part of CI; each script is standalone)
-julia --project bench/bench_highlevel.jl   # NBig vs Base.BigInt, end-to-end
-julia --project bench/bench_kernels.jl      # kernels vs GMP __gmpn_* directly
+# Benchmarks (not part of CI; run under the bench env, which pins the deps)
+julia --project=bench bench/bench_highlevel.jl [op...]        # NBig vs Base.BigInt, end-to-end
+julia --project=bench bench/bench_kernels.jl <family> [sizes] # kernel/threshold selection vs GMP
 ```
+
+`bench/bench_kernels.jl` takes a family (`micro`, `mul`, `sqr`, `div`, `kar`,
+`dc`, `gcd`, `mullo`, `barrett`, `sqrt`) plus optional sizes; run it with no
+args for the family list. `bench/bench_highlevel.jl` takes optional op filters.
 
 There is no build/lint step — it's a plain Julia package.
 
@@ -44,11 +48,11 @@ cover:
   (`bench/asm_dump.jl`).
 - **Dispatch thresholds live at the mpn layer** (`src/mul.jl`,
   `src/div.jl`, `src/gcd.jl`), never at the NBig level, and are
-  benchmark-tuned: Karatsuba ~29 limbs (`bench/bench_kar_thr.jl`), fp NTT
+  benchmark-tuned: Karatsuba ~29 limbs (`bench_kernels.jl kar`), fp NTT
   ~224 balanced limbs, divide-and-conquer division `DC_DIV_THRESHOLD` = 100
-  (`bench/bench_dc_thr.jl`), subquadratic HGCD gcd `GCD_DC_THRESHOLD` = 300
+  (`bench_kernels.jl dc`), subquadratic HGCD gcd `GCD_DC_THRESHOLD` = 300
   / `GCDEXT_DC_THRESHOLD` = 250 / `HGCD_THRESHOLD` = 120
-  (`bench/bench_gcd_thr.jl`).
+  (`bench_kernels.jl gcd`).
 - **Deleted algorithms:** Toom-3, the integer Goldilocks NTT (`src/ntt.jl`),
   and the single-prime fp pipeline were removed once the two-prime fp NTT
   beat them everywhere — git history has them; don't reintroduce variants

@@ -4,16 +4,26 @@
 # bench process corrupts the timings. Notes: divrem is a 2n/n shape; gcd/gcdx
 # operands share a planted n/2-bit factor; powermod uses a 512-bit-capped
 # exponent so large sizes stay benchable; string/parse are decimal.
+#
+#   julia --startup-file=no --project=. bench/bench_highlevel.jl [op...]
+#
+# With no args every op runs. Trailing args restrict the table to matching
+# ops (substring match, so `powermod` selects both odd and even).
 using BenchmarkTools, NativeBigInt, Random
 
 const BITSIZES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-const OPS = ("+", "-", "*", "divrem", "gcd", "gcdx", "isqrt",
-             "powermod odd", "powermod even", "string", "parse")
+const ALL_OPS = ("+", "-", "*", "divrem", "gcd", "gcdx", "isqrt",
+                 "powermod odd", "powermod even", "string", "parse")
+const OPS = isempty(ARGS) ? ALL_OPS :
+    filter(op -> any(a -> occursin(a, op), ARGS), ALL_OPS)
+isempty(OPS) && error("no ops match $(ARGS); choose from: $(join(ALL_OPS, ", "))")
 
 rng = MersenneTwister(0xbe9c)
 randbits(b) = rand(rng, big(2)^(b-1):big(2)^b-1)
 
 results = Dict(op => Float64[] for op in OPS)
+sel(op) = op in OPS
+# `sel(op) &&` short-circuits so the @belapsed args of a deselected op never run
 ratio!(op, tn, tb) = push!(results[op], tn / tb)
 
 for bits in BITSIZES
@@ -30,19 +40,19 @@ for bits in BITSIZES
     gan, gbn = NBig(gab), NBig(gbb)
     modn, meven_n, basen, en = NBig(modd), NBig(meven), NBig(base), NBig(e)
 
-    ratio!("+", (@belapsed $an + $bn), (@belapsed $ab + $bb))
-    ratio!("-", (@belapsed $an - $bn), (@belapsed $ab - $bb))
-    ratio!("*", (@belapsed $an * $bn), (@belapsed $ab * $bb))
-    ratio!("divrem", (@belapsed divrem($an, $dn)), (@belapsed divrem($ab, $db)))
-    ratio!("gcd", (@belapsed gcd($gan, $gbn)), (@belapsed gcd($gab, $gbb)))
-    ratio!("gcdx", (@belapsed gcdx($gan, $gbn)), (@belapsed gcdx($gab, $gbb)))
-    ratio!("isqrt", (@belapsed isqrt($an)), (@belapsed isqrt($ab)))
-    ratio!("powermod odd", (@belapsed powermod($basen, $en, $modn)),
+    sel("+") && ratio!("+", (@belapsed $an + $bn), (@belapsed $ab + $bb))
+    sel("-") && ratio!("-", (@belapsed $an - $bn), (@belapsed $ab - $bb))
+    sel("*") && ratio!("*", (@belapsed $an * $bn), (@belapsed $ab * $bb))
+    sel("divrem") && ratio!("divrem", (@belapsed divrem($an, $dn)), (@belapsed divrem($ab, $db)))
+    sel("gcd") && ratio!("gcd", (@belapsed gcd($gan, $gbn)), (@belapsed gcd($gab, $gbb)))
+    sel("gcdx") && ratio!("gcdx", (@belapsed gcdx($gan, $gbn)), (@belapsed gcdx($gab, $gbb)))
+    sel("isqrt") && ratio!("isqrt", (@belapsed isqrt($an)), (@belapsed isqrt($ab)))
+    sel("powermod odd") && ratio!("powermod odd", (@belapsed powermod($basen, $en, $modn)),
            (@belapsed powermod($base, $e, $modd)))
-    ratio!("powermod even", (@belapsed powermod($basen, $en, $meven_n)),
+    sel("powermod even") && ratio!("powermod even", (@belapsed powermod($basen, $en, $meven_n)),
            (@belapsed powermod($base, $e, $meven)))
-    ratio!("string", (@belapsed string($an)), (@belapsed string($ab)))
-    ratio!("parse", (@belapsed parse(NBig, $s)), (@belapsed parse(BigInt, $s)))
+    sel("string") && ratio!("string", (@belapsed string($an)), (@belapsed string($ab)))
+    sel("parse") && ratio!("parse", (@belapsed parse(NBig, $s)), (@belapsed parse(BigInt, $s)))
 
     println("done bits=$bits"); flush(stdout)
 end

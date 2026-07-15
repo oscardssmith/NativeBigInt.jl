@@ -34,7 +34,7 @@ Three layers, mirroring GMP's mpn/mpz split:
   (~0.69k full low block + two recursive cross products) above
   `MULLO_BASECASE_THRESHOLD`/`SQRLO_BASECASE_THRESHOLD`, and plain `mul!` +
   discard once the balanced product reaches the NTT
-  (`bench/bench_mullo_thr.jl`).
+  (`bench/bench_kernels.jl mullo`).
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over
   `divrem_bc!` below ~100 limbs, GMP-`dcpi1`-style divide-and-conquer division
   (recursive 2n/n blocks over `mul!`, so it inherits Karatsuba and the NTT;
@@ -74,7 +74,7 @@ Three layers, mirroring GMP's mpn/mpz split:
   (hgcd2-flavoured), one fused matrix pass over the operands, a full
   division step when a window stalls, and for gcdx a V-cofactor pair
   carried in lockstep. Above ~300 limbs (gcd; ~250 for gcdx,
-  `bench/bench_gcd_thr.jl`) a subquadratic HGCD layer in the style of GMP's
+  `bench/bench_kernels.jl gcd`) a subquadratic HGCD layer in the style of GMP's
   `mpn_hgcd` (Möller 2008) takes over: recursive half-gcd builds a 2×2
   matrix of det-+1 mpn cofactors whose products route through `mul!`, so
   gcd inherits Karatsuba and the NTT for an O(M(n) log n) total — ahead of
@@ -152,7 +152,7 @@ benchmarked in `bench_highlevel.jl` but slower than GMP's.
 
 Above that, Karatsuba carries ~2k–14k bits at rough GMP parity (0.95–1.09×
 against `__gmpn_mul`), and the two-prime fp NTT takes over at ~14k bits
-already ahead (`bench/bench_mul.jl`, AVX-512 machine; ratio is `mul!` /
+already ahead (`bench/bench_kernels.jl mul`, AVX-512 machine; ratio is `mul!` /
 `__gmpn_mul` on two equal operands of the given bit size):
 
 | bits    | 14k  | 16k  | 33k  | 49k  | 66k  | 98k  | 131k | 262k | 524k | 2.1M | 16.8M | 268M |
@@ -169,6 +169,7 @@ width shrinks slowly as operands grow (the ratio drifting up toward the
 268M-bit column), but the two-prime working modulus keeps the engine ahead
 through the largest sizes that fit in memory.
 
-Kernel-level benchmarks against GMP's `__gmpn_*` functions directly live
-alongside this one in `bench/` (see `bench/bench_kernels.jl`,
-`bench/bench_mul.jl`, `bench/div_vs_gmp.jl`, `bench/bench_dc_thr.jl`, etc.).
+Kernel- and threshold-level benchmarks against GMP's `__gmpn_*` functions
+directly live alongside this one in `bench/bench_kernels.jl`, a family-selecting
+driver (`micro`, `mul`, `sqr`, `div`, `kar`, `dc`, `gcd`, `mullo`, `barrett`,
+`sqrt`); run it with no args for the family list.
