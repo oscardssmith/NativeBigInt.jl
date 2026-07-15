@@ -37,7 +37,7 @@ function mulcost(N::Int; reps=5)
                 NB.fp_ntt_fwd!(xa, plan)
                 NB.fp_ntt_fwd!(xb, plan)
                 NB.fp_ntt_pointwise!(xa, xb, F)
-                NB.fp_ntt_inv!(xa, plan)
+                NB.fp_ntt_rev!(xa, plan)
             end
         end
         best = min(best, t)

@@ -6,7 +6,7 @@
 # magic-constant round.
 using NativeBigInt: FP_CTX1, FpCtx, fp_prime, fp_mulmod, fp_mulmod2,
                     fp_reduce, fp_round, fp_ntt_plan,
-                    fp_ntt_fwd!, fp_ntt_inv!, VF8,
+                    fp_ntt_fwd!, fp_ntt_rev!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
 
@@ -80,8 +80,12 @@ end
         y = copy(x)
         fp_ntt_fwd!(y, plan)
         @test y != x
-        fp_ntt_inv!(y, plan)
-        @test fp_canon.(y) == UInt64.(x)
+        # the reverse transform is the transposed forward, so the round trip returns the
+        # input scaled by N and index-reversed
+        fp_ntt_rev!(y, plan)
+        want = [UInt64(mod(big(N) * big(UInt64(x[mod(N - t, N)+1])), big(FP_PI)))
+                for t in 0:N-1]
+        @test fp_canon.(y) == want
         N > 256 && continue
         a = rand(rng, UInt64(0):FP_PI-1, N)
         b = rand(rng, UInt64(0):FP_PI-1, N)
@@ -92,8 +96,12 @@ end
         fa, fb = Float64.(a), Float64.(b)
         fp_ntt_fwd!(fa, plan); fp_ntt_fwd!(fb, plan)
         fc = fp_mulmod2.(fa, fb, Ref(FP_CTX1))
-        fp_ntt_inv!(fc, plan)
-        @test big.(fp_canon.(fc)) == mod.(c, big(FP_PI))
+        fp_ntt_rev!(fc, plan)
+        # recover c[j] = ninv · rev(Ĉ)[(N-j) mod N], as the unpack does
+        got = [big(fp_canon(fp_mulmod(fc[mod(N - j, N)+1], plan.ninv, plan.ninvp,
+                                      FP_CTX1)))
+               for j in 0:N-1]
+        @test got == mod.(c, big(FP_PI))
     end
 end
 
@@ -177,8 +185,10 @@ end
         y = copy(x)
         fp_ntt_fwd!(y, plan)
         @test y != x
-        fp_ntt_inv!(y, plan)
-        @test fp_canonc.(y, Ref(FP_CTX2)) == UInt64.(x)
+        fp_ntt_rev!(y, plan)
+        want = [UInt64(mod(big(N) * big(UInt64(x[mod(N - t, N)+1])), big(FP_PI2)))
+                for t in 0:N-1]
+        @test fp_canonc.(y, Ref(FP_CTX2)) == want
     end
 end
 
@@ -231,15 +241,25 @@ end
     rng = MersenneTwister(0x6a3)
     P1, P2 = big(FP_PI), big(FP_PI2)
     # random (possibly unreduced, either-sign) fp representatives of each
-    # residue, as the inverse transform would hand them over
+    # residue, laid out as fp_ntt_rev! hands them over: coefficient i sits at
+    # index (N-i) mod N and carries an extra factor N that unpack's 1/N
+    # mulmod removes
     rep(c, P) = Float64(c % P) + rand(rng, -2:2) * Float64(P)
     for b in (33, 40, 44, 48), nconv in (1, 7, 64, 200)
         cs = [rand(rng, big(0):P1*P2-1) for _ in 1:nconv]
-        x1 = [rep(c, P1) for c in cs]
-        x2 = [rep(c, P2) for c in cs]
+        N = nconv + rand(rng, 0:5)
+        x1 = zeros(Float64, N)
+        x2 = zeros(Float64, N)
+        for (i, c) in enumerate(cs)
+            idx = mod(N - (i - 1), N) + 1
+            x1[idx] = rep(c * N, P1)
+            x2[idx] = rep(c * N, P2)
+        end
+        n1 = Float64(invmod(UInt64(N), FP_PI));  n1p = n1 / Float64(FP_PI)
+        n2 = Float64(invmod(UInt64(N), FP_PI2)); n2p = n2 / Float64(FP_PI2)
         rn = cld(99 + b * (nconv - 1), 64) + 1
         r = Memory{Limb}(undef, rn)
-        fp_ntt_unpack2!(r, 0, rn, x1, x2, nconv, b)
+        fp_ntt_unpack2!(r, 0, rn, x1, x2, nconv, b, n1, n1p, n2, n2p)
         want = sum(c << (b * (i - 1)) for (i, c) in enumerate(cs))
         @test sum(big(r[i]) << (64 * (i - 1)) for i in 1:rn) == want
     end

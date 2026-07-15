@@ -94,7 +94,11 @@ Three layers, mirroring GMP's mpn/mpz split:
   Butterfly adds run unreduced with one reduction per butterfly closing
   the lazy bounds, so the hot loop is pure mul/fma/add traffic, and every
   operation is exactly correct by rounding-error analysis, not
-  approximation. Radix-4 DIF/DIT, transform lengths m·2^k for
+  approximation. Radix-4 DIF forward; the inverse direction is the
+  transposed forward network (reverse stage order, the same forward twiddle
+  tables — no inverse twiddles or 1/N pre-scale pass exist), which hands
+  the unpack N·c index-reversed with the 1/N folded into unpack's
+  descending read. Transform lengths m·2^k for
   m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; the heavier odd
   multipliers — m = 15 and the symmetric-pair radix-17 family
   m ∈ {17, 51, 85, 255} — join from m·2^14 points, where their
