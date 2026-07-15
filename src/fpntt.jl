@@ -75,6 +75,15 @@ const FP_CTX2 = FpCtx{2^41 * (2^8 -1) + 1}((2 => 41, 3 => 1, 5 => 1, 17 => 1))
 # never worse than a separate multiply-then-round.
 const FP_MAGIC = 1.5*2^52
 
+# r ≡ x (mod p) in balanced form. Exact for any exact-integer x in the domain |x| <= 2^51·p.
+# The round argument |x·inv(P)| <= 2^51, so q = fma(x, inv(P), ..) is valid
+# and r = x - q·p is a small integer (|r| <= p(1/2 + |x|·2^-52/p) < p)
+# that the single fma computes without rounding.
+@inline function fp_reduce(x, ::FpCtx{P}) where {P}
+    q = fma(x, inv(P), FP_MAGIC) - FP_MAGIC
+    return fma(q, -P, x)
+end
+
 # r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
 # q = fma(x, wpinv, ..) not dependent on h, so both multiplies issue together.
 # Only the unpack's serial Garner chain uses this precomputed-reciprocal form:
@@ -85,15 +94,6 @@ const FP_MAGIC = 1.5*2^52
     l = fma(x, w, -h)
     q = fma(x, wpinv, FP_MAGIC) - FP_MAGIC
     return fma(q, -P, h) + l
-end
-
-# r ≡ x (mod p) in balanced form. Exact for any exact-integer x in the domain |x| <= 2^51·p.
-# The round argument |x·inv(P)| <= 2^51, so q = fma(x, inv(P), ..) is valid
-# and r = x - q·p is a small integer (|r| <= p(1/2 + |x|·2^-52/p) < p)
-# that the single fma computes without rounding.
-@inline function fp_reduce(x, ::FpCtx{P}) where {P}
-    q = fma(x, inv(P), FP_MAGIC) - FP_MAGIC
-    return fma(q, -P, x)
 end
 
 # r ≡ x·y (mod p) for two data operands (no precomputed quotient).
