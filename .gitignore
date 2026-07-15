@@ -1,5 +1,6 @@
 docs/superpowers/
 bench/*
 !bench/*.jl
+Manifest.toml
 .superpowers/
 .claude/
