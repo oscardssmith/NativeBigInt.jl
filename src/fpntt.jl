@@ -16,21 +16,18 @@
 #     fit: mulmod arguments never exceed 4p < 2^51, and fp_reduce quotients
 #     are at most ~5.
 #
-# There are no inverse twiddles.  The reverse transform (fp_ntt_rev!) is
-# the transpose of the forward network — the same tables, stages in reverse
-# order — which computes the same DFT because the matrix is symmetric.
-# Fed the forward-scrambled pointwise product it returns N·c[(N-t) mod N]
-# in natural order; the unpack reads descending and folds in the 1/N.
+# The reverse transform (fp_ntt_rev!) is the transpose of the forward network
+# — same twiddle tables, stages in reverse order — which computes the same DFT
+# because the matrix is symmetric.  Fed the forward-scrambled pointwise product
+# it returns N·c[(N-t) mod N] in natural order; the unpack reads descending and
+# folds in the 1/N.
 #
-# Lazy bounds (c := p/2^52 < 1/8; mulmod output <= p/2 + |x|·c).  One
-# fp_reduce per butterfly closes the ranges, on the one lane no mulmod
-# re-caps: the forward reduces the ω^0 output before storing, the reverse
-# reduces the untwiddled input on load and stores its outputs raw (radix-5
-# and radix-17 also reduce the reverse ω^0 output — see their comments).
-# Forward values converge to <= ~0.9p (transient <= 1.6p after the leftover
-# radix-2), reverse values to <= ~3.5p, every mulmod argument stays <= 4p,
-# and every intermediate sum stays far below 2^53.  The differential tests
-# plus adversarial max-magnitude cases validate the bounds empirically.
+# Lazy bounds.  One fp_reduce per butterfly closes the per-stage ranges (the
+# ω^0 lane, which skips the twiddle mulmod, is reduced explicitly — see the
+# butterfly comments for the per-radix numbers).  The global invariant is that
+# forward values converge to <= ~0.9p and reverse to <= ~3.5p, so every mulmod
+# argument stays <= 4p and every intermediate sum stays far below 2^53.  The
+# differential and adversarial max-magnitude tests validate this empirically.
 #
 # All bounds hold for any prime p < 2^49, so the engine is parametrized by an
 # FpCtx carrying the per-prime constants and both residue transforms run
@@ -41,19 +38,31 @@
 
 const VF8 = SIMD.Vec{8,Float64}
 
-# prime to do a NTT over and the factorization of P-1 as (prime => exponent) pairs.
+# smallest small generator of GF(p)*, given the prime factors of p-1
+function fp_generator(p::UInt64, facs)
+    for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
+        all(powermod(UInt64(g), (p - 1) ÷ q, p) != 1 for (q, _) in facs) &&
+            return UInt64(g)
+    end
+    error("unreachable: GF(p) has a small generator")
+end
+
+# prime to do a NTT over, the factorization of P-1 as (prime => exponent) pairs,
+# and a primitive root of GF(P).  The constructor checks facs is the complete
+# factorization of P-1 and supplies the 2/3/5/17 radices, so every valid N | P-1
+# has a primitive Nth root — build_fp_plan trusts gen without rechecking order.
 struct FpCtx{P}
     facs::Tuple{Vararg{Pair{Int,Int}}}
+    gen::UInt64
+    function FpCtx{P}(facs::Tuple{Vararg{Pair{Int,Int}}}) where {P}
+        @assert prod(q^e for (q, e) in facs) == P - 1
+        @assert all(in(map(first, facs)), (2, 3, 5, 17))
+        new{P}(sort(facs), fp_generator(UInt64(P), facs))
+    end
 end
 @inline fp_prime(::FpCtx{P}) where {P} = UInt64(P)
-
 # 2-adicity of p-1: the exponent of the (2 => k) pair.
-@inline function two_adicity(F::FpCtx)
-    for (q, e) in F.facs
-        q == 2 && return e
-    end
-    return 0
-end
+@inline two_adicity(F::FpCtx) = F.facs[1].second
 
 # Both primes < 2^49 (rounding bounds above)
 # Of form 2^n*(2^(49-n)-1) since that allows radix 2^n and radix, 3, 5, 17 transforms
@@ -74,13 +83,10 @@ const FP_MAGIC = 1.5*2^52
     return fma(q, -P, h) + l
 end
 
-# r ≡ x (mod p), |r| <= p(1/2 + |x|·2^-52/p): exact whenever the quotient
-# fits the magic round, |x·pinv| <= 2^51, i.e. |x| <= 2^51·p.  Butterfly
-# callers use the easy end of that domain (|x| <= ~8p, quotient <= 8);
-# fp_mulmod2 uses the far edge (x = h ~ 4p², quotient ~ 4p ≈ 2^51).  The
-# result is exact either way: x is an exact integer (any double >= 2^53 in
-# magnitude is one), q·p is an integer
-# and their difference is small enough to represent exactly.
+# r ≡ x (mod p) in balanced form. Exact for any exact-integer x in the domain |x| <= 2^51·p.
+# The round argument |x·inv(P)| <= 2^51, so q = fp_round(..) is valid
+# and r = x - q·p is a small integer (|r| <= p(1/2 + |x|·2^-52/p) < p)
+# that the single fma computes without rounding.
 @inline function fp_reduce(x, ::FpCtx{P}) where {P}
     q = fp_round(x * inv(P))
     return fma(q, -P, x)
@@ -93,14 +99,6 @@ end
     h = x * y
     l = fma(x, y, -h)
     return fp_reduce(h, F) + l
-end
-
-function fp_generator(F::FpCtx)
-    for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
-        all(powermod(UInt64(g), (fp_prime(F) - 1) ÷ q, fp_prime(F)) != 1 for (q, _) in F.facs) &&
-            return UInt64(g)
-    end
-    error("unreachable: GF(p) has a small generator")
 end
 
 # ---------------------------------------------------------------------------
@@ -202,13 +200,7 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
         ωr = powermod(root, r, fp_prime(F))
-        t = Vector{Float64}(undef, Q)
-        f = UInt64(1)
-        for j in 1:Q
-            t[j] = f
-            f = UInt64(widemul(f, ωr) % fp_prime(F))
-        end
-        tw[r] = t
+        tw[r] = fp_twiddles(ωr, Q, F)
     end
     return FpOddStage(m, span, Q, rot, rot ./ fp_prime(F), tw, [t ./ fp_prime(F) for t in tw])
 end
@@ -228,13 +220,10 @@ end
 function build_fp_plan(N::Int, F::FpCtx)
     k = trailing_zeros(N)
     m = N >> k
-    @assert m in (1, 3, 5, 15, 17, 51, 85, 255) && (m == 1 || k >= 2)
-    @assert (fp_prime(F) - 1) % N == 0
-    ω = powermod(fp_generator(F), (fp_prime(F) - 1) ÷ N, fp_prime(F))
-    @assert powermod(ω, N >> 1, fp_prime(F)) == fp_prime(F) - 1
-    m % 3 == 0 && @assert powermod(ω, N ÷ 3, fp_prime(F)) != 1
-    m % 5 == 0 && @assert powermod(ω, N ÷ 5, fp_prime(F)) != 1
-    m % 17 == 0 && @assert powermod(ω, N ÷ 17, fp_prime(F)) != 1
+    # N = m·2^k with odd part m | 255 (radix 3/5/17 stages) and 2^k | P-1; with a
+    # validated FpCtx this is the full precondition, and ω is a primitive Nth root.
+    @assert m in (1, 3, 5, 15, 17, 51, 85, 255) && (m == 1 || k >= 2) && k <= two_adicity(F)
+    ω = powermod(F.gen, (fp_prime(F) - 1) ÷ N, fp_prime(F))
 
     oddf = FpOddStage[]
     span = N
@@ -897,46 +886,23 @@ function fp_ntt_params2(bits_a::Int, bits_b::Int, F1::FpCtx, F2::FpCtx)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# Garner recombination + limb streaming.  The reverse transform hands over
-# N·c index-reversed (coefficient i at (N-i) mod N, magnitude <= ~3.5p): the
-# loads walk the arrays descending — a scalar head over coefficients 0..7
-# covers the i = 0 wraparound, then 8-wide loads with a lane reversal — and
-# each residue is scaled by 1/N with a ninv mulmod as it is read.
-# Each coefficient of the product's base-2^b representation is recovered
-# from its residues as
-#   c = c1 + p1·u,  u = (c2 - c1)·p1^-1 mod p2,  c ∈ [0, p1·p2) ⊂ [0, 2^99),
-# but c is never materialized: by linearity the product is
-#   Σ cᵢ·2^(b·i) = Σ c1ᵢ·2^(b·i) + p1 · Σ uᵢ·2^(b·i) = S1 + p1·S2,
-# so the loop streams S1 (into r) and S2 (into scratch) as two independent
-# sums of 49-bit values, folded at the end by one addmul_1! pass at kernel
-# speed.
+# Garner recombination + limb streaming.  fp_ntt_rev! hands back N·c index-
+# reversed (coefficient i at (N-i) mod N); this loop scales each residue by 1/N
+# and Garner-combines the two mod-p residues of every base-2^b coefficient:
+#   c = c1 + p1·u,  u = (c2 - c1)·p1^-1 mod p2.
+# c is never materialized — by linearity Σ cᵢ·2^(b·i) = S1 + p1·S2 with
+# S1 = Σ c1ᵢ·2^(b·i) and S2 = Σ uᵢ·2^(b·i), so the two sums stream independently
+# (S1 into r, S2 into s2) and one final addmul_1! folds them at kernel speed.
 #
-# Per 8 coefficients, all SIMD: residues are canonicalized and u is computed
-# in the fp domain (·p1^-1 is a mulmod by a fixed twiddle: c1 must be
-# canonicalized FIRST — v1 - p1 is a different value mod p2 — then
-# t = v2 - fp_reduce(v1, F2) has |t| < 1.5·p2 <= 4p, so fp_mulmod is exact),
-# values are converted to integers, and each is pre-split into the window
-# halves lo = v << s, hi = v >> (64 - s) with per-lane variable shifts —
-# legal because the flush discipline below makes s = (b·i) mod 64, which is
-# data-independent.  The scalar scan is then pure adds-with-carry (a
-# variable UInt128 << there would cost a multi-uop shift sequence per
-# coefficient, since LLVM cannot prove s < 64).
-#
-# Accumulator proof (each stream).  (a1, a0) is a 128-bit window holding the
-# pending sum of contributions to bits [outbit, outbit+128); coefficient i
-# contributes v·2^(i·b - outbit) with v < 2^49 and shift s < 64 (the flush
-# keeps s in [0, 64) since b < 64), i.e. each add is < 2^113.  Between two
-# flushes s advances by b >= 1, so there are at most 64 adds; with
-# P' = P >> 64 at each flush the pending value satisfies
-# P < (P >> 64) + 64·2^113 < 2^120 < 2^128 at the fixed point — the window
-# never overflows.  A flushed limb is final: after the flush every remaining
-# coefficient starts at bit i·b >= outbit + 64, and all contributions are
-# nonnegative, so nothing can carry below its own position.  The final fold
-# S1 + p1·S2 equals the true product < 2^(64·rn), so addmul_1! carries out 0.
-const REV8 = (7, 6, 5, 4, 3, 2, 1, 0)
+# Each c1, u is pre-split into window halves lo = v << s, hi = v >> (64 - s) so
+# the scalar accumulate is pure add-with-carry; s = (b·i) mod 64 is data-
+# independent because the flush drops s by exactly 64.  The 128-bit window never
+# overflows: values are < 2^49, s < 64, and each flushed limb is final (later
+# coefficients start at a strictly higher bit).  Note c1 must be canonicalized
+# before fp_reduce(v1, F2), since v1 - p1 is a different value mod p2.
 
-# One scalar coefficient: undo the 1/N scale on each residue and Garner-combine
-# into the mod-p1 limb c1 and the correction uu (both canonical UInt64).
+# One scalar coefficient: unscale each residue by 1/N and Garner-combine into
+# the mod-p1 limb c1 and correction uu (both canonical UInt64).
 @inline function fp_unpack_coeff(x1::Vector{Float64}, x2::Vector{Float64}, idx::Int,
                                  n1::Float64, n1p::Float64, n2::Float64, n2p::Float64,
                                  g::Float64, gp::Float64)
@@ -950,13 +916,11 @@ const REV8 = (7, 6, 5, 4, 3, 2, 1, 0)
 end
 
 # Scalar-pack cnt (<= 8) coefficients starting at coefficient i into the stage
-# buffer (quarters lo1|hi1|lo2|hi2), shifting lane j by (s + j·b) & 63 — the bit
-# offset the accumulate reaches for that coefficient, since flushes only drop s
-# by 64.  Coefficient 0 wraps to x1[1]; the rest read descending x1[N-·+1].
-# The vector loop packs the same layout directly with SIMD; this is the scalar
-# fallback for the < 8-wide head and tail.  @noinline keeps its fp_mulmod
-# chains out of fp_ntt_unpack2!'s hot loop, whose carry-chain codegen degrades
-# when the whole function is bloated (adc recognition drops).
+# buffer (quarters lo1|hi1|lo2|hi2), shifting lane j by (s + j·b) & 63.
+# Coefficient 0 wraps to x1[1]; the rest read descending x1[N-·+1].  The vector
+# loop packs the same layout with SIMD; this is the < 8-wide head/tail fallback.
+# @noinline keeps its fp_mulmod chains out of fp_ntt_unpack2!'s hot loop, whose
+# adc recognition degrades when the function is bloated.
 @noinline function fp_pack_scalar!(stage::Vector{UInt64}, x1::Vector{Float64},
                                  x2::Vector{Float64}, N::Int, i::Int, cnt::Int,
                                  s::Int, b::Int, n1::Float64, n1p::Float64,
@@ -967,20 +931,18 @@ end
         c1, uu = fp_unpack_coeff(x1, x2, idx, n1, n1p, n2, n2p, g, gp)
         sh = (s + j * b) & 63
         stage[j+1]  = c1 << sh
-        stage[j+9]  = (c1 >> 1) >> (63 - sh)
+        stage[j+9]  = (c1 >> 1) >> (63 - sh) # 64 - sh but dodging the expensive case cause cpus are dumb
         stage[j+17] = uu << sh
         stage[j+25] = (uu >> 1) >> (63 - sh)
     end
     return stage
 end
 
-# Fold cnt (<= 8) pre-shifted coefficients from the stage buffer (quarters
-# lo1|hi1|lo2|hi2) into both 128-bit windows, flushing a finished limb whenever
-# the bit offset s crosses 64.  The accumulate is spelled out in this one
-# @inline body rather than a per-coefficient helper on purpose — a per-lane
-# function boundary drops LLVM's adc carry chain (0 adc, ~60% slower).  At the
-# hot call site cnt = 8 is a literal, so the loop unrolls to the full 16-adc
-# chain; the cold head/tail pass a runtime cnt.
+# Fold cnt (<= 8) pre-shifted coefficients from the stage buffer into both
+# 128-bit windows, flushing a finished limb whenever s crosses 64.  Spelled out
+# inline rather than via a per-coefficient helper on purpose: a per-lane
+# function boundary drops LLVM's adc carry chain (~60% slower).  At the hot call
+# site cnt = 8 is a literal, so this unrolls to the full 16-adc chain.
 @inline function fp_emit_stage!(r::Memory{Limb}, ro::Int, s2::Memory{Limb}, outw::Int,
                                 a01::UInt64, a11::UInt64, a02::UInt64, a12::UInt64,
                                 s::Int, b::Int, stage::Vector{UInt64}, cnt::Int)
@@ -1009,38 +971,38 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          b::Int, n1::Float64, n1p::Float64, n2::Float64, n2p::Float64)
     N = length(x1)
     s2 = Memory{Limb}(undef, rn)
-    # SIMD→scalar staging: the scan reads lanes at a runtime index, and Vec
-    # lane extraction with a non-constant index compiles to a stack spill
-    # per access (measured ~30% slower than this explicit round-trip).
-    # One buffer, quarters: lo1 | hi1 | lo2 | hi2.
+    # SIMD→scalar staging buffer, quarters lo1 | hi1 | lo2 | hi2.  The scan
+    # reads lanes at a runtime index; Vec lane extraction with a non-constant
+    # index spills to the stack (~30% slower than this explicit round-trip).
     stage = Vector{UInt64}(undef, 32)
     g = Float64(invmod(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))) # p1^-1 mod p2 (Garner)
     gp = g / fp_prime(FP_CTX2) # twiddle
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
-    vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
+    vmask = V8(UInt64(2)^51 - 1)
     ub = UInt64(b)
-    vlane = SIMD.Vec{8,UInt64}(ntuple(k -> UInt64(k - 1) * ub, 8))
+    vlane = V8(ntuple(k -> UInt64(k - 1) * ub, 8))
     a01 = UInt64(0); a11 = UInt64(0)   # stream 1 window, low/high limb
     a02 = UInt64(0); a12 = UInt64(0)   # stream 2 window
     outw = 1
     s = 0             # bit offset of coefficient i within the window
-    # scalar head through coefficient 7: covers the (N-0) mod N = 0 wraparound
-    # so the vector loop's descending 8-loads stay contiguous
+    # scalar head through coefficient 7: covers the i = 0 wraparound so the
+    # vector loop's descending 8-loads stay contiguous
     i = min(8, nconv)
     fp_pack_scalar!(stage, x1, x2, N, 0, i, s, b, n1, n1p, n2, n2p, g, gp)
     outw, a01, a11, a02, a12, s =
         fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, i)
     @inbounds while i + 8 <= nconv
+        REV8 = (7, 6, 5, 4, 3, 2, 1, 0)
         v1 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x1, N - i - 6), Val(REV8)),
                        n1, n1p, FP_CTX1)
-        v1 = SIMD.vifelse(v1 < 0.0, v1 + fp_prime(FP_CTX1), v1)
+        v1 = SIMD.vifelse(v1 < 0, v1 + fp_prime(FP_CTX1), v1)
         v2 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x2, N - i - 6), Val(REV8)),
                        n2, n2p, FP_CTX2)
         u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
-        u = SIMD.vifelse(u < 0.0, u + fp_prime(FP_CTX2), u)
-        c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
-        uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
+        u = SIMD.vifelse(u < 0, u + fp_prime(FP_CTX2), u)
+        c1v = reinterpret(V8, v1 + FP_MAGIC) & vmask
+        uv = reinterpret(V8, u + FP_MAGIC) & vmask
         sv = (UInt64(i) * ub + vlane) & UInt64(63)
         svc = UInt64(63) - sv
         SIMD.vstore(c1v << sv, stage, 1)

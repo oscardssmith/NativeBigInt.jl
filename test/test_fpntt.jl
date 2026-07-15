@@ -51,7 +51,7 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
     # generator-derived roots of unity have exact order
     for logN in (1, 5, 20, 33)
         N = UInt64(2)^logN
-        ω = powermod(NativeBigInt.fp_generator(FP_CTX1), (FP_PI - 1) ÷ N, FP_PI)
+        ω = powermod(FP_CTX1.gen, (FP_PI - 1) ÷ N, FP_PI)
         @test powermod(ω, N, FP_PI) == 1
         @test powermod(ω, N >> 1, FP_PI) == FP_PI - 1
     end
@@ -148,7 +148,7 @@ end
 # --------------------------------------------------------------------------
 # Two-prime CRT engine
 
-using NativeBigInt: FP_CTX2, FP_P1INV2, mul_fpntt2!, sqr_fpntt2!,
+using NativeBigInt: FP_CTX2, mul_fpntt2!, sqr_fpntt2!,
                     fp_ntt_unpack2!, fp_ntt_params2, ntt_len, two_adicity
 
 const FP_PI2 = fp_prime(FP_CTX2)
@@ -176,7 +176,6 @@ end
     @test Float64(FP_PI2) == Float64(fp_prime(FP_CTX2))   # exactly representable
     @test FP_PI2 - 1 == UInt64(255) << 41
     @test (FP_PI2 - 1) % (UInt64(255) << 41) == 0    # 255·2^41 length family
-    @test UInt128(FP_P1INV2) * (FP_PI % FP_PI2) % FP_PI2 == 1   # Garner inverse
 
     rng = MersenneTwister(0x2b1)
     for N in (4, 8, 64, 512, 12, 20, 48, 240, 1536, 68, 204, 340, 1020)
