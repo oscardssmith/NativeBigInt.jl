@@ -103,9 +103,6 @@ function fp_generator(F::FpCtx)
     error("unreachable: GF(p) has a small generator")
 end
 
-const FP_P1INV2 =                                  # p1^-1 mod p2 (Garner)
-    invmod(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))
-
 # ---------------------------------------------------------------------------
 # Transform plan: N = m·2^k, m divides 255, 2^k | p - 1.
 # Twiddles are stored as (w, w/p) pairs so fp_mulmod's quotient estimate is a table load.
@@ -116,7 +113,7 @@ struct FpNttStage
     w3::Vector{Float64};  w3p::Vector{Float64}
 end
 
-function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int, P::Float64)
+function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int, P::UInt)
     q = L >> 2
     st = N2 ÷ L
     len = max(q, 8)
@@ -136,17 +133,15 @@ function build_fp_stage(table::Vector{Float64}, N2::Int, L::Int, P::Float64)
 end
 
 # Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a time
-function fp_twiddles(r::UInt64, n::Int, F::FpCtx)
-    p = fp_prime(F)
-    P = Float64(p)
+function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     np = cld(n, 8) << 3
     t = Vector{Float64}(undef, np)
-    r8 = powermod(r, 8, p)
-    vw, vwp = VF8(Float64(r8)), VF8(Float64(r8) / P)
-    v = VF8(ntuple(k -> Float64(powermod(r, k - 1, p)), 8))
+    r8 = powermod(r, 8, P)
+    r8p = r8 / P
+    v = VF8(ntuple(k -> powermod(r, k - 1, P), 8))
     @inbounds for j in 1:8:np
-        SIMD.vstore(SIMD.vifelse(v < VF8(0.0), v + VF8(P), v), t, j) # canonicalize to [0, p)
-        v = fp_mulmod(v, vw, vwp, F)
+        SIMD.vstore(SIMD.vifelse(v < 0.0, v + P, v), t, j) # canonicalize to [0, p)
+        v = fp_mulmod(v, r8, r8p, F)
     end
     resize!(t, n)
     return t
@@ -192,8 +187,8 @@ function fp_dft17_consts(c::UInt64, F::FpCtx)
     for r in 1:8, j in 1:8
         cjr = powermod(c, j * r % 17, p)
         cmjr = powermod(c, 17 - j * r % 17, p)
-        rot[(r-1)*16+j] = Float64(mulm((cjr + cmjr) % p, inv2))
-        rot[(r-1)*16+8+j] = Float64(mulm(subm(cjr, cmjr), inv2))
+        rot[(r-1)*16+j] = mulm((cjr + cmjr) % p, inv2)
+        rot[(r-1)*16+8+j] = mulm(subm(cjr, cmjr), inv2)
     end
     return rot
 end
@@ -215,15 +210,17 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
         end
         tw[r] = t
     end
-    return FpOddStage(m, span, Q, rot, rot ./ Float64(fp_prime(F)), tw, [t ./ Float64(fp_prime(F)) for t in tw])
+    return FpOddStage(m, span, Q, rot, rot ./ fp_prime(F), tw, [t ./ fp_prime(F) for t in tw])
 end
 
 struct FpNttPlan{C<:FpCtx}
     ctx::C
     N::Int
     N2::Int
-    ninv::Float64;  ninvp::Float64  # 1/N; applied in the unpack
-    wi::Float64;    wip::Float64    # i = ω2^(N2/4), the DFT4 combine's twiddle
+    ninv::Float64
+    ninvp::Float64  # 1/N; applied in the unpack
+    wi::Float64
+    wip::Float64    # i = ω2^(N2/4), the DFT4 combine's twiddle
     oddf::Vector{FpOddStage}
     fwd::Vector{FpNttStage}
 end
@@ -255,12 +252,12 @@ function build_fp_plan(N::Int, F::FpCtx)
     fwd = FpNttStage[]
     L = N2
     while L >= 4
-        push!(fwd, build_fp_stage(tw, N2, L, Float64(fp_prime(F))))
+        push!(fwd, build_fp_stage(tw, N2, L, fp_prime(F)))
         L >>= 2
     end
-    wi = N2 >= 4 ? Float64(powermod(r, N2 >> 2, fp_prime(F))) : 1.0
-    ninv = Float64(invmod(N % UInt64, fp_prime(F)))
-    return FpNttPlan(F, N, N2, ninv, ninv / Float64(fp_prime(F)), wi, wi / Float64(fp_prime(F)), oddf, fwd)
+    wi = N2 >= 4 ? powermod(r, N2 >> 2, fp_prime(F)) : 1
+    ninv = invmod(N % UInt64, fp_prime(F))
+    return FpNttPlan(F, N, N2, Float64(ninv), ninv / fp_prime(F), Float64(wi), wi / fp_prime(F), oddf, fwd)
 end
 
 mutable struct FpNttPlanCache
@@ -309,14 +306,13 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
     w1, w1p, w2, w2p = st.tw[1], st.twp[1], st.tw[2], st.twp[2]
     j = 0
     if Q >= 8
-        vω3, vω3p = VF8(ω3), VF8(ω3p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
             y0 = SIMD.vload(VF8, x, i0)
             y1 = SIMD.vload(VF8, x, i0 + Q)
             y2 = SIMD.vload(VF8, x, i0 + 2Q)
             if FWD
-                y0, y1, y2 = fp_dft3(y0, y1, y2, vω3, vω3p, F)
+                y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
             end
             y0 = fp_reduce(y0, F)
             y1 = fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
@@ -324,7 +320,7 @@ function fp_radix3!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             y2 = fp_mulmod(y2, SIMD.vload(VF8, w2, j + 1),
                            SIMD.vload(VF8, w2p, j + 1), F)
             if !FWD
-                y0, y1, y2 = fp_dft3(y0, y1, y2, vω3, vω3p, F)
+                y0, y1, y2 = fp_dft3(y0, y1, y2, ω3, ω3p, F)
             end
             SIMD.vstore(y0, x, i0)
             SIMD.vstore(y1, x, i0 + Q)
@@ -391,8 +387,6 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
     wp = st.twp
     j = 0
     if Q >= 8
-        v1, v2, v3, v4 = VF8(k1), VF8(k2), VF8(k3), VF8(k4)
-        v1p, v2p, v3p, v4p = VF8(k1p), VF8(k2p), VF8(k3p), VF8(k4p)
         @inbounds while j + 8 <= Q
             i0 = o + j + 1
             y0 = SIMD.vload(VF8, x, i0)
@@ -401,8 +395,8 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             y3 = SIMD.vload(VF8, x, i0 + 3Q)
             y4 = SIMD.vload(VF8, x, i0 + 4Q)
             if FWD
-                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, v1, v2, v3, v4,
-                                             v1p, v2p, v3p, v4p, F)
+                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
+                                             k1p, k2p, k3p, k4p, F)
             end
             y0 = fp_reduce(y0, F)
             y1 = fp_mulmod(y1, SIMD.vload(VF8, w[1], j + 1),
@@ -414,8 +408,8 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpOddStage, F::FpCtx,
             y4 = fp_mulmod(y4, SIMD.vload(VF8, w[4], j + 1),
                            SIMD.vload(VF8, wp[4], j + 1), F)
             if !FWD
-                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, v1, v2, v3, v4,
-                                             v1p, v2p, v3p, v4p, F)
+                y0, y1, y2, y3, y4 = fp_dft5(y0, y1, y2, y3, y4, k1, k2, k3, k4,
+                                             k1p, k2p, k3p, k4p, F)
                 y0 = fp_reduce(y0, F)
             end
             SIMD.vstore(y0, x, i0)
@@ -618,7 +612,7 @@ end
 end
 
 function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
-                    stg::FpNttStage, vwi::VF8, vwip::VF8, F::FpCtx,
+                    stg::FpNttStage, wi::Float64, wip::Float64, F::FpCtx,
                     ::Val{FWD}) where {Q,FWD}
     vw1 = SIMD.vload(VF8, stg.w1, 1); vw1p = SIMD.vload(VF8, stg.w1p, 1)
     vw2 = SIMD.vload(VF8, stg.w2, 1); vw2p = SIMD.vload(VF8, stg.w2p, 1)
@@ -630,14 +624,14 @@ function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
         v3 = SIMD.vload(VF8, x, i0 + 24)
         y0, y1, y2, y3 = ntt_gather4(Val(Q), v0, v1, v2, v3)
         if FWD
-            y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, vwi, vwip, F)
+            y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, wi, wip, F)
         end
         y0 = fp_reduce(y0, F)
         y1 = fp_mulmod(y1, vw1, vw1p, F)
         y2 = fp_mulmod(y2, vw2, vw2p, F)
         y3 = fp_mulmod(y3, vw3, vw3p, F)
         if !FWD
-            y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, vwi, vwip, F)
+            y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, wi, wip, F)
         end
         o0, o1, o2, o3 = ntt_scatter4(Val(Q), y0, y1, y2, y3)
         SIMD.vstore(o0, x, i0)
@@ -660,7 +654,6 @@ end
 function fp_pow2_stage!(x::Vector{Float64}, o::Int, N2::Int, stg::FpNttStage,
                         wi::Float64, wip::Float64, F::FpCtx,
                         ::Val{FWD}) where {FWD}
-    vwi, vwip = VF8(wi), VF8(wip)
     q = stg.q
     L = 4q
     if q >= 8
@@ -673,7 +666,7 @@ function fp_pow2_stage!(x::Vector{Float64}, o::Int, N2::Int, stg::FpNttStage,
                 y2 = SIMD.vload(VF8, x, i0 + 2q)
                 y3 = SIMD.vload(VF8, x, i0 + 3q)
                 if FWD
-                    y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, vwi, vwip, F)
+                    y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, wi, wip, F)
                 end
                 y0 = fp_reduce(y0, F)
                 y1 = fp_mulmod(y1, SIMD.vload(VF8, w1, j + 1),
@@ -683,7 +676,7 @@ function fp_pow2_stage!(x::Vector{Float64}, o::Int, N2::Int, stg::FpNttStage,
                 y3 = fp_mulmod(y3, SIMD.vload(VF8, w3, j + 1),
                                SIMD.vload(VF8, w3p, j + 1), F)
                 if !FWD
-                    y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, vwi, vwip, F)
+                    y0, y1, y2, y3 = fp_dft4(y0, y1, y2, y3, wi, wip, F)
                 end
                 SIMD.vstore(y0, x, i0)
                 SIMD.vstore(y1, x, i0 + q)
@@ -692,9 +685,9 @@ function fp_pow2_stage!(x::Vector{Float64}, o::Int, N2::Int, stg::FpNttStage,
             end
         end
     elseif N2 >= 32
-        q == 4 ? fp_smallq!(x, o, N2, Val(4), stg, vwi, vwip, F, Val(FWD)) :
-        q == 2 ? fp_smallq!(x, o, N2, Val(2), stg, vwi, vwip, F, Val(FWD)) :
-                 fp_smallq!(x, o, N2, Val(1), stg, vwi, vwip, F, Val(FWD))
+        q == 4 ? fp_smallq!(x, o, N2, Val(4), stg, wi, wip, F, Val(FWD)) :
+        q == 2 ? fp_smallq!(x, o, N2, Val(2), stg, wi, wip, F, Val(FWD)) :
+                 fp_smallq!(x, o, N2, Val(1), stg, wi, wip, F, Val(FWD))
     else
         w1, w1p, w2, w2p, w3, w3p = stg.w1, stg.w1p, stg.w2, stg.w2p, stg.w3, stg.w3p
         for s in o:L:o+N2-1
@@ -848,7 +841,7 @@ function fp_ntt_pack!(x::Vector{Float64}, limbs::Memory{Limb}, lo::Int, n::Int,
         w = bit >> 6
         sh = bit & 63
         c = (limbs[lo+w+1] >>> sh) | (limbs[lo+w+2] << (64 - sh))
-        x[i+1] = Float64(c & mask)
+        x[i+1] = c & mask
     end
     @inbounds for i in imax+1:nch-1
         bit = i * b
@@ -858,7 +851,7 @@ function fp_ntt_pack!(x::Vector{Float64}, limbs::Memory{Limb}, lo::Int, n::Int,
         if sh + b > 64 && w + 2 <= n
             c |= limbs[lo+w+2] << (64 - sh)
         end
-        x[i+1] = Float64(c & mask)
+        x[i+1] = c & mask
     end
     fill!(view(x, nch+1:N), 0.0)
     return x
@@ -942,6 +935,75 @@ end
 # S1 + p1·S2 equals the true product < 2^(64·rn), so addmul_1! carries out 0.
 const REV8 = (7, 6, 5, 4, 3, 2, 1, 0)
 
+# One scalar coefficient: undo the 1/N scale on each residue and Garner-combine
+# into the mod-p1 limb c1 and the correction uu (both canonical UInt64).
+@inline function fp_unpack_coeff(x1::Vector{Float64}, x2::Vector{Float64}, idx::Int,
+                                 n1::Float64, n1p::Float64, n2::Float64, n2p::Float64,
+                                 g::Float64, gp::Float64)
+    v1 = fp_mulmod(x1[idx], n1, n1p, FP_CTX1)
+    v1 = ifelse(v1 < 0.0, v1 + fp_prime(FP_CTX1), v1)
+    v2 = fp_mulmod(x2[idx], n2, n2p, FP_CTX2)
+    u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
+    c1 = unsafe_trunc(UInt64, v1)
+    uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + fp_prime(FP_CTX2), u))
+    return c1, uu
+end
+
+# Scalar-pack cnt (<= 8) coefficients starting at coefficient i into the stage
+# buffer (quarters lo1|hi1|lo2|hi2), shifting lane j by (s + j·b) & 63 — the bit
+# offset the accumulate reaches for that coefficient, since flushes only drop s
+# by 64.  Coefficient 0 wraps to x1[1]; the rest read descending x1[N-·+1].
+# The vector loop packs the same layout directly with SIMD; this is the scalar
+# fallback for the < 8-wide head and tail.  @noinline keeps its fp_mulmod
+# chains out of fp_ntt_unpack2!'s hot loop, whose carry-chain codegen degrades
+# when the whole function is bloated (adc recognition drops).
+@noinline function fp_pack_scalar!(stage::Vector{UInt64}, x1::Vector{Float64},
+                                 x2::Vector{Float64}, N::Int, i::Int, cnt::Int,
+                                 s::Int, b::Int, n1::Float64, n1p::Float64,
+                                 n2::Float64, n2p::Float64, g::Float64, gp::Float64)
+    @inbounds for j in 0:cnt-1
+        c = i + j
+        idx = c == 0 ? 1 : N - c + 1
+        c1, uu = fp_unpack_coeff(x1, x2, idx, n1, n1p, n2, n2p, g, gp)
+        sh = (s + j * b) & 63
+        stage[j+1]  = c1 << sh
+        stage[j+9]  = (c1 >> 1) >> (63 - sh)
+        stage[j+17] = uu << sh
+        stage[j+25] = (uu >> 1) >> (63 - sh)
+    end
+    return stage
+end
+
+# Fold cnt (<= 8) pre-shifted coefficients from the stage buffer (quarters
+# lo1|hi1|lo2|hi2) into both 128-bit windows, flushing a finished limb whenever
+# the bit offset s crosses 64.  The accumulate is spelled out in this one
+# @inline body rather than a per-coefficient helper on purpose — a per-lane
+# function boundary drops LLVM's adc carry chain (0 adc, ~60% slower).  At the
+# hot call site cnt = 8 is a literal, so the loop unrolls to the full 16-adc
+# chain; the cold head/tail pass a runtime cnt.
+@inline function fp_emit_stage!(r::Memory{Limb}, ro::Int, s2::Memory{Limb}, outw::Int,
+                                a01::UInt64, a11::UInt64, a02::UInt64, a12::UInt64,
+                                s::Int, b::Int, stage::Vector{UInt64}, cnt::Int)
+    @inbounds for j in 1:cnt
+        if s >= 64
+            r[ro+outw] = a01
+            s2[outw] = a02
+            a01 = a11; a11 = UInt64(0)
+            a02 = a12; a12 = UInt64(0)
+            outw += 1
+            s -= 64
+        end
+        t1 = a01 + stage[j]
+        a11 += stage[j+8] + (t1 < a01)
+        a01 = t1
+        t2 = a02 + stage[j+16]
+        a12 += stage[j+24] + (t2 < a02)
+        a02 = t2
+        s += b
+    end
+    return outw, a01, a11, a02, a12, s
+end
+
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          x1::Vector{Float64}, x2::Vector{Float64}, nconv::Int,
                          b::Int, n1::Float64, n1p::Float64, n2::Float64, n2p::Float64)
@@ -952,11 +1014,8 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     # per access (measured ~30% slower than this explicit round-trip).
     # One buffer, quarters: lo1 | hi1 | lo2 | hi2.
     stage = Vector{UInt64}(undef, 32)
-    g = Float64(FP_P1INV2)          # the Garner inverse as an fp_mulmod
-    gp = g / Float64(fp_prime(FP_CTX2))              # twiddle; const-folds to literals
-    vg, vgp = VF8(g), VF8(gp)
-    vn1, vn1p = VF8(n1), VF8(n1p)
-    vn2, vn2p = VF8(n2), VF8(n2p)
+    g = Float64(invmod(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))) # p1^-1 mod p2 (Garner)
+    gp = g / fp_prime(FP_CTX2) # twiddle
     # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
     # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
     vmask = SIMD.Vec{8,UInt64}(UInt64(2)^51 - 1)
@@ -966,42 +1025,20 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     a02 = UInt64(0); a12 = UInt64(0)   # stream 2 window
     outw = 1
     s = 0             # bit offset of coefficient i within the window
-    i = 0
     # scalar head through coefficient 7: covers the (N-0) mod N = 0 wraparound
     # so the vector loop's descending 8-loads stay contiguous
-    @inbounds while i < min(8, nconv)
-        idx = i == 0 ? 1 : N - i + 1
-        v1 = fp_mulmod(x1[idx], n1, n1p, FP_CTX1)
-        v1 = ifelse(v1 < 0.0, v1 + Float64(fp_prime(FP_CTX1)), v1)
-        v2 = fp_mulmod(x2[idx], n2, n2p, FP_CTX2)
-        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
-        c1 = unsafe_trunc(UInt64, v1)
-        uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + Float64(fp_prime(FP_CTX2)), u))
-        if s >= 64
-            r[ro+outw] = a01
-            s2[outw] = a02
-            a01 = a11; a11 = UInt64(0)
-            a02 = a12; a12 = UInt64(0)
-            outw += 1
-            s -= 64
-        end
-        t1 = a01 + (c1 << s)
-        a11 += ((c1 >> 1) >> (63 - s)) + (t1 < a01)
-        a01 = t1
-        t2 = a02 + (uu << s)
-        a12 += ((uu >> 1) >> (63 - s)) + (t2 < a02)
-        a02 = t2
-        s += b
-        i += 1
-    end
+    i = min(8, nconv)
+    fp_pack_scalar!(stage, x1, x2, N, 0, i, s, b, n1, n1p, n2, n2p, g, gp)
+    outw, a01, a11, a02, a12, s =
+        fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, i)
     @inbounds while i + 8 <= nconv
         v1 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x1, N - i - 6), Val(REV8)),
-                       vn1, vn1p, FP_CTX1)
-        v1 = SIMD.vifelse(v1 < 0.0, v1 + Float64(fp_prime(FP_CTX1)), v1)
+                       n1, n1p, FP_CTX1)
+        v1 = SIMD.vifelse(v1 < 0.0, v1 + fp_prime(FP_CTX1), v1)
         v2 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x2, N - i - 6), Val(REV8)),
-                       vn2, vn2p, FP_CTX2)
-        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), vg, vgp, FP_CTX2)
-        u = SIMD.vifelse(u < 0.0, u + Float64(fp_prime(FP_CTX2)), u)
+                       n2, n2p, FP_CTX2)
+        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
+        u = SIMD.vifelse(u < 0.0, u + fp_prime(FP_CTX2), u)
         c1v = reinterpret(SIMD.Vec{8,UInt64}, v1 + FP_MAGIC) & vmask
         uv = reinterpret(SIMD.Vec{8,UInt64}, u + FP_MAGIC) & vmask
         sv = (UInt64(i) * ub + vlane) & UInt64(63)
@@ -1010,50 +1047,15 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
         SIMD.vstore((c1v >> 1) >> svc, stage, 9)
         SIMD.vstore(uv << sv, stage, 17)
         SIMD.vstore((uv >> 1) >> svc, stage, 25)
-        for j in 1:8
-            if s >= 64
-                r[ro+outw] = a01
-                s2[outw] = a02
-                a01 = a11; a11 = UInt64(0)
-                a02 = a12; a12 = UInt64(0)
-                outw += 1
-                s -= 64
-            end
-            t1 = a01 + stage[j]
-            a11 += stage[j+8] + (t1 < a01)
-            a01 = t1
-            t2 = a02 + stage[j+16]
-            a12 += stage[j+24] + (t2 < a02)
-            a02 = t2
-            s += b
-        end
+        outw, a01, a11, a02, a12, s =
+            fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, 8)
         i += 8
     end
-    @inbounds while i < nconv
-        idx = N - i + 1
-        v1 = fp_mulmod(x1[idx], n1, n1p, FP_CTX1)
-        v1 = ifelse(v1 < 0.0, v1 + Float64(fp_prime(FP_CTX1)), v1)
-        v2 = fp_mulmod(x2[idx], n2, n2p, FP_CTX2)
-        u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
-        c1 = unsafe_trunc(UInt64, v1)
-        uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + Float64(fp_prime(FP_CTX2)), u))
-        if s >= 64
-            r[ro+outw] = a01
-            s2[outw] = a02
-            a01 = a11; a11 = UInt64(0)
-            a02 = a12; a12 = UInt64(0)
-            outw += 1
-            s -= 64
-        end
-        t1 = a01 + (c1 << s)
-        a11 += ((c1 >> 1) >> (63 - s)) + (t1 < a01)
-        a01 = t1
-        t2 = a02 + (uu << s)
-        a12 += ((uu >> 1) >> (63 - s)) + (t2 < a02)
-        a02 = t2
-        s += b
-        i += 1
-    end
+    # scalar tail: the final nconv mod 8 coefficients
+    tail = nconv - i
+    fp_pack_scalar!(stage, x1, x2, N, i, tail, s, b, n1, n1p, n2, n2p, g, gp)
+    outw, a01, a11, a02, a12, s =
+        fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, tail)
     @inbounds while outw <= rn
         r[ro+outw] = a01
         s2[outw] = a02
