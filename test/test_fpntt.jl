@@ -4,8 +4,8 @@
 # tests hammer the documented lazy-range bounds (mulmod |x| <= 4p, reduce
 # |x| <= 8p) where random in-range inputs would never stress the
 # magic-constant round.
-using NativeBigInt: FP_CTX1, FpCtx, fp_prime, fp_mulmod, fp_mulmod2,
-                    fp_reduce, fp_round, fp_ntt_plan,
+using NativeBigInt: FP_CTX1, FpCtx, fp_prime, fp_mulmod,
+                    fp_reduce, fp_ntt_plan,
                     fp_ntt_fwd!, fp_ntt_rev!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
@@ -39,7 +39,7 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
     end
     for x in xs, y in xs
         abs(x) <= 2FP_P && abs(y) <= 2FP_P || continue
-        r = fp_mulmod2(x, y, FP_CTX1)
+        r = fp_mulmod(x, y, FP_CTX1)
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(big(Int128(x)) * big(Int128(y)), P)
     end
@@ -95,7 +95,7 @@ end
         end
         fa, fb = Float64.(a), Float64.(b)
         fp_ntt_fwd!(fa, plan); fp_ntt_fwd!(fb, plan)
-        fc = fp_mulmod2.(fa, fb, Ref(FP_CTX1))
+        fc = fp_mulmod.(fa, fb, Ref(FP_CTX1))
         fp_ntt_rev!(fc, plan)
         # recover c[j] = ninv · rev(Ĉ)[(N-j) mod N], as the unpack does
         got = [big(fp_canon(fp_mulmod(fc[mod(N - j, N)+1], plan.ninv, plan.ninvp,
