@@ -19,9 +19,9 @@ const SQR_KARATSUBA_THRESHOLD = 52
 # linear overhead ever favored single-prime), so dispatch is fp2-only.
 # For unbalanced operands the NTT needs the smaller one substantial (the
 # chunked Karatsuba path is ~max·min^0.585 while the NTT pays for the
-# combined length); at min = 96 the admitted region wins throughout
-# (worst ~0.92 just past a transform-length step).
-const MUL_FPNTT_MIN = 96         # smaller operand at least this many limbs
+# combined length); at min = 64 the admitted region wins throughout
+# (0.74-0.91 at n = 64 across m = 512..8192; n = 48 still loses 1.02-1.21).
+const MUL_FPNTT_MIN = 64         # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 160  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 176  # operand at least this many limbs
 
