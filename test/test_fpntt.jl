@@ -207,12 +207,13 @@ end
     maxk = min(two_adicity(FP_CTX1), two_adicity(FP_CTX2))
     @test maxk == 34                                  # p1's 2-adicity is the binding cap
 
-    # brute-force reference: smallest m·2^k >= T over the family, honoring
-    # the uniform k >= 14 floor for the expensive composite odd multipliers
+    # brute-force reference: smallest m·2^k >= T over the T-tiered family
     function want(T)
+        ms = T <= 1 << 14 ? (1, 3, 5, 9) :
+             T <= 1 << 20 ? (1, 3, 5, 7, 9, 15, 21, 105) :
+                            (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315)
         best = typemax(Int)
-        for m in (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315), k in 2:maxk
-            k >= NativeBigInt.ntt_m_floor(m) || continue
+        for m in ms, k in 2:maxk
             c = m << k
             c >= T && c < best && (best = c)
         end
@@ -231,13 +232,12 @@ end
         @test (fp_prime(FP_CTX1) - 1) % n == 0
         @test (fp_prime(FP_CTX2) - 1) % n == 0
     end
-    # floor boundary: 15·2^14 is the first admitted m = 15 length;
-    # at k = 13 the pow2/small-odd family is chosen instead
+    # tier boundaries: composite multipliers only join above 2^14 points
     @test ntt_len(15 << 14, ctxs...) == 15 << 14
-    @test ntt_len(15 << 13, ctxs...) == 1 << 17      # 15·2^13 is below the floor
-    @test ntt_len(7 << 10, ctxs...) == 1 << 13       # 7·2^10 is below m = 7's floor
-    @test ntt_len(7 << 14, ctxs...) == 7 << 14       # first admitted m = 7 length
-    @test ntt_len(9 << 10, ctxs...) == 9 << 10       # m = 9 has no floor
+    @test ntt_len(15 << 13, ctxs...) == 15 << 13     # mid tier admits m = 15
+    @test ntt_len(7 << 10, ctxs...) == 1 << 13       # small tier: no m = 7
+    @test ntt_len(7 << 14, ctxs...) == 7 << 14
+    @test ntt_len(9 << 10, ctxs...) == 9 << 10       # m = 9 is in every tier
 
     # just past a pure 2^34: must fall back to an odd multiplier, never
     # exceed the primes' shared 2-adicity

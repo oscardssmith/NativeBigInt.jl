@@ -925,25 +925,23 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
 end
 
 # pick min m·2^k >= T
-# For small T, pick m only in (1, 3, 5, 9) since bigger nums are slower than extra length.
-# The other m carry per-m floors (ntt_m_floor), bench-placed via the radix
-# family plus end-to-end mul A/Bs: 7/15/21/105 join at k >= 14, where the
-# radix 2 tower exceeds cache and their tighter padding starts paying
-# (7·2^14 measured +3% vs the pow2 at 36k limbs but -2% at 300 limbs);
-# 35/45/63/315 bench slower than a same-coverage cheaper neighbor until
-# deep in the DRAM-bound regime (per-point premiums collapse to ~1.0 at
-# >= ~2^24 points, where the smallest N wins outright), so they join at
-# k >= 20.
+# The admissible multipliers come in T-size tiers
+# When the FFT fits in L1/L2 only very fast transforms are worthwhile
+# In L3, we are memory bound, but doing multiple slow transforms to save <1% isn't worth it.
 # A pure 2^k tops out at 2^34 (~37 GB operands) since 2^k must divide all p-1.
 # The odd multipliers then extend reach to 315·2^34 (~12 TB).
-ntt_m_floor(m) = m <= 5 || m == 9 ? 2 : m in (7, 15, 21, 105) ? 14 : 20
-function ntt_len(T::Int, ctxs::FpCtx...)
+const NTT_MS_SMALL = [1, 3, 5, 9]
+const NTT_MS_MID   = [1, 3, 5, 7, 9, 15, 21, 105]
+const NTT_MS_LARGE = [1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315]
+function ntt_len(T::Int, ctxs::Vararg{FpCtx,N}) where {N}
     maxk = minimum(two_adicity(F) for F in ctxs)
     best = typemax(Int)
-    for m in (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315)
+    ms = T <= 1 << 14 ? NTT_MS_SMALL : # L1/L2
+         T <= 1 << 20 ? NTT_MS_MID :   # L3
+                        NTT_MS_LARGE   # RAM
+    for m in ms
         k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
         k <= maxk || continue                         # 2^k must divide p-1
-        k >= ntt_m_floor(m) || continue               # per-multiplier floor
         c = m << k
         c < best && (best = c)
     end
@@ -954,15 +952,24 @@ end
 
 # Chunk width and transform length against the CRT modulus prod(primes).
 # The bound min(nca,ncb)·(2^b-1)^2 < prod(primes) is checked in division form:
-# the product overflows UInt128 at large b with large operands
-# and the descending search visits large b first regardless of operand size.
-# Start search at the largest b<primes, so one pack serves both residues
-function fp_ntt_params(bits_a::Int, bits_b::Int, ctxs::FpCtx...)
-    primes = fp_prime.(ctxs)
-    for b in Base.top_set_bit(minimum(primes))-1:-1:1
+# the product overflows UInt128 at large b with large operands.  b must stay
+# below every prime so one pack serves both residues, and the search descends
+# from an upper estimate of the answer — (2^b-1)² <= pp/min_nc caps b at
+# (L_pp - L_nc + 3)/2, using the fewest-chunks (b = maxb) lower bound for
+# min_nc — so it settles within a couple of UInt128 divides.  (This runs per
+# multiplication and was ~40% of a 224-limb mul when the loop rebuilt the
+# UInt128 product, allocating, every iteration.)
+# Vararg{FpCtx,N} (not FpCtx...) forces specialization on the concrete ctx
+# types: the unspecialized form dynamic-dispatches every fp_prime call.
+function fp_ntt_params(bits_a::Int, bits_b::Int, ctxs::Vararg{FpCtx,N}) where {N}
+    pp = prod(UInt128 ∘ fp_prime, ctxs) - 1
+    maxb = Base.top_set_bit(minimum(fp_prime.(ctxs))) - 1
+    nclow = Base.top_set_bit(cld(min(bits_a, bits_b), maxb))
+    bstart = min(maxb, (Base.top_set_bit(pp) - nclow + 3) >> 1)
+    for b in bstart:-1:1
         nca = cld(bits_a, b)
         ncb = cld(bits_b, b)
-        if min(nca, ncb) <= (prod(UInt128.(primes)) - 1) ÷ UInt128(2^b - 1)^2
+        if min(nca, ncb) <= pp ÷ UInt128(2^b - 1)^2
             return b, ntt_len(nca + ncb - 1, ctxs...)
         end
     end

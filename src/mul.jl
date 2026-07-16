@@ -22,8 +22,8 @@ const SQR_KARATSUBA_THRESHOLD = 52
 # combined length); at min = 96 the admitted region wins throughout
 # (worst ~0.92 just past a transform-length step).
 const MUL_FPNTT_MIN = 96         # smaller operand at least this many limbs
-const MUL_FPNTT_THRESHOLD = 224  # average operand at least this many limbs
-const SQR_FPNTT_THRESHOLD = 224  # operand at least this many limbs
+const MUL_FPNTT_THRESHOLD = 160  # average operand at least this many limbs
+const SQR_FPNTT_THRESHOLD = 176  # operand at least this many limbs
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
