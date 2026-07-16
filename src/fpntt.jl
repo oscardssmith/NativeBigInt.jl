@@ -1,8 +1,8 @@
 # Floating-point NTT multiplication following FLINT's fft_small design:
 # coefficients live in Float64, products use the FMA error-free transform,
 # and quotients use the magic-constant round.  The operands are split into
-# b-bit chunks and the convolution is computed by CRT over two ~2^49 primes
-# (working modulus p1·p2 ≈ 2^98.97, so b ≈ 41-44).
+# b-bit chunks and the convolution is computed by CRT over two just-under-2^50
+# primes (working modulus p1·p2 ≈ 2^99.99, so b ≈ 42-45).
 #
 # Arithmetic model.  Values are exact integers in balanced representation,
 # |x| < a few p.  Every operation is exactly correct (not approximately):
@@ -12,12 +12,10 @@
 #     within (1/2 + |x·w|·2^-52/p) of x·w/p, and r = x·w - q·p is an
 #     integer small enough to be exact through the final fma and add.
 #   - fp_round(v) = (v + 1.5·2^52) - 1.5·2^52 rounds exactly to the nearest
-#     integer for |v| <= 2^51.  p < 2^49 makes every quotient in the engine
-#     fit: mulmod products never exceed 4p² < 2^51·p, and fp_reduce
-#     quotients are at most ~5.
+#     integer for |v| <= 2^51.
 #
-# A transform of length N = m·2^k (m | 255, 2^k | p - 1) is a flat list of
-# uniform FpNttStage passes — the odd radices (17/5/3) first, then the
+# A transform of length N = m·2^k (m | 15, 2^k | p - 1) is a flat list of
+# uniform FpNttStage passes — the odd radices (5/3) first, then the
 # radix-4 tower, plus a twiddle-free radix-2 pass when k is odd.  The reverse
 # transform (fp_ntt_rev!) runs the same stages in reverse order; each stage's
 # transpose reuses its forward tables (the DFT matrices are symmetric), so
@@ -25,14 +23,20 @@
 # pointwise product it returns N·c[(N-t) mod N] in natural order; the unpack
 # reads descending and folds in the 1/N.
 #
-# Lazy bounds.  One fp_reduce per butterfly closes the per-stage ranges (the
-# ω^0 lane, which skips the twiddle mulmod, is reduced explicitly — see the
-# butterfly comments for the per-radix numbers).  The global invariant is that
-# forward values converge to <= ~0.9p and reverse to <= ~3.5p, so every mulmod
-# product stays <= 4p² and every intermediate sum stays far below 2^53.  The
-# differential and adversarial max-magnitude tests validate this empirically.
+# Lazy bounds, at p < 2^50 (write κ = p·2^-52 <= 1/4; a constant mulmod on
+# |x| <= c·p returns <= p(1/2 + c·κ/2) since all stored tables are minimal
+# balanced, |w| <= p/2).  One fp_reduce per butterfly closes the per-stage
+# ranges (the ω^0 lane, which skips the twiddle mulmod, is reduced explicitly
+# — see the butterfly comments for the per-radix numbers).  The global
+# invariant: forward values converge to <= ~1.0p (so pointwise products stay
+# <= p², round argument <= p), reverse raw stores to <= ~3.3p, every constant
+# mulmod's round argument to <= (4p)·(p/2)/p = 2p < 2^51, and every
+# intermediate sum to <= ~4.2p < 2^53/p = 8p.  The minimal-balance clamp on
+# the tables is load-bearing: float-generated constants drift to ~0.8p, and
+# 3.6p·0.8p breaks the 2^51·p round domain.  The differential and adversarial
+# max-magnitude tests validate the ranges empirically.
 #
-# All bounds hold for any prime p < 2^49, so the engine is parametrized by an
+# All bounds hold for any prime p < 2^50, so the engine is parametrized by an
 # FpCtx carrying the per-prime constants and both residue transforms run
 # through the same code.
 #
@@ -52,14 +56,14 @@ end
 
 # prime to do a NTT over, the factorization of P-1 as (prime => exponent) pairs,
 # and a primitive root of GF(P).  The constructor checks facs is the complete
-# factorization of P-1 and supplies the 2/3/5/17 radices, so every valid N | P-1
+# factorization of P-1 and supplies the 2/3/5 radices, so every valid N | P-1
 # has a primitive Nth root — build_fp_plan trusts gen without rechecking order.
 struct FpCtx{P}
     facs::Tuple{Vararg{Pair{Int,Int}}}
     gen::UInt64
     function FpCtx{P}(facs::Tuple{Vararg{Pair{Int,Int}}}) where {P}
         @assert prod(q^e for (q, e) in facs) == P - 1
-        @assert all(in(map(first, facs)), (2, 3, 5, 17))
+        @assert all(in(map(first, facs)), (2, 3, 5))
         new{P}(sort(facs), fp_generator(UInt64(P), facs))
     end
 end
@@ -67,10 +71,10 @@ end
 # 2-adicity of p-1: the exponent of the (2 => k) pair.
 @inline two_adicity(F::FpCtx) = F.facs[1].second
 
-# Both primes < 2^49 (rounding bounds above)
-# Of form 2^n*(2^(49-n)-1) since that allows radix 2^n and radix, 3, 5, 17 transforms
-const FP_CTX1 = FpCtx{2^33 * (2^16-1) + 1}((2 => 33, 3 => 1, 5 => 1, 17 => 1, 257 => 1))
-const FP_CTX2 = FpCtx{2^41 * (2^8 -1) + 1}((2 => 41, 3 => 1, 5 => 1, 17 => 1))
+# Both primes just under 2^50 (rounding bounds above), maximizing the CRT
+# modulus p1·p2, with 15·2^k | p-1 for the radix 2^k and radix 3, 5 transforms
+const FP_CTX1 = FpCtx{16335 * 2^36 + 1}((2 => 36, 3 => 3, 5 => 1, 11 => 2))
+const FP_CTX2 = FpCtx{4095 * 2^38 + 1}((2 => 38, 3 => 2, 5 => 1, 7 => 1, 13 => 1))
 
 # magic rounding constant. FP_MAGIC + x - FP_MAGIC rounds x to Int.
 const FP_MAGIC = 1.5*2^52 
@@ -86,7 +90,7 @@ const FP_MAGIC = 1.5*2^52
 end
 
 # r ≡ x·w (mod p) in balanced form, for exact-integer operands with
-# |x·w| <= 4p² (< 2^51·p for p < 2^49, so fp_round's quotient stays in range);
+# |x·w| <= 2^51·p (so fp_round's quotient stays in range);
 # then |r| <= p(1/2 + |x·w|·2^-52/p) < p.
 # Split the product into high part h and the exact FMA error l = x·w - h:
 # when |x·w| >= 2^53 both are integers and r = x·w - q·p is an exact small integer
@@ -105,40 +109,34 @@ end
     return fma(q, -P, h) + l
 end
 
+# Exact minimal balanced form |x| <= p/2 of a balanced integer |x| < ~p:
+# the ±p shift is exact (integers below 2^53).  Stored constants must be
+# minimal, not just balanced: the reverse transform feeds raw values up to
+# ~3.6p into constant mulmods, and the fp_round domain |x·w| <= 2^51·p only
+# holds at p -> 2^50 when |w| <= p/2.
+@inline fp_minbal(x, ::FpCtx{P}) where {P} =
+    ifelse(x > P / 2, x - P, ifelse(x < -P / 2, x + P, x))
+@inline fp_minbal(x::VF8, ::FpCtx{P}) where {P} =
+    SIMD.vifelse(x > P / 2, x - P, SIMD.vifelse(x < -P / 2, x + P, x))
+
 # Winograd 5-point constants from a primitive 5th root c.
 # With a = c + c^4, b = c^2 + c^3 (a + b = -1, the roots sum to zero):
 # k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
 # all balanced residues mod p (see fp_dft5 for the combine they feed).
 function fp_dft5_consts(c::UInt64, F::FpCtx)
     inv2 = Float64(invmod(UInt64(2), fp_prime(F)))
-    c1 = Float64(c)
+    c1 = fp_reduce(Float64(c), F)
     c2 = fp_mulmod(c1, c1, F); c3 = fp_mulmod(c2, c1, F); c4 = fp_mulmod(c3, c1, F)
     inv4 = fp_mulmod(inv2, inv2, F)
-    return Float64[-inv4, fp_mulmod((c1 + c4) - (c2 + c3), inv4, F),
-                   fp_mulmod(c1 - c4, inv2, F), fp_mulmod(c2 - c3, inv2, F)]
+    return Float64[fp_minbal(-inv4, F),
+                   fp_minbal(fp_mulmod((c1 + c4) - (c2 + c3), inv4, F), F),
+                   fp_minbal(fp_mulmod(c1 - c4, inv2, F), F),
+                   fp_minbal(fp_mulmod(c2 - c3, inv2, F), F)]
 end
 
-# Symmetric-pair constants for the 17-point DFT (see fp_dft17_uv).
-# Pairing x_j with x_{17-j} and y_r with y_{17-r} (c^{j(17-r)} = c^{-jr})
-# turns the 16x16 DFT matrix into 8x8 quadrants of half-sums/half-differences
-# A_{jr} = (c^{jr} + c^{-jr})/2,  B_{jr} = (c^{jr} - c^{-jr})/2,
-# stored row-major by r: A_{jr} at (r-1)·16 + j, B_{jr} at (r-1)·16 + 8 + j,
-# so each output pair reads 16 contiguous constants.
-function fp_dft17_consts(c::UInt64, F::FpCtx)
-    p = fp_prime(F)
-    inv2 = Float64(invmod(UInt64(2), p))
-    rot = Vector{Float64}(undef, 128)
-    for r in 1:8, j in 1:8
-        cjr = Float64(powermod(c, j * r % 17, p))
-        cmjr = Float64(powermod(c, 17 - j * r % 17, p))
-        rot[(r-1)*16+j] = fp_mulmod(cjr + cmjr, inv2, F)
-        rot[(r-1)*16+8+j] = fp_mulmod(cjr - cmjr, inv2, F)
-    end
-    return rot
-end
-
-# Balanced (|w| <= ~p/2) Float64 powers r^0, r^1, ..., r^(n-1) mod p,
-# generated 8 lanes at a time
+# Minimal balanced (|w| <= p/2) Float64 powers r^0, r^1, ..., r^(n-1) mod p,
+# generated 8 lanes at a time; the per-step fp_minbal keeps the chain minimal
+# (raw mulmod output drifts to ~0.57p).
 function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     np = cld(n, 8) << 3
     t = Vector{Float64}(undef, np)
@@ -146,6 +144,7 @@ function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     r8p = r8 / P
     v = fp_reduce(VF8(ntuple(k -> Float64(powermod(r, k - 1, P)), 8)), F)
     @inbounds for j in 1:8:np
+        v = fp_minbal(v, F)
         SIMD.vstore(v, t, j)
         v = fp_mulmod(v, r8, r8p, F)
     end
@@ -153,7 +152,7 @@ function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     return t
 end
 
-# Transform plan: N = m·2^k, m divides 255, 2^k | p - 1.
+# Transform plan: N = m·2^k, m divides 15, 2^k | p - 1.
 # rot holds the DFT combine constants 
 # tw holds the m-1 per-residue twiddle tables. All constant multiplies go through fp_mulmod.
 # span is the block size the stage processes at each offset.
@@ -183,7 +182,6 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
     c = powermod(root, Q, fp_prime(F))
     rot = m == 5 ? fp_dft5_consts(c, F) :
-          m == 17 ? fp_dft17_consts(c, F) :
           Float64[fp_reduce(Float64(powermod(c, r, fp_prime(F))), F) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
@@ -205,18 +203,18 @@ end
 function build_fp_plan(N::Int, F::FpCtx)
     k = trailing_zeros(N)
     m = N >> k
-    # N = m·2^k with odd part m | 255 (radix 3/5/17 stages) and 2^k | P-1; with a
+    # N = m·2^k with odd part m | 15 (radix 3/5 stages) and 2^k | P-1; with a
     # validated FpCtx this is the full precondition, and ω is a primitive Nth root.
-    @assert m in (1, 3, 5, 15, 17, 51, 85, 255) && (m == 1 || k >= 2) && k <= two_adicity(F)
+    @assert m in (1, 3, 5, 15) && (m == 1 || k >= 2) && k <= two_adicity(F)
     ω = powermod(F.gen, (fp_prime(F) - 1) ÷ N, fp_prime(F))
 
     stages = FpNttStage[]
     span = N
     r = ω
-    # peel the arithmetic-heaviest radix first: it lands at span == N, where the
-    # twiddle table is largest and least reused, so its dense mulmods overlap the
-    # memory traffic the cheaper radices can't hide (matters for m in 51/85/255).
-    for mf in (17, 5, 3)
+    # peel the arithmetic-heavier radix first: it lands at span == N, where the
+    # twiddle table is largest and least reused, so its denser mulmods overlap
+    # the memory traffic the cheaper radix can't hide.
+    for mf in (5, 3)
         if m % mf == 0
             push!(stages, build_fp_odd(mf, span, r, F))
             r = powermod(r, mf, fp_prime(F))
@@ -231,8 +229,8 @@ function build_fp_plan(N::Int, F::FpCtx)
         push!(stages, build_fp_4(tw, span, L, wi))
         L >>= 2
     end
-    ninv = invmod(N % UInt64, fp_prime(F))
-    return FpNttPlan(F, N, span, Float64(ninv), ninv / fp_prime(F), stages)
+    ninv = fp_reduce(Float64(invmod(N % UInt64, fp_prime(F))), F)
+    return FpNttPlan(F, N, span, ninv, ninv / fp_prime(F), stages)
 end
 
 mutable struct FpNttPlanCache
@@ -258,11 +256,9 @@ function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
 end
 
 # ---------------------------------------------------------------------------
-# Odd-radix stages: Winograd radix-3 and radix-5, symmetric-pair radix-17.
-# A stage is twiddle+reduce with the combine before it (forward) or after it (reverse).
-# Radix-3 and radix-5 share that twiddle+reduce block.
-# radix-17 instead interleaves its twiddles into the per-pair r-loop because
-# a shared block would keep all 17 lanes live at once.
+# Odd-radix stages: Winograd radix-3 and radix-5.
+# A stage is twiddle+reduce with the combine before it (forward) or after it
+# (reverse); radix-3 and radix-5 share that twiddle+reduce block.
 
 # Raw Winograd 3-point combine (u = ω3·(b - c) folds the matrix into one
 # mulmod). Every output, including ω^0, comes back unreduced: the forward
@@ -330,11 +326,11 @@ end
 #   (y2+y3)/2 = r - q                        (y2-y3)/2 = k4·t3 - k3·t4 = g2
 # so y1, y4 = (r+q) ± g1 and y2, y3 = (r-q) ± g2.
 # Bounds:
-# for inputs |xi| <= p, S and D stay < 4p (mulmod-legal); reducing
-# x0 + k1·S closes the chain, leaving every output <= ~3.5p — inside the 4p
-# mulmod domain of whatever loads it next. y0 comes back unreduced;
-# callers reduce it in both directions (the reverse column sum reaches
-# ~4.1p raw, past the mulmod domain).
+# for inputs |xi| <= ~1.0p, S and D stay <= ~3.6p (round argument
+# S·k <= 1.8p with minimal constants); reducing x0 + k1·S closes the chain,
+# leaving every output <= ~2.9p — inside the mulmod domain of whatever loads
+# it next. y0 comes back unreduced; callers reduce it in both directions
+# (the reverse column sum reaches ~4.1p raw, past comfortable margins).
 @inline function fp_dft5(x0, x1, x2, x3, x4, k1, k2, k3, k4, F::FpCtx)
     t1 = x1 + x4; t3 = x1 - x4
     t2 = x2 + x3; t4 = x2 - x3
@@ -403,98 +399,6 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
         x[i0+2Q] = y2
         x[i0+3Q] = y3
         x[i0+4Q] = y4
-        j += 1
-    end
-    return x
-end
-
-# Symmetric-pair 17-point DFT output pair (see fp_dft17_consts): with
-# s_j = x_j + x_{17-j}, d_j = x_j - x_{17-j},
-#   y_r      = x_0 + u_r + v_r,   u_r = Σ_j s_j·A_{jr}
-#   y_{17-r} = x_0 + u_r - v_r,   v_r = Σ_j d_j·B_{jr}
-# for r in 1..8 — 128 mulmods per column instead of the DFT matrix's 256.
-# Bounds: inputs |x| <= ~0.94p give |s|,|d| <= 2p (mulmod-legal), each
-# mulmod out <= 0.75p, so |u|,|v| <= 6p; both are fp_reduced here before the
-# ±-combine, so every y is <= |x0| + ~1.02p <= ~2p — legal for whatever
-# mulmod loads it next.  The sums are balanced trees purely for latency;
-# every order is exact (integers < 2^53).
-@inline function fp_dft17_uv(s::NTuple{8,T}, d::NTuple{8,T}, base::Int,
-                             rot::Vector{Float64}, F::FpCtx) where {T}
-    @inbounds begin
-        Base.Cartesian.@nexprs 8 j -> u_j = fp_mulmod(s[j], T(rot[base+j]), F)
-        Base.Cartesian.@nexprs 8 j -> v_j = fp_mulmod(d[j], T(rot[base+8+j]), F)
-    end
-    u = ((u_1 + u_2) + (u_3 + u_4)) + ((u_5 + u_6) + (u_7 + u_8))
-    v = ((v_1 + v_2) + (v_3 + v_4)) + ((v_5 + v_6) + (v_7 + v_8))
-    return fp_reduce(u, F), fp_reduce(v, F)
-end
-
-function fp_radix17!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
-                     ::Val{FWD}) where {FWD}
-    (;Q, tw, rot) = st
-    j = 0
-    @inbounds while j + 8 <= Q
-        i0 = o + j + 1
-        x0 = SIMD.vload(VF8, x, i0)
-        FWD || (x0 = fp_reduce(x0, F))
-        Base.Cartesian.@nexprs 8 jj -> begin
-            a_jj = SIMD.vload(VF8, x, i0 + jj * Q)
-            b_jj = SIMD.vload(VF8, x, i0 + (17 - jj) * Q)
-            if !FWD
-                a_jj = fp_mulmod(a_jj, SIMD.vload(VF8, tw[jj], j + 1), F)
-                b_jj = fp_mulmod(b_jj, SIMD.vload(VF8, tw[17-jj], j + 1), F)
-            end
-            s_jj = a_jj + b_jj
-            d_jj = a_jj - b_jj
-        end
-        s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
-        d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
-        y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
-        SIMD.vstore(fp_reduce(x0 + y0, F), x, i0)
-        for r in 1:8
-            u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, F)
-            xu = x0 + u
-            yr = xu + v
-            ym = xu - v
-            if FWD
-                yr = fp_mulmod(yr, SIMD.vload(VF8, tw[r], j + 1), F)
-                ym = fp_mulmod(ym, SIMD.vload(VF8, tw[17-r], j + 1), F)
-            end
-            SIMD.vstore(yr, x, i0 + r * Q)
-            SIMD.vstore(ym, x, i0 + (17 - r) * Q)
-        end
-        j += 8
-    end
-    @inbounds while j < Q
-        i0 = o + j + 1
-        x0 = x[i0]
-        FWD || (x0 = fp_reduce(x0, F))
-        Base.Cartesian.@nexprs 8 jj -> begin
-            a_jj = x[i0+jj*Q]
-            b_jj = x[i0+(17-jj)*Q]
-            if !FWD
-                a_jj = fp_mulmod(a_jj, tw[jj][j+1], F)
-                b_jj = fp_mulmod(b_jj, tw[17-jj][j+1], F)
-            end
-            s_jj = a_jj + b_jj
-            d_jj = a_jj - b_jj
-        end
-        s = (s_1, s_2, s_3, s_4, s_5, s_6, s_7, s_8)
-        d = (d_1, d_2, d_3, d_4, d_5, d_6, d_7, d_8)
-        y0 = ((s_1 + s_2) + (s_3 + s_4)) + ((s_5 + s_6) + (s_7 + s_8))
-        x[i0] = fp_reduce(x0 + y0, F)
-        for r in 1:8
-            u, v = fp_dft17_uv(s, d, (r - 1) * 16, rot, F)
-            xu = x0 + u
-            yr = xu + v
-            ym = xu - v
-            if FWD
-                yr = fp_mulmod(yr, tw[r][j+1], F)
-                ym = fp_mulmod(ym, tw[17-r][j+1], F)
-            end
-            x[i0+r*Q] = yr
-            x[i0+(17-r)*Q] = ym
-        end
         j += 1
     end
     return x
@@ -589,14 +493,15 @@ function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
 end
 
 # Leftover radix-2 stage for odd k, twiddle-free and shared by both
-# directions (the DFT2 matrix is its own transpose).  Forward outputs
-# <= 2·0.9p feed the pointwise stage, whose quotient bound tolerates 2p inputs.
-function fp_radix2!(x::Vector{Float64}, N::Int)
+# directions (the DFT2 matrix is its own transpose).  Outputs are reduced:
+# raw they reach ~2.4p, and the forward feeds the pointwise stage, whose
+# product of two values must stay within the 2^51·p mulmod domain.
+function fp_radix2!(x::Vector{Float64}, N::Int, F::FpCtx)
     @inbounds for s in 0:2:N-1
         u = x[s+1]
         v = x[s+2]
-        x[s+1] = u + v
-        x[s+2] = u - v
+        x[s+1] = fp_reduce(u + v, F)
+        x[s+2] = fp_reduce(u - v, F)
     end
     return x
 end
@@ -669,8 +574,7 @@ end
     for o in 0:st.span:plan.N-1
         st.m == 3 ? fp_radix3!(x, o, st, F, fwd) :
         st.m == 4 ? fp_radix4!(x, o, st, F, fwd) :
-        st.m == 5 ? fp_radix5!(x, o, st, F, fwd) :
-                    fp_radix17!(x, o, st, F, fwd)
+                    fp_radix5!(x, o, st, F, fwd)
     end
     return x
 end
@@ -679,7 +583,7 @@ function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
     for stage in plan.stages
         fp_stage!(x, stage, plan, Val(true))
     end
-    isodd(trailing_zeros(plan.N2)) && fp_radix2!(x, plan.N)
+    isodd(trailing_zeros(plan.N2)) && fp_radix2!(x, plan.N, plan.ctx)
     return x
 end
 
@@ -688,7 +592,7 @@ end
 # Fed pointwise product Ĉ it yields N·c[(N-t) mod N];
 # the unpack reads backwards and folds in the 1/N.
 function fp_ntt_rev!(x::Vector{Float64}, plan::FpNttPlan)
-    isodd(trailing_zeros(plan.N2)) && fp_radix2!(x, plan.N)
+    isodd(trailing_zeros(plan.N2)) && fp_radix2!(x, plan.N, plan.ctx)
     for stage in Iterators.reverse(plan.stages)
         fp_stage!(x, stage, plan, Val(false))
     end
@@ -747,7 +651,9 @@ function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     return xa
 end
 
-# Garner recombination + limb streaming.  fp_ntt_rev! hands back N·c index-
+# Garner recombination + limb streaming.  (Unpack loads reverse-transform
+# values up to ~3.3p raw; ninv is minimal balanced so the 1/N round argument
+# stays <= ~1.7p < 2^51.)  fp_ntt_rev! hands back N·c index-
 # reversed (coefficient i at (N-i) mod N); this loop scales each residue by 1/N
 # and Garner-combines the two mod-p residues of every base-2^b coefficient:
 #   c = c1 + p1·u,  u = (c2 - c1)·p1^-1 mod p2.
@@ -758,7 +664,7 @@ end
 # Each c1, u is pre-split into window halves lo = v << s, hi = v >> (64 - s) so
 # the scalar accumulate is pure add-with-carry; s = (b·i) mod 64 is data-
 # independent because the flush drops s by exactly 64.  The 128-bit window never
-# overflows: values are < 2^49, s < 64, and each flushed limb is final (later
+# overflows: values are < 2^50, s < 64, and each flushed limb is final (later
 # coefficients start at a strictly higher bit).  Note c1 must be canonicalized
 # before fp_reduce(v1, F2), since v1 - p1 is a different value mod p2.
 
@@ -855,7 +761,7 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
         v2 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x2, N - i - 6), REV8), n2, n2p, FP_CTX2)
         u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
         u = SIMD.vifelse(u < 0, u + fp_prime(FP_CTX2), u)
-        # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
+        # canonical values are < p < 2^50, so v + 1.5·2^52 pins the exponent and
         # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
         mask = UInt64(2)^51 - 1
         c1v = reinterpret(V8, v1 + FP_MAGIC) & mask
@@ -887,14 +793,14 @@ end
 
 # pick min m·2^k >= T
 # For small T, pick m only in (1, 3, 5) since bigger nums are slower than extra length.
-# m >= 15 are only selected when we have k (radix 2 transforms) >= 14
-# because they only bench better once the radix 2 is >= cache size
-# A pure 2^k tops out at 2^33 (~18 GB operands) since 2^k must divide all p-1.
-# The odd multipliers then extend reach to 255·2^33 (~4 TB).
+# m == 15 is only selected when we have k (radix 2 transforms) >= 14
+# because it only benches better once the radix 2 is >= cache size
+# A pure 2^k tops out at 2^36 (~150 GB operands) since 2^k must divide all p-1.
+# The odd multipliers then extend reach to 15·2^36 (~2 TB).
 function ntt_len(T::Int, ctxs::FpCtx...)
     maxk = minimum(two_adicity(F) for F in ctxs)
     best = typemax(Int)
-    for m in (1, 3, 5, 15, 17, 51, 85, 255)           # multiples of 3, 5, 17 each used <= once
+    for m in (1, 3, 5, 15)                            # multiples of 3, 5 each used <= once
         k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
         k <= maxk || continue                         # 2^k must divide p-1
         m <= 5 || k >= 14 || break                    # odd-multiplier floor
@@ -902,7 +808,7 @@ function ntt_len(T::Int, ctxs::FpCtx...)
         c < best && (best = c)
     end
     best == typemax(Int) &&
-        throw(ArgumentError("fp NTT length $T exceeds the 255·2^$maxk the primes support"))
+        throw(ArgumentError("fp NTT length $T exceeds the 15·2^$maxk the primes support"))
     return best
 end
 
@@ -923,8 +829,8 @@ function fp_ntt_params(bits_a::Int, bits_b::Int, ctxs::FpCtx...)
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# Two-prime CRT pipeline. The working modulus p1·p2 ≈ 2^98.97 chunk width
-# b ≈ (99 - log2 nc)/2 ≈ 45 bits at 256 chunks and >32 bits until >10 billion chunks
+# Two-prime CRT pipeline. The working modulus p1·p2 ≈ 2^99.99 chunk width
+# b ≈ (100 - log2 nc)/2 ≈ 46 bits at 256 chunks and >32 bits until >10 billion chunks
 # mpn-layer entry points: r[1..m+n] = a[1..m]·b[1..n], r must not alias the inputs.
 # Calls fp_ntt_pack! right before fp_ntt_fwd! to improve locality.
 function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,

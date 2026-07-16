@@ -1,11 +1,12 @@
 # fp NTT multiplication: Float64 field arithmetic, transform, and the
 # two-prime CRT engine mul_fpntt2!/sqr_fpntt2!.  The engine's correctness
 # rests on rounding-error analysis, so beyond the differential net these
-# tests hammer the documented lazy-range bounds (mulmod |x| <= 4p, reduce
+# tests hammer the documented lazy-range bounds (constant mulmod |x| <= 4p
+# with minimal-balanced |w| <= p/2, value mulmod |x·y| <= ~p², reduce
 # |x| <= 8p) where random in-range inputs would never stress the
 # magic-constant round.
 using NativeBigInt: FP_CTX1, FpCtx, fp_prime, fp_mulmod,
-                    fp_reduce, fp_round, fp_ntt_plan,
+                    fp_reduce, fp_round, fp_minbal, fp_ntt_plan,
                     fp_ntt_fwd!, fp_ntt_rev!, VF8,
                     Limb, nlimbs, nbig_from_limbs
 using Random: MersenneTwister
@@ -18,13 +19,15 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
 
 @testset "fp field arithmetic" begin
     P = big(FP_PI)
-    @test FP_PI == 0x0001_FFFE_0000_0001          # 2^49 - 2^33 + 1
+    @test FP_PI == UInt64(16335) * 2^36 + 1        # 16335·2^36 + 1, just under 2^50
     @test Float64(FP_PI) == FP_P                   # p is exactly representable
-    @test (FP_PI - 1) % (UInt64(255) << 33) == 0   # 255·2^33 length family
+    @test (FP_PI - 1) % (UInt64(15) << 36) == 0    # 15·2^36 length family
 
     rng = MersenneTwister(0xf94)
-    edgew = UInt64[0, 1, 2, FP_PI - 1, FP_PI - 2, UInt64(2)^33, UInt64(2)^48]
-    ws = [edgew; rand(rng, UInt64(0):FP_PI-1, 60)]
+    # constants are minimal balanced |w| <= p/2 (fp_minbal)
+    half = (FP_P - 1) / 2
+    edgew = Float64[0, 1, -1, 2, ldexp(1.0, 33), half, -half]
+    ws = [edgew; [rand(rng, (-1.0, 1.0)) * rand(rng, UInt64(0):(FP_PI-1)>>1) for _ in 1:60]]
     # x sweeps the full lazy range ±4p, including the extremes where the
     # magic round and the q-error bound are tight
     lazy_edges = Float64[0.0, 1.0, -1.0, FP_P - 1, -(FP_P - 1), FP_P, -FP_P,
@@ -33,12 +36,13 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
           [rand(rng, (-4.0, -2.0, -1.0, 1.0, 2.0, 4.0)) * rand(rng, UInt64(0):FP_PI-1)
            for _ in 1:200]]
     for w in ws, x in xs
-        r = fp_mulmod(x, Float64(w), Float64(w) / FP_P, FP_CTX1)
+        r = fp_mulmod(x, w, w / FP_P, FP_CTX1)
         @test abs(r) < FP_P
-        @test big(fp_canon(r)) == mod(big(w) * big(Int128(x)), P)
+        @test big(fp_canon(r)) == mod(big(Int128(w)) * big(Int128(x)), P)
     end
+    # value×value products (the pointwise stage): |x·y| <= ~p²
     for x in xs, y in xs
-        abs(x) <= 2FP_P && abs(y) <= 2FP_P || continue
+        abs(x) <= FP_P && abs(y) <= FP_P || continue
         r = fp_mulmod(x, y, FP_CTX1)
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(big(Int128(x)) * big(Int128(y)), P)
@@ -48,8 +52,14 @@ fp_canon(x::Float64) = (v = fp_reduce(x, FP_CTX1); v < 0 && (v += FP_P); UInt64(
         @test abs(r) < FP_P
         @test big(fp_canon(r)) == mod(2 * big(Int128(x)), P)
     end
+    # fp_minbal: exact minimal representative of balanced inputs
+    for x in [ws; Float64[half + 1, -(half + 1), FP_P - 1, -(FP_P - 1)]]
+        m = fp_minbal(x, FP_CTX1)
+        @test abs(m) <= FP_P / 2
+        @test big(fp_canon(m)) == mod(big(Int128(x)), P)
+    end
     # generator-derived roots of unity have exact order
-    for logN in (1, 5, 20, 33)
+    for logN in (1, 5, 20, 36)
         N = UInt64(2)^logN
         ω = powermod(FP_CTX1.gen, (FP_PI - 1) ÷ N, FP_PI)
         @test powermod(ω, N, FP_PI) == 1
@@ -73,8 +83,7 @@ end
 
 @testset "fp ntt transform" begin
     rng = MersenneTwister(0xf18)
-    for N in (4, 8, 64, 512, 1024, 12, 20, 48, 96, 160, 240, 1536,
-              68, 136, 204, 340, 1020, 2176)   # 17-family: 17,51,85,255 odd parts
+    for N in (4, 8, 64, 512, 1024, 12, 20, 48, 96, 160, 240, 1536, 960, 3840)
         plan = fp_ntt_plan(N, FP_CTX1)
         x = Float64.(rand(rng, UInt64(0):FP_PI-1, N))
         y = copy(x)
@@ -172,13 +181,13 @@ function fpntt2_square(a::NBig)
 end
 
 @testset "fp second prime and transform" begin
-    @test FP_PI2 == 0x0001_FE00_0000_0001            # 255·2^41 + 1
+    @test FP_PI2 == UInt64(4095) * 2^38 + 1          # 4095·2^38 + 1 = 2^50 - 2^38 + 1
     @test Float64(FP_PI2) == Float64(fp_prime(FP_CTX2))   # exactly representable
-    @test FP_PI2 - 1 == UInt64(255) << 41
-    @test (FP_PI2 - 1) % (UInt64(255) << 41) == 0    # 255·2^41 length family
+    @test FP_PI2 - 1 == UInt64(4095) << 38
+    @test (FP_PI2 - 1) % (UInt64(15) << 38) == 0     # 15·2^38 length family
 
     rng = MersenneTwister(0x2b1)
-    for N in (4, 8, 64, 512, 12, 20, 48, 240, 1536, 68, 204, 340, 1020)
+    for N in (4, 8, 64, 512, 12, 20, 48, 240, 1536, 960)
         plan = fp_ntt_plan(N, FP_CTX2)
         x = Float64.(rand(rng, UInt64(0):FP_PI2-1, N))
         y = copy(x)
@@ -194,13 +203,13 @@ end
 @testset "ntt_len length selection and 2-adic cap" begin
     ctxs = (FP_CTX1, FP_CTX2)
     maxk = min(two_adicity(FP_CTX1), two_adicity(FP_CTX2))
-    @test maxk == 33                                  # p1's 2-adicity is the binding cap
+    @test maxk == 36                                  # p1's 2-adicity is the binding cap
 
     # brute-force reference: smallest m·2^k >= T over the family, honoring
-    # the uniform k >= 14 floor for the expensive odd multipliers
+    # the uniform k >= 14 floor for the expensive odd multiplier
     function want(T)
         best = typemax(Int)
-        for m in (1, 3, 5, 15, 17, 51, 85, 255), k in 2:maxk
+        for m in (1, 3, 5, 15), k in 2:maxk
             m <= 5 || k >= 14 || continue
             c = m << k
             c >= T && c < best && (best = c)
@@ -209,8 +218,8 @@ end
     end
 
     for T in (1, 4, 5, 100, 1000, 1023, 1025, 13000, 15359, 15360, 20000, 1<<20,
-              (17<<14) - 100, 17<<14, (17<<14) + 1, (51<<14) - 1, 51<<14,
-              (85<<14) - 1, 85<<14, (255<<14) - 1, 255<<14, 1<<22, 1<<25)
+              (15<<14) - 100, 15<<14, (15<<14) + 1, (15<<20) - 1, 15<<20,
+              (3<<22) - 1, 3<<22, (5<<22) - 1, 5<<22, 1<<22, 1<<25)
         n = ntt_len(T, ctxs...)
         @test n == want(T)
         @test n >= T
@@ -218,22 +227,21 @@ end
         @test (fp_prime(FP_CTX1) - 1) % n == 0
         @test (fp_prime(FP_CTX2) - 1) % n == 0
     end
-    # floor boundary: m·2^14 is the first admitted length of each odd
-    # multiplier; at k = 13 the pow2/small-odd family is chosen instead
-    @test ntt_len((17 << 14) - 100, ctxs...) == 17 << 14
+    # floor boundary: 15·2^14 is the first admitted m = 15 length;
+    # at k = 13 the pow2/small-odd family is chosen instead
     @test ntt_len(15 << 14, ctxs...) == 15 << 14
     @test ntt_len(15 << 13, ctxs...) == 1 << 17      # 15·2^13 is below the floor
 
-    # just past a pure 2^33: must fall back to an odd multiplier, never
+    # just past a pure 2^36: must fall back to an odd multiplier, never
     # exceed the primes' shared 2-adicity
-    n = ntt_len((1 << 33) + 1, ctxs...)
-    @test n >= (1 << 33) + 1 && trailing_zeros(n) <= maxk
-    @test n == 17 << 29                              # smallest admissible odd length
-    @test ntt_len(1 << 33, ctxs...) == 1 << 33       # exactly 2^33 is still fine
-    @test ntt_len(255 << 33, ctxs...) == 255 << 33   # largest supported length
+    n = ntt_len((1 << 36) + 1, ctxs...)
+    @test n >= (1 << 36) + 1 && trailing_zeros(n) <= maxk
+    @test n == 5 << 34                               # smallest admissible odd length
+    @test ntt_len(1 << 36, ctxs...) == 1 << 36       # exactly 2^36 is still fine
+    @test ntt_len(15 << 36, ctxs...) == 15 << 36     # largest supported length
 
-    # beyond 255·2^33 no valid length exists
-    @test_throws ArgumentError ntt_len((255 << 33) + 1, ctxs...)
+    # beyond 15·2^36 no valid length exists
+    @test_throws ArgumentError ntt_len((15 << 36) + 1, ctxs...)
 end
 
 @testset "garner unpack vs BigInt CRT" begin
@@ -254,8 +262,11 @@ end
             x1[idx] = rep(c * N, P1)
             x2[idx] = rep(c * N, P2)
         end
-        n1 = Float64(invmod(UInt64(N), FP_PI));  n1p = n1 / Float64(FP_PI)
-        n2 = Float64(invmod(UInt64(N), FP_PI2)); n2p = n2 / Float64(FP_PI2)
+        # engine hands unpack a minimal-balanced 1/N (see build_fp_plan)
+        n1 = fp_reduce(Float64(invmod(UInt64(N), FP_PI)), FP_CTX1)
+        n1p = n1 / Float64(FP_PI)
+        n2 = fp_reduce(Float64(invmod(UInt64(N), FP_PI2)), FP_CTX2)
+        n2p = n2 / Float64(FP_PI2)
         rn = cld(99 + b * (nconv - 1), 64) + 1
         r = Memory{Limb}(undef, rn)
         fp_ntt_unpack2!(r, 0, rn, x1, x2, nconv, b, n1, n1p, n2, n2p)
@@ -278,21 +289,22 @@ end
         end
     end
     # feasibility-boundary chunk widths: tiny all-ones operands reach the
-    # largest reachable b (48) with max-magnitude convolution coefficients
+    # largest reachable b (49) with max-magnitude convolution coefficients
     for na in 1:8, nb in 1:na
         a = big(2)^(64na) - 1
         b = big(2)^(64nb) - 1
         @test BigInt(fpntt2_mul(NBig(a), NBig(b))) == a * b
     end
-    # large enough that ntt_len picks a 17-family length (17·2^15 = 557056
-    # points here), exercising the radix-17 stage end to end.
+    # large enough that ntt_len picks an m = 15 length (15·2^15 = 491520
+    # points here), exercising the radix-5 and radix-3 stages end to end
+    # above the odd-multiplier floor.
     # BigInt round-trips are too slow at this size, so the product is
     # verified by residues mod random 63-bit moduli (an engine-independent
     # O(n) check: a wrong limb survives one modulus with prob ~2^-63)
     limbmod(x, n, m) = (r = UInt128(0); for i in n:-1:1; r = ((r << 64) | x[i]) % m; end; UInt64(r))
-    let n = 168_000
+    let n = 144_000
         bch, N = fp_ntt_params(64n, 64n, FP_CTX1, FP_CTX2)
-        @test N >> trailing_zeros(N) == 17
+        @test N >> trailing_zeros(N) == 15
         am = Memory{Limb}(rand(rng, UInt64, n))
         bm = Memory{Limb}(rand(rng, UInt64, n))
         r = Memory{Limb}(undef, 2n)

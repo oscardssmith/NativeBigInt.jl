@@ -83,14 +83,16 @@ Three layers, mirroring GMP's mpn/mpz split:
 - **fp NTT multiplication (`src/fpntt.jl`):** the sole large-size engine —
   number-theoretic transforms computed entirely in `Float64` in the style
   of FLINT's `fft_small`, with the convolution recombined by CRT over two
-  ~2^49 primes (p₁ = 2^49 − 2^33 + 1, p₂ = 255·2^41 + 1; working modulus
-  p₁·p₂ ≈ 2^99 keeps the chunk width at ~41–44 bits across all practical
-  sizes, Garner recombination in the unpack). Products use the FMA
-  error-free transform (`h = x*w; l = fma(x, w, -h)` captures the exact
-  98-bit product with no carry chains), reduction is a Barrett quotient
-  via the magic-constant round (p < 2^49 keeps every quotient below the
-  2^51 exactness bound), and twiddles are stored as Shoup-style `(w, w/p)`
-  pairs so the quotient multiply runs in parallel with the product.
+  just-under-2^50 primes (p₁ = 16335·2^36 + 1, p₂ = 2^50 − 2^38 + 1;
+  working modulus p₁·p₂ ≈ 2^99.99 keeps the chunk width at ~42–45 bits
+  across all practical sizes, Garner recombination in the unpack).
+  Products use the FMA error-free transform (`h = x*w; l = fma(x, w, -h)`
+  captures the exact ~100-bit product with no carry chains), reduction is
+  a Barrett quotient via the magic-constant round (p < 2^50 with all
+  constant tables stored minimal balanced, |w| ≤ p/2, keeps every quotient
+  below the 2^51 exactness bound), and twiddles are stored as Shoup-style
+  `(w, w/p)` pairs so the quotient multiply runs in parallel with the
+  product.
   Butterfly adds run unreduced with one reduction per butterfly closing
   the lazy bounds, so the hot loop is pure mul/fma/add traffic, and every
   operation is exactly correct by rounding-error analysis, not
@@ -99,14 +101,12 @@ Three layers, mirroring GMP's mpn/mpz split:
   tables — no inverse twiddles or 1/N pre-scale pass exist), which hands
   the unpack N·c index-reversed with the 1/N folded into unpack's
   descending read. Transform lengths m·2^k for
-  m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; the heavier odd
-  multipliers — m = 15 and the symmetric-pair radix-17 family
-  m ∈ {17, 51, 85, 255} — join from m·2^14 points, where their
-  cache-blocked odd passes and tighter padding beat one monolithic pow-2
-  transform) keeping zero-padding waste
-  ≤ ~25% (≤ ~18% once the 17 family is admitted), in-register shuffle
-  butterflies for sub-vector-width stages, and squaring with one forward
-  transform instead of two.
+  m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; the combined
+  multiplier m = 15 joins from 15·2^14 points, where its cache-blocked odd
+  passes and tighter padding beat one monolithic pow-2 transform) keeping
+  zero-padding waste ≤ ~25% (≤ ~19% once m = 15 is admitted), in-register
+  shuffle butterflies for sub-vector-width stages, and squaring with one
+  forward transform instead of two.
 - **`NBig` (`src/nbig.jl`):** sign-magnitude value type
   (`signlen = sign * limb count`, little-endian normalized `Memory{UInt64}`),
   covering comparison, `+`/`-`/`*`, `divrem`/`div`/`rem`/`mod`/`fld`/`cld`,
