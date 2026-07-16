@@ -74,14 +74,6 @@ const FP_MAGIC = 1.5*2^52
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
 
-# r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
-# q = fp_round(x * wpinv) not dependent on h, so both multiplies issue together.
-@inline function fp_mulmod(x, w, wpinv, ::FpCtx{P}) where {P}
-    h = x * w
-    l = fma(x, w, -h)
-    q = fp_round(x * wpinv)
-    return fma(q, -P, h) + l
-end
 
 # r ≡ x (mod p) in balanced form. Exact for any exact-integer x in the domain |x| <= 2^51·p.
 # The round argument |x·inv(P)| <= 2^51, so q = fp_round(..) is valid
@@ -90,6 +82,15 @@ end
 @inline function fp_reduce(x, ::FpCtx{P}) where {P}
     q = fp_round(x * inv(P))
     return fma(q, -P, x)
+end
+
+# r ≡ w·x (mod p), w in [0, p), |x| <= 4p; |r| <= p(1/2 + |x|·2^-52) < p.
+# q = fp_round(x * wpinv) not dependent on h, so both multiplies issue together.
+@inline function fp_mulmod(x, w, wpinv, ::FpCtx{P}) where {P}
+    h = x * w
+    l = fma(x, w, -h)
+    q = fp_round(x * wpinv)
+    return fma(q, -P, h) + l
 end
 
 # r ≡ x·y (mod p) for two data operands (no precomputed quotient).
@@ -782,29 +783,6 @@ end
 # (ntt_len), split limbs into chunk coefficients (fp_ntt_pack!), and multiply
 # lanewise between the transforms (fp_ntt_pointwise!).
 
-# Smallest transform length >= T: m·2^k with m in (1, 3, 5) at every size;
-# the expensive odd multipliers (15 and the 17 family) join only from
-# k >= 14, where their tighter padding beats a cache-spilling pow2
-# transform (1.26x at 15·2^18 vs 2^22, 0.80x at 255·2^15 vs 2^23).  The
-# uniform floor gives up <= ~5% in narrow bands against the measured per-m
-# tie points (bench/bench_radix17.jl), accepted for the simpler rule.  A
-# pure 2^k tops out at 2^33 (~18 GB operands) since 2^k must divide p-1
-# for both primes; the odd multipliers extend reach to 255·2^33 (~4 TB).
-function ntt_len(T::Int, ctxs::FpCtx...)
-    maxk = minimum(two_adicity(F) for F in ctxs)
-    best = typemax(Int)
-    for m in (1, 3, 5, 15, 17, 51, 85, 255)           # multiples of 3, 5, 17 each used <= once
-        k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
-        k <= maxk || continue                         # 2^k must divide p-1
-        m <= 5 || k >= 14 || continue                 # odd-multiplier floor
-        c = m << k
-        c < best && (best = c)
-    end
-    best == typemax(Int) &&
-        throw(ArgumentError("fp NTT length $T exceeds the 255·2^$maxk the primes support"))
-    return best
-end
-
 # b-bit chunk extraction into Float64 points; chunks < 2^b <= 2^52 are exact
 # doubles and, being smaller than every prime, already canonical residues.
 # Overwrites all of x (chunks, then zero fill), so callers can recycle a
@@ -852,29 +830,6 @@ function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
     return xa
 end
 
-# ---------------------------------------------------------------------------
-# Two-prime CRT pipeline — what dispatch uses.  The working modulus
-# p1·p2 ≈ 2^98.97 holds the chunk width at b ≈ 41-44 where a single prime's
-# density decays with size (b ≈ (49 - log2 nc)/2).
-
-# chunk width and transform length against the CRT modulus p1·p2.  The bound
-# min(nca,ncb)·(2^b-1)^2 < p1·p2 is checked in division form: the product
-# overflows UInt128 at large b with large operands, and the descending search
-# visits large b first regardless of operand size.  The search starts at the
-# largest b keeping chunks below both primes (48 here), so one pack serves
-# both residues.
-function fp_ntt_params2(bits_a::Int, bits_b::Int, F1::FpCtx, F2::FpCtx)
-    for b in Base.top_set_bit(min(fp_prime(F1), fp_prime(F2)))-1:-1:1
-        nca = cld(bits_a, b)
-        ncb = cld(bits_b, b)
-        if UInt128(min(nca, ncb)) <=
-           (UInt128(fp_prime(F1)) * fp_prime(F2) - 1) ÷ (UInt128(2)^b - 1)^2
-            return b, ntt_len(nca + ncb - 1, F1, F2)
-        end
-    end
-    error("unreachable: b == 1 always satisfies the bound for supported sizes")
-end
-
 # Garner recombination + limb streaming.  fp_ntt_rev! hands back N·c index-
 # reversed (coefficient i at (N-i) mod N); this loop scales each residue by 1/N
 # and Garner-combines the two mod-p residues of every base-2^b coefficient:
@@ -896,11 +851,11 @@ end
                                  n1::Float64, n1p::Float64, n2::Float64, n2p::Float64,
                                  g::Float64, gp::Float64)
     v1 = fp_mulmod(x1[idx], n1, n1p, FP_CTX1)
-    v1 = ifelse(v1 < 0.0, v1 + fp_prime(FP_CTX1), v1)
+    v1 = ifelse(v1 < 0, v1 + fp_prime(FP_CTX1), v1)
     v2 = fp_mulmod(x2[idx], n2, n2p, FP_CTX2)
     u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
     c1 = unsafe_trunc(UInt64, v1)
-    uu = unsafe_trunc(UInt64, ifelse(u < 0.0, u + fp_prime(FP_CTX2), u))
+    uu = unsafe_trunc(UInt64, ifelse(u < 0, u + fp_prime(FP_CTX2), u))
     return c1, uu
 end
 
@@ -910,7 +865,7 @@ end
 # loop packs the same layout with SIMD; this is the < 8-wide head/tail fallback.
 # @noinline keeps its fp_mulmod chains out of fp_ntt_unpack2!'s hot loop, whose
 # adc recognition degrades when the function is bloated.
-@noinline function fp_pack_scalar!(stage::Vector{UInt64}, x1::Vector{Float64},
+@noinline function fp_unpack_scalar!(stage::Vector{UInt64}, x1::Vector{Float64},
                                  x2::Vector{Float64}, N::Int, i::Int, cnt::Int,
                                  s::Int, b::Int, n1::Float64, n1p::Float64,
                                  n2::Float64, n2p::Float64, g::Float64, gp::Float64)
@@ -927,32 +882,32 @@ end
     return stage
 end
 
-# Fold cnt (<= 8) pre-shifted coefficients from the stage buffer into both
-# 128-bit windows, flushing a finished limb whenever s crosses 64.  Spelled out
+# Fold cnt (<= 8) pre-shifted coefficients from the word buffer into both
+# 128-bit windows, flushing a finished limb whenever bitpos crosses a limb
+# boundary.  bitpos is the absolute bit offset of the next coefficient (i·b),
+# so the windows cover bits [64·(bitpos>>6), +128).  Spelled out
 # inline rather than via a per-coefficient helper on purpose: a per-lane
 # function boundary drops LLVM's adc carry chain (~60% slower).  At the hot call
 # site cnt = 8 is a literal, so this unrolls to the full 16-adc chain.
-@inline function fp_emit_stage!(r::Memory{Limb}, ro::Int, s2::Memory{Limb}, outw::Int,
-                                a01::UInt64, a11::UInt64, a02::UInt64, a12::UInt64,
-                                s::Int, b::Int, stage::Vector{UInt64}, cnt::Int)
+@inline function fp_accum_words!(r::Memory{Limb}, ro::Int, s2::Memory{Limb},
+                                w1::UInt128, w2::UInt128, bitpos::Int, b::Int,
+                                words::Vector{UInt64}, cnt::Int)
+    s = bitpos & 63
+    outw = (bitpos >> 6) + 1
     @inbounds for j in 1:cnt
+        w1 += (UInt128(words[j+8]) << 64) | words[j]
+        w2 += (UInt128(words[j+24]) << 64) | words[j+16]
+        s += b
         if s >= 64
-            r[ro+outw] = a01
-            s2[outw] = a02
-            a01 = a11; a11 = UInt64(0)
-            a02 = a12; a12 = UInt64(0)
+            r[ro+outw] = w1 % UInt64
+            s2[outw] = w2 % UInt64
+            w1 >>= 64
+            w2 >>= 64
             outw += 1
             s -= 64
         end
-        t1 = a01 + stage[j]
-        a11 += stage[j+8] + (t1 < a01)
-        a01 = t1
-        t2 = a02 + stage[j+16]
-        a12 += stage[j+24] + (t2 < a02)
-        a02 = t2
-        s += b
     end
-    return outw, a01, a11, a02, a12, s
+    return w1, w2
 end
 
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
@@ -960,71 +915,106 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
                          b::Int, n1::Float64, n1p::Float64, n2::Float64, n2p::Float64)
     N = length(x1)
     s2 = Memory{Limb}(undef, rn)
-    # SIMD→scalar staging buffer, quarters lo1 | hi1 | lo2 | hi2.  The scan
-    # reads lanes at a runtime index; Vec lane extraction with a non-constant
-    # index spills to the stack (~30% slower than this explicit round-trip).
-    stage = Vector{UInt64}(undef, 32)
+    # Pre-shifted coefficient words awaiting the carry accumulate, quarters
+    # lo1 | hi1 | lo2 | hi2.  fp_accum_words! reads lanes at a runtime index;
+    # Vec lane extraction with a non-constant index spills to the stack
+    # (~30% slower than this explicit round-trip).
+    wordbuf = Vector{UInt64}(undef, 32)
     g = Float64(invmod(fp_prime(FP_CTX1) % fp_prime(FP_CTX2), fp_prime(FP_CTX2))) # p1^-1 mod p2 (Garner)
     gp = g / fp_prime(FP_CTX2) # twiddle
-    # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
-    # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
-    vmask = V8(UInt64(2)^51 - 1)
     ub = UInt64(b)
     vlane = V8(ntuple(k -> UInt64(k - 1) * ub, 8))
-    a01 = UInt64(0); a11 = UInt64(0)   # stream 1 window, low/high limb
-    a02 = UInt64(0); a12 = UInt64(0)   # stream 2 window
-    outw = 1
-    s = 0             # bit offset of coefficient i within the window
+    w1 = UInt128(0)   # stream 1 window over bits [64·(bitpos>>6), +128)
+    w2 = UInt128(0)   # stream 2 window; bitpos = i·b throughout
     # scalar head through coefficient 7: covers the i = 0 wraparound so the
     # vector loop's descending 8-loads stay contiguous
     i = min(8, nconv)
-    fp_pack_scalar!(stage, x1, x2, N, 0, i, s, b, n1, n1p, n2, n2p, g, gp)
-    outw, a01, a11, a02, a12, s =
-        fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, i)
+    fp_unpack_scalar!(wordbuf, x1, x2, N, 0, i, 0, b, n1, n1p, n2, n2p, g, gp)
+    w1, w2 = fp_accum_words!(r, ro, s2, w1, w2, 0, b, wordbuf, i)
     @inbounds while i + 8 <= nconv
-        REV8 = (7, 6, 5, 4, 3, 2, 1, 0)
-        v1 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x1, N - i - 6), Val(REV8)),
-                       n1, n1p, FP_CTX1)
+        REV8 = Val((7, 6, 5, 4, 3, 2, 1, 0))
+        v1 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x1, N - i - 6), REV8), n1, n1p, FP_CTX1)
         v1 = SIMD.vifelse(v1 < 0, v1 + fp_prime(FP_CTX1), v1)
-        v2 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x2, N - i - 6), Val(REV8)),
-                       n2, n2p, FP_CTX2)
+        v2 = fp_mulmod(SIMD.shufflevector(SIMD.vload(VF8, x2, N - i - 6), REV8), n2, n2p, FP_CTX2)
         u = fp_mulmod(v2 - fp_reduce(v1, FP_CTX2), g, gp, FP_CTX2)
         u = SIMD.vifelse(u < 0, u + fp_prime(FP_CTX2), u)
-        c1v = reinterpret(V8, v1 + FP_MAGIC) & vmask
-        uv = reinterpret(V8, u + FP_MAGIC) & vmask
+        # canonical values are < p < 2^49, so v + 1.5·2^52 pins the exponent and
+        # leaves v in the low 51 mantissa bits: int(v) is a reinterpret-and-mask
+        mask = UInt64(2)^51 - 1
+        c1v = reinterpret(V8, v1 + FP_MAGIC) & mask
+        uv = reinterpret(V8, u + FP_MAGIC) & mask
         sv = (UInt64(i) * ub + vlane) & UInt64(63)
         svc = UInt64(63) - sv
-        SIMD.vstore(c1v << sv, stage, 1)
-        SIMD.vstore((c1v >> 1) >> svc, stage, 9)
-        SIMD.vstore(uv << sv, stage, 17)
-        SIMD.vstore((uv >> 1) >> svc, stage, 25)
-        outw, a01, a11, a02, a12, s =
-            fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, 8)
+        SIMD.vstore(c1v << sv, wordbuf, 1)
+        SIMD.vstore((c1v >> 1) >> svc, wordbuf, 9) # same as shifting by 64-sv, but avoiding shift by 64
+        SIMD.vstore(uv << sv, wordbuf, 17)
+        SIMD.vstore((uv >> 1) >> svc, wordbuf, 25)
+        w1, w2 = fp_accum_words!(r, ro, s2, w1, w2, i * b, b, wordbuf, 8)
         i += 8
     end
     # scalar tail: the final nconv mod 8 coefficients
     tail = nconv - i
-    fp_pack_scalar!(stage, x1, x2, N, i, tail, s, b, n1, n1p, n2, n2p, g, gp)
-    outw, a01, a11, a02, a12, s =
-        fp_emit_stage!(r, ro, s2, outw, a01, a11, a02, a12, s, b, stage, tail)
+    fp_unpack_scalar!(wordbuf, x1, x2, N, i, tail, i * b, b, n1, n1p, n2, n2p, g, gp)
+    w1, w2 = fp_accum_words!(r, ro, s2, w1, w2, i * b, b, wordbuf, tail)
+    outw = (nconv * b) >> 6 + 1
     @inbounds while outw <= rn
-        r[ro+outw] = a01
-        s2[outw] = a02
-        a01 = a11; a11 = UInt64(0)
-        a02 = a12; a12 = UInt64(0)
+        r[ro+outw] = w1 % UInt64
+        s2[outw] = w2 % UInt64
+        w1 >>= 64
+        w2 >>= 64
         outw += 1
     end
     addmul_1!(r, ro, s2, 0, rn, fp_prime(FP_CTX1))
     return r
 end
 
+# pick min m·2^k >= T
+# For small T, pick m only in (1, 3, 5) since bigger nums are slower than extra length.
+# m >= 15 are only selected when we have k (radix 2 transforms) >= 14
+# because they only bench better once the radix 2 is >= cache size
+# A pure 2^k tops out at 2^33 (~18 GB operands) since 2^k must divide all p-1.
+# The odd multipliers then extend reach to 255·2^33 (~4 TB).
+function ntt_len(T::Int, ctxs::FpCtx...)
+    maxk = minimum(two_adicity(F) for F in ctxs)
+    best = typemax(Int)
+    for m in (1, 3, 5, 15, 17, 51, 85, 255)           # multiples of 3, 5, 17 each used <= once
+        k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
+        k <= maxk || continue                         # 2^k must divide p-1
+        m <= 5 || k >= 14 || break                    # odd-multiplier floor
+        c = m << k
+        c < best && (best = c)
+    end
+    best == typemax(Int) &&
+        throw(ArgumentError("fp NTT length $T exceeds the 255·2^$maxk the primes support"))
+    return best
+end
+
+# Chunk width and transform length against the CRT modulus prod(primes).
+# The bound min(nca,ncb)·(2^b-1)^2 < prod(primes) is checked in division form:
+# the product overflows UInt128 at large b with large operands
+# and the descending search visits large b first regardless of operand size.
+# Start search at the largest b<primes, so one pack serves both residues
+function fp_ntt_params(bits_a::Int, bits_b::Int, ctxs::FpCtx...)
+    primes = fp_prime.(ctxs)
+    for b in Base.top_set_bit(minimum(primes))-1:-1:1
+        nca = cld(bits_a, b)
+        ncb = cld(bits_b, b)
+        if min(nca, ncb) <= (prod(UInt128.(primes)) - 1) ÷ UInt128(2^b - 1)^2
+            return b, ntt_len(nca + ncb - 1, ctxs...)
+        end
+    end
+    error("unreachable: b == 1 always satisfies the bound for supported sizes")
+end
+
+# Two-prime CRT pipeline. The working modulus p1·p2 ≈ 2^98.97 chunk width
+# b ≈ (99 - log2 nc)/2 ≈ 45 bits at 256 chunks and >32 bits until >10 billion chunks
 # mpn-layer entry points: r[1..m+n] = a[1..m]·b[1..n], r must not alias the inputs.
 # Calls fp_ntt_pack! right before fp_ntt_fwd! to improve locality.
 function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                      b::Memory{Limb}, bo::Int, n::Int)
     bits_a = magnitude_bits(a, ao, m)
     bits_b = magnitude_bits(b, bo, n)
-    bch, N = fp_ntt_params2(bits_a, bits_b, FP_CTX1, FP_CTX2)
+    bch, N = fp_ntt_params(bits_a, bits_b, FP_CTX1, FP_CTX2)
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
@@ -1047,7 +1037,7 @@ end
 
 function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     bits = magnitude_bits(a, ao, n)
-    bch, N = fp_ntt_params2(bits, bits, FP_CTX1, FP_CTX2)
+    bch, N = fp_ntt_params(bits, bits, FP_CTX1, FP_CTX2)
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca = cld(bits, bch)
