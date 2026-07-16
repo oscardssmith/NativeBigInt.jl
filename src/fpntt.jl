@@ -108,18 +108,14 @@ end
 # Winograd 5-point constants from a primitive 5th root c.
 # With a = c + c^4, b = c^2 + c^3 (a + b = -1, the roots sum to zero):
 # k1 = -1/4,  k2 = (a - b)/4,  k3 = (c - c^4)/2,  k4 = (c^2 - c^3)/2,
-# all canonical residues mod p (see fp_dft5 for the combine they feed).
+# all balanced residues mod p (see fp_dft5 for the combine they feed).
 function fp_dft5_consts(c::UInt64, F::FpCtx)
-    p = fp_prime(F)
-    mulm(x, y) = UInt64(UInt128(x) * y % p)
-    subm(x, y) = x >= y ? x - y : x + p - y
-    c2 = mulm(c, c); c3 = mulm(c2, c); c4 = mulm(c3, c)
-    inv2 = invmod(UInt64(2), p)
-    inv4 = mulm(inv2, inv2)
-    a = (c + c4) % p
-    b = (c2 + c3) % p
-    return Float64[p - inv4, mulm(subm(a, b), inv4),
-                   mulm(subm(c, c4), inv2), mulm(subm(c2, c3), inv2)]
+    inv2 = Float64(invmod(UInt64(2), fp_prime(F)))
+    c1 = Float64(c)
+    c2 = fp_mulmod(c1, c1, F); c3 = fp_mulmod(c2, c1, F); c4 = fp_mulmod(c3, c1, F)
+    inv4 = fp_mulmod(inv2, inv2, F)
+    return Float64[-inv4, fp_mulmod((c1 + c4) - (c2 + c3), inv4, F),
+                   fp_mulmod(c1 - c4, inv2, F), fp_mulmod(c2 - c3, inv2, F)]
 end
 
 # Symmetric-pair constants for the 17-point DFT (see fp_dft17_uv).
@@ -130,28 +126,27 @@ end
 # so each output pair reads 16 contiguous constants.
 function fp_dft17_consts(c::UInt64, F::FpCtx)
     p = fp_prime(F)
-    mulm(x, y) = UInt64(UInt128(x) * y % p)
-    subm(x, y) = x >= y ? x - y : x + p - y
-    inv2 = invmod(UInt64(2), p)
+    inv2 = Float64(invmod(UInt64(2), p))
     rot = Vector{Float64}(undef, 128)
     for r in 1:8, j in 1:8
-        cjr = powermod(c, j * r % 17, p)
-        cmjr = powermod(c, 17 - j * r % 17, p)
-        rot[(r-1)*16+j] = mulm((cjr + cmjr) % p, inv2)
-        rot[(r-1)*16+8+j] = mulm(subm(cjr, cmjr), inv2)
+        cjr = Float64(powermod(c, j * r % 17, p))
+        cmjr = Float64(powermod(c, 17 - j * r % 17, p))
+        rot[(r-1)*16+j] = fp_mulmod(cjr + cmjr, inv2, F)
+        rot[(r-1)*16+8+j] = fp_mulmod(cjr - cmjr, inv2, F)
     end
     return rot
 end
 
-# Canonical Float64 powers r^0, r^1, ..., r^(n-1) mod p, generated 8 lanes at a time
+# Balanced (|w| <= ~p/2) Float64 powers r^0, r^1, ..., r^(n-1) mod p,
+# generated 8 lanes at a time
 function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     np = cld(n, 8) << 3
     t = Vector{Float64}(undef, np)
-    r8 = powermod(r, 8, P)
+    r8 = fp_reduce(Float64(powermod(r, 8, P)), F)
     r8p = r8 / P
-    v = VF8(ntuple(k -> powermod(r, k - 1, P), 8))
+    v = fp_reduce(VF8(ntuple(k -> Float64(powermod(r, k - 1, P)), 8)), F)
     @inbounds for j in 1:8:np
-        SIMD.vstore(SIMD.vifelse(v < 0.0, v + P, v), t, j) # canonicalize to [0, p)
+        SIMD.vstore(v, t, j)
         v = fp_mulmod(v, r8, r8p, F)
     end
     resize!(t, n)
@@ -170,7 +165,7 @@ struct FpNttStage
     tw::Vector{Vector{Float64}}
 end
 
-function build_fp_4(table::Vector{Float64}, N2::Int, L::Int, wi::UInt64)
+function build_fp_4(table::Vector{Float64}, N2::Int, L::Int, wi::Float64)
     q = L >> 2
     st = N2 ÷ L
     len = max(q, 8)
@@ -181,7 +176,7 @@ function build_fp_4(table::Vector{Float64}, N2::Int, L::Int, wi::UInt64)
         tw[2][j+1] = table[2jm*st+1]
         tw[3][j+1] = table[3jm*st+1]
     end
-    return FpNttStage(4, N2, q, [Float64(wi)], tw)
+    return FpNttStage(4, N2, q, [wi], tw)
 end
 
 function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
@@ -189,7 +184,7 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     c = powermod(root, Q, fp_prime(F))
     rot = m == 5 ? fp_dft5_consts(c, F) :
           m == 17 ? fp_dft17_consts(c, F) :
-          Float64[powermod(c, r, fp_prime(F)) for r in 1:m-1]
+          Float64[fp_reduce(Float64(powermod(c, r, fp_prime(F))), F) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
         ωr = powermod(root, r, fp_prime(F))
@@ -230,7 +225,7 @@ function build_fp_plan(N::Int, F::FpCtx)
     end
 
     tw = fp_twiddles(r, span, F)
-    wi = span >= 4 ? powermod(r, span >> 2, fp_prime(F)) : UInt64(1)
+    wi = span >= 4 ? fp_reduce(Float64(powermod(r, span >> 2, fp_prime(F))), F) : 1.0
     L = span
     while L >= 4
         push!(stages, build_fp_4(tw, span, L, wi))
