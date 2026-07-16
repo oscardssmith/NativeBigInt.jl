@@ -44,19 +44,28 @@ end
 NBig(x::Bool) = NBig(Int(x))
 NBig(x::NBig) = x
 
+# mpz_import/mpz_export with explicit 8-byte native-endian words are
+# independent of GMP's limb size (32-bit on Windows), so both directions
+# are a linear copy.
 function NBig(x::BigInt)
-    x == 0 && return NBig(0, EMPTY_LIMBS)
-    return nbig_from_magnitude(x < 0 ? -1 : 1, abs(x))
+    x.size == 0 && return NBig(0, EMPTY_LIMBS)
+    nbits = ccall((:__gmpz_sizeinbase, :libgmp), Csize_t, (Ref{BigInt}, Cint), x, 2)
+    n = (Int(nbits) + 63) >> 6
+    limbs = Memory{Limb}(undef, n)
+    ccall((:__gmpz_export, :libgmp), Ptr{Limb},
+          (Ptr{Limb}, Ptr{Csize_t}, Cint, Csize_t, Cint, Csize_t, Ref{BigInt}),
+          limbs, C_NULL, -1, sizeof(Limb), 0, 0, x)
+    return NBig(sign(Int(x.size)) * n, limbs)
 end
 
 function Base.BigInt(x::NBig)
     n = nlimbs(x)
     n == 0 && return big(0)
-    r = big(0)
-    for i in n:-1:1
-        r = (r << 64) | big(x.limbs[i])
-    end
-    return signbit(x) ? -r : r
+    r = BigInt()
+    ccall((:__gmpz_import, :libgmp), Cvoid,
+          (Ref{BigInt}, Csize_t, Cint, Csize_t, Cint, Csize_t, Ptr{Limb}),
+          r, n, -1, sizeof(Limb), 0, 0, x.limbs)
+    return signbit(x) ? Base.GMP.MPZ.neg!(r) : r
 end
 
 function Base.:(==)(a::NBig, b::NBig)
