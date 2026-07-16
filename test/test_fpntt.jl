@@ -149,7 +149,7 @@ end
 # Two-prime CRT engine
 
 using NativeBigInt: FP_CTX2, mul_fpntt2!, sqr_fpntt2!,
-                    fp_ntt_unpack2!, fp_ntt_params2, ntt_len, two_adicity
+                    fp_ntt_unpack2!, fp_ntt_params, ntt_len, two_adicity
 
 const FP_PI2 = fp_prime(FP_CTX2)
 
@@ -291,7 +291,7 @@ end
     # O(n) check: a wrong limb survives one modulus with prob ~2^-63)
     limbmod(x, n, m) = (r = UInt128(0); for i in n:-1:1; r = ((r << 64) | x[i]) % m; end; UInt64(r))
     let n = 168_000
-        bch, N = fp_ntt_params2(64n, 64n, FP_CTX1, FP_CTX2)
+        bch, N = fp_ntt_params(64n, 64n, FP_CTX1, FP_CTX2)
         @test N >> trailing_zeros(N) == 17
         am = Memory{Limb}(rand(rng, UInt64, n))
         bm = Memory{Limb}(rand(rng, UInt64, n))
