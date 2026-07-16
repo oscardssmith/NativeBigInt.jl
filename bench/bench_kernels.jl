@@ -116,15 +116,18 @@ function run_sqr(sizes)
          "sqr!" => (() -> @belapsed sqr!($r, 0, $a, 0, $n)),
          "mul!(a,a)" => (() -> @belapsed mul!($r, 0, $a, 0, $n, $a, 0, $n))]
     end)
-    println("\ncrossover: basecase vs one-level Karatsuba")
-    sweep((24, 32, 40, 48, 56, 64, 80), n -> begin
+    # crossover sweeps reuse `sizes`, each filtered to its relevant range
+    bc_sizes = filter(n -> 16 <= n <= 96, sizes)
+    isempty(bc_sizes) || println("\ncrossover: basecase vs one-level Karatsuba")
+    sweep(bc_sizes, n -> begin
         a = rlimbs(n); r = Memory{Limb}(undef, 2n)
         s = Memory{Limb}(undef, kar_scratch_len(n, n))   # force one kar level
         ["bc" => (() -> @belapsed sqr_basecase!($r, 0, $a, 0, $n)),
          "kar" => (() -> @belapsed sqr_kar!($r, 0, $a, 0, $n, $s, 0, $n))]
     end)
-    println("\ncrossover: Karatsuba vs fp NTT")
-    sweep((256, 320, 384, 448, 512, 640, 768, 1024), n -> begin
+    ntt_sizes = filter(n -> n >= 96, sizes)
+    isempty(ntt_sizes) || println("\ncrossover: Karatsuba vs fp NTT")
+    sweep(ntt_sizes, n -> begin
         a = rlimbs(n); r = Memory{Limb}(undef, 2n)
         s = Memory{Limb}(undef, sqr_scratch_len(n))
         ["kar" => (() -> @belapsed sqr_kar!($r, 0, $a, 0, $n, $s, 0)),
@@ -287,7 +290,7 @@ const FAMILIES = Dict(
     "micro"   => (run_micro,   [1, 2, 4, 8, 16, 32, 64, 128, 256]),
     "radix"   => (run_radix,   [1 << k for k in 8:16]),
     "mul"     => (run_mul,     [8, 16, 25, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]),
-    "sqr"     => (run_sqr,     [2, 4, 8, 12, 16, 24, 32, 40, 48, 64, 96, 128, 192, 256]),
+    "sqr"     => (run_sqr,     [2, 4, 8, 12, 16, 24, 32, 40, 48, 64, 96, 128, 160, 192, 256, 384, 512]),
     "div"     => (run_div,     [2, 4, 8, 16, 32, 64, 128]),
     "kar"     => (run_kar,     [32, 48, 64, 80, 96, 128, 192, 256]),
     "dc"      => (run_dc,      [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]),

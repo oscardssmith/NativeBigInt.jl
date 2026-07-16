@@ -2,7 +2,8 @@
 # coefficients live in Float64, products use the FMA error-free transform,
 # and quotients use the magic-constant round.  The operands are split into
 # b-bit chunks and the convolution is computed by CRT over two just-under-2^50
-# primes (working modulus p1·p2 ≈ 2^99.99, so b ≈ 42-45).
+# primes (working modulus p1·p2 ≈ 2^99.99, so b ≈ 46 at typical sizes,
+# shrinking slowly with operand length — see fp_ntt_params).
 #
 # Arithmetic model.  Values are exact integers in balanced representation,
 # |x| < a few p.  Every operation is exactly correct (not approximately):
@@ -54,7 +55,7 @@ function fp_generator(p::UInt64, facs)
     error("unreachable: GF(p) has a small generator")
 end
 
-# prime to do a NTT over, the factorization of P-1 as (prime => exponent) pairs,
+# A prime to do an NTT over, the factorization of P-1 as (prime => exponent) pairs,
 # and a primitive root of GF(P).  The constructor checks facs is the complete
 # factorization of P-1 and supplies the 2/3/5/7 radices, so every valid N | P-1
 # has a primitive Nth root — build_fp_plan trusts gen without rechecking order.
@@ -77,8 +78,7 @@ end
 const FP_CTX1 = FpCtx{65205 * 2^34 + 1}((2 => 34, 3 => 4, 5 => 1, 7 => 1, 23 => 1))
 const FP_CTX2 = FpCtx{4095 * 2^38 + 1}((2 => 38, 3 => 2, 5 => 1, 7 => 1, 13 => 1))
 
-# magic rounding constant. FP_MAGIC + x - FP_MAGIC rounds x to Int.
-const FP_MAGIC = 1.5*2^52 
+const FP_MAGIC = 1.5 * 2^52  # magic rounding constant, see fp_round
 # exact round-to-nearest-integer for |v| <= 2^51 (scalar and VF8)
 @inline fp_round(v) = (v + FP_MAGIC) - FP_MAGIC
 
@@ -185,10 +185,9 @@ function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     return t
 end
 
-# Transform plan: N = m·2^k, m divides 315, 2^k | p - 1.
-# rot holds the DFT combine constants 
-# tw holds the m-1 per-residue twiddle tables. All constant multiplies go through fp_mulmod.
-# span is the block size the stage processes at each offset.
+# One transform pass: rot holds the DFT combine constants, tw the m-1
+# per-residue twiddle tables (all minimal balanced), and span is the block
+# size the stage processes at each offset.
 struct FpNttStage
     m::Int
     span::Int
@@ -229,8 +228,8 @@ struct FpNttPlan{C<:FpCtx}
     ctx::C
     N::Int
     N2::Int
-    ninv::Float64
-    ninvp::Float64  # 1/N; applied in the unpack
+    ninv::Float64   # 1/N mod p, minimal balanced; applied in the unpack
+    ninvp::Float64  # ninv/p, its precomputed fp_mulmod quotient companion
     stages::Vector{FpNttStage}  # forward order: odd radices, then the radix-4 tower
 end
 
@@ -308,7 +307,7 @@ end
     return a + (b + c), (a - c) + u, (a - b) - u
 end
 
-function fp_radix3!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
+function fp_radix3!(x::AbstractVector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
                     ::Val{FWD}) where {FWD}
     (;Q, tw, rot) = st
     ω3 = rot[1]
@@ -357,8 +356,8 @@ end
 # Winograd order-5 DFT combine, 6 mulmods by ±-pairing the outputs:
 # y1+y4 = 2·x0 + a·(x1+x4) + b·(x2+x3) for
 # a = ω + ω^4, b = ω^2 + ω^3, and a + b = -1 rewrites that as
-# 2·x0 - S/2 + ((a-b)/2)·D — one mulmod, not two. 
-# With the halving folded into k1..k4 (fp_dft5_consts), 
+# 2·x0 - S/2 + ((a-b)/2)·D — one mulmod, not two.
+# With the halving folded into k1..k4 (fp_dft5_consts),
 # r, q, g1, g2 below are the half-sums and half-differences of the pairs:
 #   (y1+y4)/2 = x0 + k1·S + k2·D = r + q     (y1-y4)/2 = k3·t3 + k4·t4 = g1
 #   (y2+y3)/2 = r - q                        (y2-y3)/2 = k4·t3 - k3·t4 = g2
@@ -382,7 +381,7 @@ end
     return y0, u + g1, v + g2, v - g2, u - g1
 end
 
-function fp_radix5!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
+function fp_radix5!(x::AbstractVector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
                     ::Val{FWD}) where {FWD}
     (;Q, tw, rot) = st
     k1, k2, k3, k4 = rot
@@ -492,7 +491,7 @@ end
     return y0, a1 + v1, a2 + v2, a3 + v3, a3 - v3, a2 - v2, a1 - v1
 end
 
-function fp_radix7!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
+function fp_radix7!(x::AbstractVector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
                     ::Val{FWD}) where {FWD}
     (;Q, tw, rot) = st
     j = 0
@@ -593,7 +592,7 @@ end
     end
 end
 
-function fp_smallq!(x::Vector{Float64}, o::Int, N2::Int, ::Val{Q},
+function fp_smallq!(x::AbstractVector{Float64}, o::Int, N2::Int, ::Val{Q},
                     stg::FpNttStage, wi::Float64, F::FpCtx,
                     ::Val{FWD}) where {Q,FWD}
     vw1 = SIMD.vload(VF8, stg.tw[1], 1)
@@ -628,7 +627,7 @@ end
 # directions (the DFT2 matrix is its own transpose).  Outputs are reduced:
 # raw they reach ~2.4p, and the forward feeds the pointwise stage, whose
 # product of two values must stay within the 2^51·p mulmod domain.
-function fp_radix2!(x::Vector{Float64}, N::Int, F::FpCtx)
+function fp_radix2!(x::AbstractVector{Float64}, N::Int, F::FpCtx)
     @inbounds for s in 0:2:N-1
         u = x[s+1]
         v = x[s+2]
@@ -638,11 +637,12 @@ function fp_radix2!(x::Vector{Float64}, N::Int, F::FpCtx)
     return x
 end
 
-# One radix-4 stage (butterfly span 4Q) over the length stg.span block at offset o.
-# Both directions run the same twiddle+reduce pass (reduce the ω^0 lane, twiddle the rest)
-# FWD picks which side of it the DFT4 combine; before for forward, after for reverse.
-# Reverse outputs store raw. The next stage's ω^0 reduce or the unpack's 1/N mulmod absorbs them.
-function fp_radix4!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
+# One radix-4 stage (butterfly span 4Q) over the length st.span block at offset o.
+# Both directions run the same twiddle+reduce pass (reduce the ω^0 lane, twiddle
+# the rest); FWD picks which side of it the DFT4 combine runs on — before it for
+# forward, after it for reverse.  Reverse outputs store raw: the next stage's
+# ω^0 reduce or the unpack's 1/N mulmod absorbs them.
+function fp_radix4!(x::AbstractVector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
                     ::Val{FWD}) where {FWD}
     (;Q, tw, rot) = st
     if Q >= 8
@@ -700,7 +700,7 @@ function fp_radix4!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
     return x
 end
 
-@inline function fp_stage!(x::Vector{Float64}, st::FpNttStage, plan::FpNttPlan,
+@inline function fp_stage!(x::AbstractVector{Float64}, st::FpNttStage, plan::FpNttPlan,
                            fwd::Val)
     F = plan.ctx
     for o in 0:st.span:plan.N-1
@@ -712,7 +712,7 @@ end
     return x
 end
 
-function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
+function fp_ntt_fwd!(x::AbstractVector{Float64}, plan::FpNttPlan)
     for stage in plan.stages
         fp_stage!(x, stage, plan, Val(true))
     end
@@ -720,11 +720,11 @@ function fp_ntt_fwd!(x::Vector{Float64}, plan::FpNttPlan)
     return x
 end
 
-# Transpose of fp_ntt_fwd! (same twiddles, stages reversed): 
+# Transpose of fp_ntt_fwd! (same twiddles, stages reversed):
 # consumes the forward's scrambled output order and returns natural order.
 # Fed pointwise product Ĉ it yields N·c[(N-t) mod N];
 # the unpack reads backwards and folds in the 1/N.
-function fp_ntt_rev!(x::Vector{Float64}, plan::FpNttPlan)
+function fp_ntt_rev!(x::AbstractVector{Float64}, plan::FpNttPlan)
     isodd(trailing_zeros(plan.N2)) && fp_radix2!(x, plan.N, plan.ctx)
     for stage in Iterators.reverse(plan.stages)
         fp_stage!(x, stage, plan, Val(false))
@@ -741,7 +741,7 @@ end
 # doubles and, being smaller than every prime, already canonical residues.
 # Overwrites all of x (chunks, then zero fill), so callers can recycle a
 # spent transform buffer.
-function fp_ntt_pack!(x::Vector{Float64}, limbs::Memory{Limb}, lo::Int, n::Int,
+function fp_ntt_pack!(x::AbstractVector{Float64}, limbs::Memory{Limb}, lo::Int, n::Int,
                       b::Int, nch::Int)
     N = length(x)
     mask = (UInt64(1) << b) - 1
@@ -767,7 +767,7 @@ function fp_ntt_pack!(x::Vector{Float64}, limbs::Memory{Limb}, lo::Int, n::Int,
     return x
 end
 
-function fp_ntt_pointwise!(xa::Vector{Float64}, xb::Vector{Float64}, F::FpCtx)
+function fp_ntt_pointwise!(xa::AbstractVector{Float64}, xb::AbstractVector{Float64}, F::FpCtx)
     n = length(xa)
     i = 1
     if n >= 8
@@ -803,7 +803,7 @@ end
 
 # One scalar coefficient: unscale each residue by 1/N and Garner-combine into
 # the mod-p1 limb c1 and correction uu (both canonical UInt64).
-@inline function fp_unpack_coeff(x1::Vector{Float64}, x2::Vector{Float64}, idx::Int,
+@inline function fp_unpack_coeff(x1::AbstractVector{Float64}, x2::AbstractVector{Float64}, idx::Int,
                                  n1::Float64, n1p::Float64, n2::Float64, n2p::Float64,
                                  g::Float64, gp::Float64)
     v1 = fp_mulmod(x1[idx], n1, n1p, FP_CTX1)
@@ -821,8 +821,8 @@ end
 # loop packs the same layout with SIMD; this is the < 8-wide head/tail fallback.
 # @noinline keeps its fp_mulmod chains out of fp_ntt_unpack2!'s hot loop, whose
 # adc recognition degrades when the function is bloated.
-@noinline function fp_unpack_scalar!(stage::Vector{UInt64}, x1::Vector{Float64},
-                                 x2::Vector{Float64}, N::Int, i::Int, cnt::Int,
+@noinline function fp_unpack_scalar!(stage::Vector{UInt64}, x1::AbstractVector{Float64},
+                                 x2::AbstractVector{Float64}, N::Int, i::Int, cnt::Int,
                                  s::Int, b::Int, n1::Float64, n1p::Float64,
                                  n2::Float64, n2p::Float64, g::Float64, gp::Float64)
     @inbounds for j in 0:cnt-1
@@ -831,7 +831,7 @@ end
         c1, uu = fp_unpack_coeff(x1, x2, idx, n1, n1p, n2, n2p, g, gp)
         sh = (s + j * b) & 63
         stage[j+1]  = c1 << sh
-        stage[j+9]  = (c1 >> 1) >> (63 - sh) # 64 - sh but dodging the expensive case cause cpus are dumb
+        stage[j+9]  = (c1 >> 1) >> (63 - sh) # same as >> (64 - sh), avoiding shift by 64
         stage[j+17] = uu << sh
         stage[j+25] = (uu >> 1) >> (63 - sh)
     end
@@ -867,7 +867,7 @@ end
 end
 
 function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
-                         x1::Vector{Float64}, x2::Vector{Float64}, nconv::Int,
+                         x1::AbstractVector{Float64}, x2::AbstractVector{Float64}, nconv::Int,
                          b::Int, n1::Float64, n1p::Float64, n2::Float64, n2p::Float64)
     N = length(x1)
     s2 = Memory{Limb}(undef, rn)
@@ -924,10 +924,10 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
     return r
 end
 
-# pick min m·2^k >= T
-# The admissible multipliers come in T-size tiers
-# When the FFT fits in L1/L2 only very fast transforms are worthwhile
-# In L3, we are memory bound, but doing multiple slow transforms to save <1% isn't worth it.
+# Pick the smallest admissible N = m·2^k >= T.  The multiplier set is tiered
+# by T: while the FFT fits in L1/L2 only very fast transforms are worthwhile;
+# in L3 we are memory bound, but running several slow odd-radix stages to save
+# <1% of the points still isn't worth it — the full set waits for RAM sizes.
 # A pure 2^k tops out at 2^34 (~37 GB operands) since 2^k must divide all p-1.
 # The odd multipliers then extend reach to 315·2^34 (~12 TB).
 const NTT_MS_SMALL = [1, 3, 5, 9]
@@ -976,10 +976,9 @@ function fp_ntt_params(bits_a::Int, bits_b::Int, ctxs::Vararg{FpCtx,N}) where {N
     error("unreachable: b == 1 always satisfies the bound for supported sizes")
 end
 
-# Two-prime CRT pipeline. The working modulus p1·p2 ≈ 2^99.99 chunk width
-# b ≈ (100 - log2 nc)/2 ≈ 46 bits at 256 chunks and >32 bits until >10 billion chunks
-# mpn-layer entry points: r[1..m+n] = a[1..m]·b[1..n], r must not alias the inputs.
-# Calls fp_ntt_pack! right before fp_ntt_fwd! to improve locality.
+# Two-prime CRT pipeline, the mpn-layer entry points: r[1..m+n] = a[1..m]·b[1..n],
+# r must not alias the inputs.  The working modulus p1·p2 ≈ 2^99.99 gives chunk
+# width b ≈ (100 - log2 nc)/2: 46 bits at 256 chunks, >32 until >10 billion chunks.
 function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
                      b::Memory{Limb}, bo::Int, n::Int)
     bits_a = magnitude_bits(a, ao, m)
@@ -988,13 +987,22 @@ function mul_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca, ncb = cld(bits_a, bch), cld(bits_b, bch)
-    tmp1 = fp_ntt_pack!(Vector{Float64}(undef, N), a, ao, m, bch, nca)
+    # a is packed once (tmp3) and kept for the in-place plan-2 transform; only
+    # b, whose plan-1 copy is consumed by the pointwise product, is re-packed.
+    # One backing allocation wrapped as three dense Vectors: one malloc instead
+    # of three (small sizes sit right at the Karatsuba crossover), without the
+    # per-access indexing overhead views cost in the radix loops.
+    buf = Memory{Float64}(undef, 3N)
+    tmp1 = Base.wrap(Array, memoryref(buf, 1), (N,))
+    tmp2 = Base.wrap(Array, memoryref(buf, N + 1), (N,))
+    tmp3 = Base.wrap(Array, memoryref(buf, 2N + 1), (N,))
+    fp_ntt_pack!(tmp3, a, ao, m, bch, nca)
+    copyto!(tmp1, tmp3)
     fp_ntt_fwd!(tmp1, plan1)
-    tmp2 = fp_ntt_pack!(Vector{Float64}(undef, N), b, bo, n, bch, ncb)
+    fp_ntt_pack!(tmp2, b, bo, n, bch, ncb)
     fp_ntt_fwd!(tmp2, plan1)
     fp_ntt_pointwise!(tmp1, tmp2, FP_CTX1)
     fp_ntt_rev!(tmp1, plan1)
-    tmp3 = fp_ntt_pack!(Vector{Float64}(undef, N), a, ao, m, bch, nca)
     fp_ntt_fwd!(tmp3, plan2)
     fp_ntt_pack!(tmp2, b, bo, n, bch, ncb)
     fp_ntt_fwd!(tmp2, plan2)
@@ -1011,11 +1019,15 @@ function sqr_fpntt2!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, n::Int)
     plan1 = fp_ntt_plan(N, FP_CTX1)
     plan2 = fp_ntt_plan(N, FP_CTX2)
     nca = cld(bits, bch)
-    tmp1 = fp_ntt_pack!(Vector{Float64}(undef, N), a, ao, n, bch, nca)
+    # single pack: tmp2 keeps the packed input for the in-place plan-2 pass
+    buf = Memory{Float64}(undef, 2N)
+    tmp1 = Base.wrap(Array, memoryref(buf, 1), (N,))
+    tmp2 = Base.wrap(Array, memoryref(buf, N + 1), (N,))
+    fp_ntt_pack!(tmp2, a, ao, n, bch, nca)
+    copyto!(tmp1, tmp2)
     fp_ntt_fwd!(tmp1, plan1)
     fp_ntt_pointwise!(tmp1, tmp1, FP_CTX1)
     fp_ntt_rev!(tmp1, plan1)
-    tmp2 = fp_ntt_pack!(Vector{Float64}(undef, N), a, ao, n, bch, nca)
     fp_ntt_fwd!(tmp2, plan2)
     fp_ntt_pointwise!(tmp2, tmp2, FP_CTX2)
     fp_ntt_rev!(tmp2, plan2)
