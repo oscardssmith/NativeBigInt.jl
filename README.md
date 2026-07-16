@@ -83,9 +83,10 @@ Three layers, mirroring GMP's mpn/mpz split:
 - **fp NTT multiplication (`src/fpntt.jl`):** the sole large-size engine —
   number-theoretic transforms computed entirely in `Float64` in the style
   of FLINT's `fft_small`, with the convolution recombined by CRT over two
-  just-under-2^50 primes (p₁ = 16335·2^36 + 1, p₂ = 2^50 − 2^38 + 1;
-  working modulus p₁·p₂ ≈ 2^99.99 keeps the chunk width at ~42–45 bits
-  across all practical sizes, Garner recombination in the unpack).
+  just-under-2^50 primes (p₁ = 65205·2^34 + 1, p₂ = 2^50 − 2^38 + 1, both
+  with 3²·5·7 | p−1; working modulus p₁·p₂ ≈ 2^99.99 keeps the chunk width
+  at ~42–45 bits across all practical sizes, Garner recombination in the
+  unpack).
   Products use the FMA error-free transform (`h = x*w; l = fma(x, w, -h)`
   captures the exact ~100-bit product with no carry chains), reduction is
   a Barrett quotient via the magic-constant round (p < 2^50 with all
@@ -100,13 +101,15 @@ Three layers, mirroring GMP's mpn/mpz split:
   transposed forward network (reverse stage order, the same forward twiddle
   tables — no inverse twiddles or 1/N pre-scale pass exist), which hands
   the unpack N·c index-reversed with the 1/N folded into unpack's
-  descending read. Transform lengths m·2^k for
-  m ∈ {1, 3, 5} (Winograd radix-3 and radix-5 passes; the combined
-  multiplier m = 15 joins from 15·2^14 points, where its cache-blocked odd
-  passes and tighter padding beat one monolithic pow-2 transform) keeping
-  zero-padding waste ≤ ~25% (≤ ~19% once m = 15 is admitted), in-register
-  shuffle butterflies for sub-vector-width stages, and squaring with one
-  forward transform instead of two.
+  descending read. Transform lengths m·2^k for m | 315 (Winograd radix-3,
+  radix-5, and radix-7 passes, radix 3 up to twice), with bench-placed
+  per-multiplier admission floors: {3, 5, 9} at any size, {7, 15, 21, 105}
+  from m·2^14 points where the cache-blocked odd passes and tighter padding
+  beat one monolithic pow-2 transform, and {35, 45, 63, 315} from m·2^20
+  where transforms go DRAM-bound and the smallest length wins outright —
+  zero-padding waste is ≤ ~12.5% at small sizes and ≤ ~7% in the spill
+  regime, with in-register shuffle butterflies for sub-vector-width stages,
+  and squaring with one forward transform instead of two.
 - **`NBig` (`src/nbig.jl`):** sign-magnitude value type
   (`signlen = sign * limb count`, little-endian normalized `Memory{UInt64}`),
   covering comparison, `+`/`-`/`*`, `divrem`/`div`/`rem`/`mod`/`fld`/`cld`,

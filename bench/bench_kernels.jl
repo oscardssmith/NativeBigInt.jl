@@ -16,6 +16,9 @@
 #   mullo    mullo!/sqrlo! sweep vs the full product they replace
 #   barrett  BARRETT_THRESHOLD / BARRETT_EVEN_THRESHOLD sweep (powermod_limbs)
 #   sqrt     SQRT_DIVAPPR_THRESHOLD sweep (isqrt divappr vs exact vs gmp)
+#   radix    fp NTT fwd+rev ns/point per odd multiplier m (tunes ntt_len's
+#            family admission: a multiplier only deserves selection where its
+#            per-point cost stays below the padding it saves)
 #
 # Trailing integer args override the size list of the family they follow.
 using NativeBigInt, BenchmarkTools, Random
@@ -25,7 +28,8 @@ using NativeBigInt: Limb,
     sqr_fpntt2!, kar_scratch_len, sqr_scratch_len, MUL_FPNTT_THRESHOLD,
     divrem!, divrem_1!, divrem_dc!, divrem_bc!, invert_pi1, gcd!, gcdext!,
     mullo!, sqrlo!, mullo_basecase!, sqrlo_basecase!, mullo_scratch_len,
-    sqrlo_scratch_len, powermod_limbs
+    sqrlo_scratch_len, powermod_limbs,
+    fp_ntt_plan, fp_ntt_fwd!, fp_ntt_rev!, FP_CTX1, fp_prime, two_adicity
 
 # large sizes are µs–ms scale; a modest per-measurement budget keeps sweeps quick
 BenchmarkTools.DEFAULT_PARAMETERS.seconds = 0.5
@@ -249,9 +253,39 @@ function run_sqrt(bits)
     end; unit = 1e6, u = "us")
 end
 
+# radix: per-point fwd+rev transform cost by odd multiplier m, at point-count
+# targets T (one block per T; N = m·2^k is the smallest m-length >= T).  The
+# ratio column is vs the pure pow2 transform of the same coverage — an m is
+# worth admitting in ntt_len where its ratio is below the padding factor it
+# saves (up to 2·(next multiplier gap)).
+function run_radix(targets)
+    F = FP_CTX1
+    p = fp_prime(F)
+    maxk = two_adicity(F)
+    for T in targets
+        println("T = $T points:")
+        ref = 0.0
+        for m in (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315)
+            k = max(Base.top_set_bit(cld(T, m) - 1), 2)
+            k <= maxk || continue
+            N = m << k
+            x = Float64.(rand(UInt64(0):p-1, N))
+            plan = fp_ntt_plan(N, F)
+            t = @belapsed (fp_ntt_fwd!($x, $plan); fp_ntt_rev!($x, $plan))
+            perpt = t / N * 1e9
+            m == 1 && (ref = perpt)
+            println("  ", rpad("m=$m", 7), rpad("N=$N", 12),
+                    rpad("$(round(perpt, digits = 3)) ns/pt", 14),
+                    "(", round(perpt / ref, digits = 2), ")")
+            flush(stdout)
+        end
+    end
+end
+
 # ---- dispatch --------------------------------------------------------------
 const FAMILIES = Dict(
     "micro"   => (run_micro,   [1, 2, 4, 8, 16, 32, 64, 128, 256]),
+    "radix"   => (run_radix,   [1 << k for k in 8:16]),
     "mul"     => (run_mul,     [8, 16, 25, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]),
     "sqr"     => (run_sqr,     [2, 4, 8, 12, 16, 24, 32, 40, 48, 64, 96, 128, 192, 256]),
     "div"     => (run_div,     [2, 4, 8, 16, 32, 64, 128]),

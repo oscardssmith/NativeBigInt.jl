@@ -14,8 +14,8 @@
 #   - fp_round(v) = (v + 1.5·2^52) - 1.5·2^52 rounds exactly to the nearest
 #     integer for |v| <= 2^51.
 #
-# A transform of length N = m·2^k (m | 15, 2^k | p - 1) is a flat list of
-# uniform FpNttStage passes — the odd radices (5/3) first, then the
+# A transform of length N = m·2^k (m | 315, 2^k | p - 1) is a flat list of
+# uniform FpNttStage passes — the odd radices (7/5/3, radix 3 up to twice) first, then the
 # radix-4 tower, plus a twiddle-free radix-2 pass when k is odd.  The reverse
 # transform (fp_ntt_rev!) runs the same stages in reverse order; each stage's
 # transpose reuses its forward tables (the DFT matrices are symmetric), so
@@ -47,7 +47,7 @@ const VF8 = SIMD.Vec{8,Float64}
 
 # smallest small generator of GF(p)*, given the prime factors of p-1
 function fp_generator(p::UInt64, facs)
-    for g in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
+    for g in 3:63
         all(powermod(UInt64(g), (p - 1) ÷ q, p) != 1 for (q, _) in facs) &&
             return UInt64(g)
     end
@@ -56,14 +56,14 @@ end
 
 # prime to do a NTT over, the factorization of P-1 as (prime => exponent) pairs,
 # and a primitive root of GF(P).  The constructor checks facs is the complete
-# factorization of P-1 and supplies the 2/3/5 radices, so every valid N | P-1
+# factorization of P-1 and supplies the 2/3/5/7 radices, so every valid N | P-1
 # has a primitive Nth root — build_fp_plan trusts gen without rechecking order.
 struct FpCtx{P}
     facs::Tuple{Vararg{Pair{Int,Int}}}
     gen::UInt64
     function FpCtx{P}(facs::Tuple{Vararg{Pair{Int,Int}}}) where {P}
         @assert prod(q^e for (q, e) in facs) == P - 1
-        @assert all(in(map(first, facs)), (2, 3, 5))
+        @assert all(in(map(first, facs)), (2, 3, 5, 7))
         new{P}(sort(facs), fp_generator(UInt64(P), facs))
     end
 end
@@ -72,8 +72,9 @@ end
 @inline two_adicity(F::FpCtx) = F.facs[1].second
 
 # Both primes just under 2^50 (rounding bounds above), maximizing the CRT
-# modulus p1·p2, with 15·2^k | p-1 for the radix 2^k and radix 3, 5 transforms
-const FP_CTX1 = FpCtx{16335 * 2^36 + 1}((2 => 36, 3 => 3, 5 => 1, 11 => 2))
+# modulus p1·p2, with 105·2^k | p-1 for the radix 2^k and radix 3, 5, 7
+# transforms
+const FP_CTX1 = FpCtx{65205 * 2^34 + 1}((2 => 34, 3 => 4, 5 => 1, 7 => 1, 23 => 1))
 const FP_CTX2 = FpCtx{4095 * 2^38 + 1}((2 => 38, 3 => 2, 5 => 1, 7 => 1, 13 => 1))
 
 # magic rounding constant. FP_MAGIC + x - FP_MAGIC rounds x to Int.
@@ -134,6 +135,38 @@ function fp_dft5_consts(c::UInt64, F::FpCtx)
                    fp_minbal(fp_mulmod(c2 - c3, inv2, F), F)]
 end
 
+# Winograd constants for the 7-point DFT (see fp_dft7).  Pairing x_j with
+# x_{7-j} splits the 6x6 DFT matrix into half-sum/half-difference quadrants
+# A_{jr} = (c^{jr} + c^{-jr})/2, B_{jr} = (c^{jr} - c^{-jr})/2; reindexing the
+# pairs by the generator 3 mod 7 (pair orbit 1 -> 3 -> 2, and 3³ ≡ -1 folds
+# onto the same pairs) makes the A quadrant a 3-point cyclic correlation with
+# a = (A_1, A_3, A_2) and the B quadrant a skew-cyclic one with
+# b = (B_1, B_3, B_2).  Each 3-convolution is done CRT-style in 4 mulmods
+# (x³∓1 = (x∓1)(x²±x+1)), with the 1/3 of the reconstruction idempotents
+# folded into the constants:
+#   [1] K1  = (a0+a1+a2)/3      [5] Kn  = (b0-b1+b2)/3
+#   [2] b'0 = (a0-a2)/3         [6] n0  = (b0-b2)/3
+#   [3] b'1 = (a1-a2)/3         [7] n1  = (b1+b2)/3
+#   [4] b'0+b'1                 [8] n0+n1
+function fp_dft7_consts(c::UInt64, F::FpCtx)
+    p = fp_prime(F)
+    inv2 = Float64(invmod(UInt64(2), p))
+    inv3 = Float64(invmod(UInt64(3), p))
+    cj = [Float64(powermod(c, j, p)) for j in 1:6]
+    A(j) = fp_mulmod(cj[j] + cj[7-j], inv2, F)
+    B(j) = fp_mulmod(cj[j] - cj[7-j], inv2, F)
+    a0, a1, a2 = A(1), A(3), A(2)
+    b0, b1, b2 = B(1), B(3), B(2)
+    bp0 = fp_minbal(fp_mulmod(a0 - a2, inv3, F), F)
+    bp1 = fp_minbal(fp_mulmod(a1 - a2, inv3, F), F)
+    n0 = fp_minbal(fp_mulmod(b0 - b2, inv3, F), F)
+    n1 = fp_minbal(fp_mulmod(b1 + b2, inv3, F), F)
+    return Float64[fp_minbal(fp_mulmod((a0 + a1) + a2, inv3, F), F), bp0, bp1,
+                   fp_minbal(bp0 + bp1, F),
+                   fp_minbal(fp_mulmod((b0 + b2) - b1, inv3, F), F), n0, n1,
+                   fp_minbal(n0 + n1, F)]
+end
+
 # Minimal balanced (|w| <= p/2) Float64 powers r^0, r^1, ..., r^(n-1) mod p,
 # generated 8 lanes at a time; the per-step fp_minbal keeps the chain minimal
 # (raw mulmod output drifts to ~0.57p).
@@ -152,7 +185,7 @@ function fp_twiddles(r::UInt64, n::Int, F::FpCtx{P}) where P
     return t
 end
 
-# Transform plan: N = m·2^k, m divides 15, 2^k | p - 1.
+# Transform plan: N = m·2^k, m divides 315, 2^k | p - 1.
 # rot holds the DFT combine constants 
 # tw holds the m-1 per-residue twiddle tables. All constant multiplies go through fp_mulmod.
 # span is the block size the stage processes at each offset.
@@ -182,6 +215,7 @@ function build_fp_odd(m::Int, span::Int, root::UInt64, F::FpCtx)
     Q = span ÷ m
     c = powermod(root, Q, fp_prime(F))
     rot = m == 5 ? fp_dft5_consts(c, F) :
+          m == 7 ? fp_dft7_consts(c, F) :
           Float64[fp_reduce(Float64(powermod(c, r, fp_prime(F))), F) for r in 1:m-1]
     tw = Vector{Vector{Float64}}(undef, m - 1)
     for r in 1:m-1
@@ -203,22 +237,26 @@ end
 function build_fp_plan(N::Int, F::FpCtx)
     k = trailing_zeros(N)
     m = N >> k
-    # N = m·2^k with odd part m | 15 (radix 3/5 stages) and 2^k | P-1; with a
-    # validated FpCtx this is the full precondition, and ω is a primitive Nth root.
-    @assert m in (1, 3, 5, 15) && (m == 1 || k >= 2) && k <= two_adicity(F)
+    # N = m·2^k with odd part m | 315 (radix 3/5/7 stages, radix 3 up to twice —
+    # both primes carry 3²) and 2^k | P-1; with a validated FpCtx this is the
+    # full precondition, and ω is a primitive Nth root.
+    @assert m in (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315) &&
+            (m == 1 || k >= 2) && k <= two_adicity(F)
+    @assert (fp_prime(F) - 1) % N == 0
     ω = powermod(F.gen, (fp_prime(F) - 1) ÷ N, fp_prime(F))
 
     stages = FpNttStage[]
     span = N
     r = ω
-    # peel the arithmetic-heavier radix first: it lands at span == N, where the
+    # peel the arithmetic-heaviest radix first: it lands at span == N, where the
     # twiddle table is largest and least reused, so its denser mulmods overlap
-    # the memory traffic the cheaper radix can't hide.
-    for mf in (5, 3)
+    # the memory traffic the cheaper radices can't hide.
+    for mf in (7, 5, 3, 3)
         if m % mf == 0
             push!(stages, build_fp_odd(mf, span, r, F))
             r = powermod(r, mf, fp_prime(F))
             span ÷= mf
+            m ÷= mf
         end
     end
 
@@ -256,9 +294,9 @@ function fp_ntt_plan(N::Int, F::C) where {C<:FpCtx}
 end
 
 # ---------------------------------------------------------------------------
-# Odd-radix stages: Winograd radix-3 and radix-5.
+# Odd-radix stages: Winograd radix-3 and radix-5, symmetric-pair radix-7.
 # A stage is twiddle+reduce with the combine before it (forward) or after it
-# (reverse); radix-3 and radix-5 share that twiddle+reduce block.
+# (reverse); all three share that twiddle+reduce structure.
 
 # Raw Winograd 3-point combine (u = ω3·(b - c) folds the matrix into one
 # mulmod). Every output, including ω^0, comes back unreduced: the forward
@@ -404,11 +442,105 @@ function fp_radix5!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
     return x
 end
 
+# Winograd 7-point DFT (constants and derivation in fp_dft7_consts): with
+# s_j = x_j + x_{7-j}, d_j = x_j - x_{7-j} (j = 1..3),
+#   y_r     = x0 + u_r + v_r,   y_{7-r} = x0 + u_r - v_r
+# where (u_1,u_3,u_2) is the cyclic 3-convolution of (s_1,s_2,s_3) with the
+# A-constants and (v_1,v_3,v_2) the skew-cyclic one of the d's with the
+# B-constants — 8 mulmods per column instead of the DFT matrix's 36.
+# Bounds: RED (reverse only) closes the twiddled s,d at <= ~0.55p, so every
+# convolution input sum is <= ~2.2p (round argument <= ~1.1p) and mulmod
+# outs are <= ~0.6p; the reconstruction sums reach <= ~5p < 2^53/p before
+# the u/v reduces, so every y is <= |x0| + ~1.1p.  In the forward, radix-7
+# runs first and its inputs are pack chunks << p, so the entry reduces are
+# skipped but the u/v reduces stay (mulmod outputs are ~p/2 regardless of
+# input size, and 5 of them accumulate).  y0 comes back unreduced; the
+# forward's shared block reduces it, the reverse re-reduces after the
+# combine.
+@inline function fp_dft7(x0, x1, x2, x3, x4, x5, x6, rot::Vector{Float64},
+                         F::FpCtx, ::Val{RED}) where {RED}
+    T = typeof(x0)
+    s1 = x1 + x6; d1 = x1 - x6
+    s2 = x2 + x5; d2 = x2 - x5
+    s3 = x3 + x4; d3 = x3 - x4
+    if RED
+        s1 = fp_reduce(s1, F); s2 = fp_reduce(s2, F); s3 = fp_reduce(s3, F)
+        d1 = fp_reduce(d1, F); d2 = fp_reduce(d2, F); d3 = fp_reduce(d3, F)
+    end
+    S = (s1 + s2) + s3
+    y0 = x0 + S
+    @inbounds begin
+        m1 = fp_mulmod(S, T(rot[1]), F)
+        va = s1 - s3; vb = s2 - s3
+        w0 = fp_mulmod(va, T(rot[2]), F)
+        w1 = fp_mulmod(vb, T(rot[3]), F)
+        w2 = fp_mulmod(va + vb, T(rot[4]), F)
+        mn = fp_mulmod((d1 + d2) - d3, T(rot[5]), F)
+        wa = d1 + d3; wb = -(d2 + d3)
+        q0 = fp_mulmod(wa, T(rot[6]), F)
+        q1 = fp_mulmod(wb, T(rot[7]), F)
+        q2 = fp_mulmod(wa + wb, T(rot[8]), F)
+    end
+    u1 = fp_reduce(m1 + (3w0 - w2), F)
+    u3 = fp_reduce((m1 + 2w2) - 3(w0 + w1), F)
+    u2 = fp_reduce(m1 + (3w1 - w2), F)
+    r0 = q0 - q1; r1 = q2 - q0
+    v1 = fp_reduce(mn + (2r0 + r1), F)
+    v3 = fp_reduce((r0 + 2r1) - mn, F)
+    v2 = fp_reduce((mn - r0) + r1, F)
+    a1 = x0 + u1; a2 = x0 + u2; a3 = x0 + u3
+    return y0, a1 + v1, a2 + v2, a3 + v3, a3 - v3, a2 - v2, a1 - v1
+end
+
+function fp_radix7!(x::Vector{Float64}, o::Int, st::FpNttStage, F::FpCtx,
+                    ::Val{FWD}) where {FWD}
+    (;Q, tw, rot) = st
+    j = 0
+    @inbounds while j + 8 <= Q
+        i0 = o + j + 1
+        y0 = SIMD.vload(VF8, x, i0)
+        Base.Cartesian.@nexprs 6 t -> y_t = SIMD.vload(VF8, x, i0 + t * Q)
+        if FWD
+            y0, y_1, y_2, y_3, y_4, y_5, y_6 =
+                fp_dft7(y0, y_1, y_2, y_3, y_4, y_5, y_6, rot, F, Val(false))
+        end
+        y0 = fp_reduce(y0, F)
+        Base.Cartesian.@nexprs 6 t -> y_t = fp_mulmod(y_t, SIMD.vload(VF8, tw[t], j + 1), F)
+        if !FWD
+            y0, y_1, y_2, y_3, y_4, y_5, y_6 =
+                fp_dft7(y0, y_1, y_2, y_3, y_4, y_5, y_6, rot, F, Val(true))
+            y0 = fp_reduce(y0, F)
+        end
+        SIMD.vstore(y0, x, i0)
+        Base.Cartesian.@nexprs 6 t -> SIMD.vstore(y_t, x, i0 + t * Q)
+        j += 8
+    end
+    @inbounds while j < Q
+        i0 = o + j + 1
+        y0 = x[i0]
+        Base.Cartesian.@nexprs 6 t -> y_t = x[i0+t*Q]
+        if FWD
+            y0, y_1, y_2, y_3, y_4, y_5, y_6 =
+                fp_dft7(y0, y_1, y_2, y_3, y_4, y_5, y_6, rot, F, Val(false))
+        end
+        y0 = fp_reduce(y0, F)
+        Base.Cartesian.@nexprs 6 t -> y_t = fp_mulmod(y_t, tw[t][j+1], F)
+        if !FWD
+            y0, y_1, y_2, y_3, y_4, y_5, y_6 =
+                fp_dft7(y0, y_1, y_2, y_3, y_4, y_5, y_6, rot, F, Val(true))
+            y0 = fp_reduce(y0, F)
+        end
+        x[i0] = y0
+        Base.Cartesian.@nexprs 6 t -> x[i0+t*Q] = y_t
+        j += 1
+    end
+    return x
+end
+
 # ---------------------------------------------------------------------------
 # Radix-4 butterfly core, shared by both directions (the DFT4 matrix is
 # symmetric).  y0 comes back unreduced: the forward reduces it before
 # storing; the reverse stores it raw.
-
 @inline function fp_dft4(a, b, c, d, wi, F::FpCtx)
     apc = a + c
     amc = a - c
@@ -574,7 +706,8 @@ end
     for o in 0:st.span:plan.N-1
         st.m == 3 ? fp_radix3!(x, o, st, F, fwd) :
         st.m == 4 ? fp_radix4!(x, o, st, F, fwd) :
-                    fp_radix5!(x, o, st, F, fwd)
+        st.m == 5 ? fp_radix5!(x, o, st, F, fwd) :
+                    fp_radix7!(x, o, st, F, fwd)
     end
     return x
 end
@@ -792,23 +925,30 @@ function fp_ntt_unpack2!(r::Memory{Limb}, ro::Int, rn::Int,
 end
 
 # pick min m·2^k >= T
-# For small T, pick m only in (1, 3, 5) since bigger nums are slower than extra length.
-# m == 15 is only selected when we have k (radix 2 transforms) >= 14
-# because it only benches better once the radix 2 is >= cache size
-# A pure 2^k tops out at 2^36 (~150 GB operands) since 2^k must divide all p-1.
-# The odd multipliers then extend reach to 15·2^36 (~2 TB).
+# For small T, pick m only in (1, 3, 5, 9) since bigger nums are slower than extra length.
+# The other m carry per-m floors (ntt_m_floor), bench-placed via the radix
+# family plus end-to-end mul A/Bs: 7/15/21/105 join at k >= 14, where the
+# radix 2 tower exceeds cache and their tighter padding starts paying
+# (7·2^14 measured +3% vs the pow2 at 36k limbs but -2% at 300 limbs);
+# 35/45/63/315 bench slower than a same-coverage cheaper neighbor until
+# deep in the DRAM-bound regime (per-point premiums collapse to ~1.0 at
+# >= ~2^24 points, where the smallest N wins outright), so they join at
+# k >= 20.
+# A pure 2^k tops out at 2^34 (~37 GB operands) since 2^k must divide all p-1.
+# The odd multipliers then extend reach to 315·2^34 (~12 TB).
+ntt_m_floor(m) = m <= 5 || m == 9 ? 2 : m in (7, 15, 21, 105) ? 14 : 20
 function ntt_len(T::Int, ctxs::FpCtx...)
     maxk = minimum(two_adicity(F) for F in ctxs)
     best = typemax(Int)
-    for m in (1, 3, 5, 15)                            # multiples of 3, 5 each used <= once
+    for m in (1, 3, 5, 7, 9, 15, 21, 35, 45, 63, 105, 315)
         k = max(Base.top_set_bit(cld(T, m) - 1), 2)   # ceil(log2), >= 4 points
         k <= maxk || continue                         # 2^k must divide p-1
-        m <= 5 || k >= 14 || break                    # odd-multiplier floor
+        k >= ntt_m_floor(m) || continue               # per-multiplier floor
         c = m << k
         c < best && (best = c)
     end
     best == typemax(Int) &&
-        throw(ArgumentError("fp NTT length $T exceeds the 15·2^$maxk the primes support"))
+        throw(ArgumentError("fp NTT length $T exceeds the 315·2^$maxk the primes support"))
     return best
 end
 
