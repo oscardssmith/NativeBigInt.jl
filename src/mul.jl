@@ -30,6 +30,37 @@ const SQR_KARATSUBA_THRESHOLD = 52
 const MUL_FPNTT_MIN = 64         # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 124  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
+# fp NTT → O(n (log n)^(1-2^-78)) multiplication (src/belownlogn/): the
+# OpenAI preprint's algorithm with the parameters and h = 46 network of
+# Colkitt's improvement (github.com/CrocSwap/integer-mult-bounds, patch
+# h46-nonadjacent-78; the preprint itself had κ = 2^-182).  The paper proves
+# its bound for all n beyond one fixed cutoff and uses the established
+# multiplier below it.  Its sharpest size hypothesis is the chunk width
+# K = ⌊d^c⌋ ≥ 6 (Section 5, packed rectangles) with c = a/2 = 9/10^12,
+# a = 9/(5·10^11), and d = ⌊b^ε⌋, ε = 1/40, b = ⌈log2 n⌉ the input length's
+# bit count.  So the dispatch rule is exactly the paper's: compute b, then
+# d by binary search on d^40 ≤ b, then test K ≥ 6, i.e. d^9 ≥ 6^(10^12).
+# The threshold constant is on the K scale, where it is the integer 6.
+# Unwound, the cutoff is d ≥ ⌈6^(10^12/9)⌉ =: D (a number of 2.9·10^11
+# digits), b ≥ D^40 (about 1.15·10^13 bits, 1.4 TB) and n ≥ 2^(D^40) bits.
+# Every step is exact integer arithmetic over any Integer limb count; with
+# an Int operand b ≤ 69 and d = 1, K = 1, so there the branch is never
+# taken, as the paper's cutoff analysis implies.  (The preprint's constants
+# gave n ≥ 2^(6^(2^131)); even d ≥ 2 now needs n ≥ 2^(2^40) bits.)
+# BelowNLogN.mul_belownlogn runs the same algorithm at any size (it
+# re-derives p from the paper's error bound instead of assuming n is
+# large); it is benchmark-tuned in the sense that bench/bench_belownlogn.jl
+# measured it, not in the sense that it won.
+const MUL_BELOWNLOGN_THRESHOLD = 6   # on the scale K = ⌊d^c⌋ (chunk width)
+
+# b = ⌈log2(bits)⌉ for an m-limb top-normalized operand, taking bits = 64m
+# as the paper's machine reads the whole input string; m ≥ 1.
+@inline belownlogn_b(m::Integer) = 6 + Base.top_set_bit(m - 1)
+# The paper's cutoff predicate K = ⌊d^c⌋ ≥ threshold for inputs of 64m
+# bits; K ≥ k ⟺ d^(9/10^12) ≥ k ⟺ d^9 ≥ k^(10^12), decided exactly.
+# `threshold` is exposed so the predicate can be seen to fire (k = 1).
+@inline above_belownlogn_cutoff(m::Integer; threshold::Int=MUL_BELOWNLOGN_THRESHOLD) =
+    BelowNLogN.pow_ge(BelowNLogN.paper_dimension(belownlogn_b(m)), 9, threshold, 10^12)
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -176,6 +207,9 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
               b::Memory{Limb}, bo::Int, n::Int)
     if n < MUL_KARATSUBA_THRESHOLD
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
+    end
+    if above_belownlogn_cutoff(m)
+        return BelowNLogN.mul_limbs!(r, ro, a, ao, m, b, bo, n)
     end
     if n >= MUL_FPNTT_MIN && m + n >= 2MUL_FPNTT_THRESHOLD
         return mul_fpntt2!(r, ro, a, ao, m, b, bo, n)
